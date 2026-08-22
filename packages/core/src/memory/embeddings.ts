@@ -22,6 +22,26 @@ export interface EmbeddingStatus {
   error?: string;
 }
 
+/**
+ * Topically neutral sentences used to measure what "unrelated" scores like for a
+ * given model and query.
+ *
+ * Embedding models have wildly different absolute cosine ranges — measured here,
+ * multilingual-e5-small rates *completely unrelated* text at ~0.75, so a naive
+ * threshold either admits everything or nothing. Comparing a query against these
+ * anchors gives a per-query null baseline, which makes the relevance gate
+ * self-calibrating instead of a magic constant. Mixed FR/EN so the baseline is
+ * not skewed by the query's language.
+ */
+export const NULL_ANCHORS: readonly string[] = [
+  'The weather in the mountains changed quickly this afternoon.',
+  'Elle a prepare un gateau au chocolat pour ses amis.',
+  'A wooden chair stood alone in the empty room.',
+  'Le train de nuit arrive a la gare vers six heures.',
+  'Photosynthesis converts light energy into chemical energy in plants.',
+  'Il a achete des chaussures neuves au marche du dimanche.',
+];
+
 export function cosine(a: Float32Array, b: Float32Array): number {
   // Vectors are stored L2-normalised, so the dot product is the cosine.
   const n = Math.min(a.length, b.length);

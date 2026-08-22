@@ -3,7 +3,7 @@ export { loadConfig, getConfig, setConfig, ensureDirs, type JarvisConfig } from 
 export { openDb, transaction, parseJson, type Db } from './db/index.js';
 export { EventBus, type JarvisEvent, type JarvisEventType } from './events/bus.js';
 
-export { MemoryService } from './memory/service.js';
+export { MemoryService, calibrateSemantic, toFtsQuery } from './memory/service.js';
 export * from './memory/types.js';
 export { scanForSecrets, redactSecrets } from './memory/secrets.js';
 export {
@@ -17,6 +17,7 @@ export {
   getEmbeddingProvider,
   setEmbeddingProvider,
   cosine,
+  NULL_ANCHORS,
   type EmbeddingProvider,
   type EmbeddingStatus,
 } from './memory/embeddings.js';

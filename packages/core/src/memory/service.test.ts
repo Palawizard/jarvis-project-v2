@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { openDb, type Db } from '../db/index.js';
 import { loadConfig, type JarvisConfig } from '../config.js';
 import { EventBus } from '../events/bus.js';
-import { MemoryService } from './service.js';
+import { MemoryService, calibrateSemantic, toFtsQuery } from './service.js';
 import { ContextPackBuilder, estimateTokens } from '../context/pack.js';
 import type { EmbeddingProvider } from './embeddings.js';
 
@@ -736,5 +736,114 @@ describe('events', () => {
     expect(first.status).toBe('stored');
     expect(seen).toContain('memory.stored');
     expect(seen).toContain('memory.superseded');
+  });
+});
+
+describe('semantic calibration', () => {
+  it('adapts to a compressed cosine range (e5-style, everything near 0.8)', () => {
+    // Real measured behaviour: unrelated pairs still score ~0.75 with e5.
+    const raw = [
+      { id: 'related', sim: 0.82 },
+      { id: 'somewhat', sim: 0.79 },
+      { id: 'unrelated1', sim: 0.75 },
+      { id: 'unrelated2', sim: 0.748 },
+      { id: 'unrelated3', sim: 0.751 },
+    ];
+    const scores = calibrateSemantic(raw, { absoluteFloor: 0.2, margin: 0.06 });
+    // A fixed 0.2 floor would have admitted all five.
+    expect(scores.has('related')).toBe(true);
+    expect(scores.has('unrelated1')).toBe(false);
+    expect(scores.has('unrelated3')).toBe(false);
+    expect(scores.get('related')).toBeCloseTo(1, 5);
+  });
+
+  it('adapts to a wide cosine range (MiniLM-style)', () => {
+    const raw = [
+      { id: 'related', sim: 0.71 },
+      { id: 'unrelated1', sim: 0.09 },
+      { id: 'unrelated2', sim: 0.12 },
+      { id: 'unrelated3', sim: 0.05 },
+    ];
+    const scores = calibrateSemantic(raw, { absoluteFloor: 0.2, margin: 0.06 });
+    expect([...scores.keys()]).toEqual(['related']);
+  });
+
+  it('rejects everything when nothing beats the null baseline', () => {
+    // Measured e5 behaviour: an unrelated query still scores ~0.75 against every
+    // memory. Only the null baseline can tell that apart from a real match.
+    const raw = [
+      { id: 'a', sim: 0.752 },
+      { id: 'b', sim: 0.739 },
+      { id: 'c', sim: 0.732 },
+      { id: 'd', sim: 0.727 },
+    ];
+    const withBaseline = calibrateSemantic(raw, {
+      absoluteFloor: 0.2,
+      margin: 0.06,
+      nullBaseline: { mean: 0.696, stdev: 0.019 },
+    });
+    expect(withBaseline.size).toBe(0);
+  });
+
+  it('accepts a genuine match that clears the null baseline', () => {
+    const raw = [
+      { id: 'auth', sim: 0.841 },
+      { id: 'retry', sim: 0.787 },
+      { id: 'deploy', sim: 0.762 },
+      { id: 'pdf', sim: 0.754 },
+    ];
+    const scores = calibrateSemantic(raw, {
+      absoluteFloor: 0.2,
+      margin: 0.06,
+      nullBaseline: { mean: 0.719, stdev: 0.011 },
+    });
+    expect(scores.has('auth')).toBe(true);
+    expect(scores.get('auth')).toBeCloseTo(1, 5);
+    expect(scores.has('pdf')).toBe(false);
+  });
+
+  it('falls back to the absolute floor with too few candidates for statistics', () => {
+    expect(calibrateSemantic([{ id: 'a', sim: 0.9 }], { absoluteFloor: 0.2, margin: 0.06 }).has('a')).toBe(true);
+    expect(calibrateSemantic([{ id: 'a', sim: 0.05 }], { absoluteFloor: 0.2, margin: 0.06 }).has('a')).toBe(false);
+  });
+
+  it('never emits a score outside 0..1', () => {
+    const scores = calibrateSemantic(
+      [
+        { id: 'a', sim: 0.99 },
+        { id: 'b', sim: 0.5 },
+        { id: 'c', sim: 0.1 },
+        { id: 'd', sim: 0.05 },
+      ],
+      { absoluteFloor: 0.2, margin: 0.06 },
+    );
+    for (const value of scores.values()) {
+      expect(value).toBeGreaterThanOrEqual(0);
+      expect(value).toBeLessThanOrEqual(1);
+    }
+  });
+});
+
+describe('lexical query construction', () => {
+  it('strips stopwords that would otherwise match every memory', () => {
+    const q = toFtsQuery('what is the capital of Peru');
+    expect(q).toBe('"capital" OR "peru"');
+  });
+
+  it('strips French stopwords too', () => {
+    const q = toFtsQuery('comment fonctionne la connexion des utilisateurs');
+    expect(q).toContain('connexion');
+    expect(q).toContain('utilisateurs');
+    expect(q).not.toContain('comment');
+    expect(q).not.toContain('"des"');
+  });
+
+  it('deduplicates repeated terms', () => {
+    expect(toFtsQuery('cache cache cache')).toBe('"cache"');
+  });
+
+  it('returns null when nothing meaningful is left', () => {
+    expect(toFtsQuery('what is the')).toBeNull();
+    expect(toFtsQuery('')).toBeNull();
   });
 });

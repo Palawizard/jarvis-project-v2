@@ -33,12 +33,18 @@ export interface JarvisConfig {
     /** Lexical Jaccard above which a new memory is considered a duplicate (no-embeddings path). */
     dedupeLexical: number;
     /**
-     * Minimum raw cosine similarity for the semantic leg to count as a relevance
-     * signal at all. Without a floor every embedded memory scores non-zero, so
-     * retrieval would return the whole scope ranked by noise — exactly the
-     * "dump everything" behaviour the design forbids.
+     * Hard minimum cosine for the semantic leg to count as a relevance signal.
+     * The effective cutoff is usually higher and is derived per query from the
+     * candidate distribution (see calibrateSemantic) — embedding models differ
+     * far too much in absolute cosine range for a fixed threshold to work.
      */
     semanticFloor: number;
+    /**
+     * How far above the null baseline a memory must score to count as relevant.
+     * Measured against multilingual-e5-small, where unrelated text sits ~0.06
+     * below genuinely related text. Retune if you change the embedding model.
+     */
+    semanticMargin: number;
     embeddingsEnabled: boolean;
     embeddingModel: string;
     /** Max characters stored for a single memory's content. */
@@ -114,7 +120,8 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
       minImportance: envFloat('JARVIS_MEMORY_MIN_IMPORTANCE', 0.35),
       dedupeSimilarity: envFloat('JARVIS_MEMORY_DEDUPE_SIMILARITY', 0.92),
       dedupeLexical: envFloat('JARVIS_MEMORY_DEDUPE_LEXICAL', 0.8),
-      semanticFloor: envFloat('JARVIS_MEMORY_SEMANTIC_FLOOR', 0.3),
+      semanticFloor: envFloat('JARVIS_MEMORY_SEMANTIC_FLOOR', 0.2),
+      semanticMargin: envFloat('JARVIS_MEMORY_SEMANTIC_MARGIN', 0.06),
       embeddingsEnabled: envBool('JARVIS_EMBEDDINGS', true),
       embeddingModel: process.env.JARVIS_EMBEDDING_MODEL || 'Xenova/multilingual-e5-small',
       maxContentChars: envInt('JARVIS_MEMORY_MAX_CONTENT_CHARS', 1200),

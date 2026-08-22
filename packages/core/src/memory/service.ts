@@ -11,6 +11,7 @@ import {
   cosine,
   getEmbeddingProvider,
   vectorToBlob,
+  NULL_ANCHORS,
   type EmbeddingProvider,
 } from './embeddings.js';
 import type {
@@ -84,6 +85,8 @@ export class MemoryService {
   private readonly embeddings: EmbeddingProvider;
   /** Set once we learn embeddings are unusable, so we stop retrying per query. */
   private semanticDisabled = false;
+  /** Null-baseline anchor vectors, embedded lazily once per process. */
+  private anchorVectors: Float32Array[] | undefined;
 
   constructor(deps: MemoryServiceDeps) {
     this.db = deps.db;
@@ -555,15 +558,19 @@ export class MemoryService {
       const queryVec = await this.embeddings.embedQuery(query);
       // ponytail: brute-force cosine over the scope-filtered candidate set.
       // Fine to five figures of memories; swap for sqlite-vec/HNSW past that.
+      const raw: Array<{ id: string; sim: number }> = [];
       for (const memory of candidates) {
         const vec = this.loadVector(memory.id);
         if (!vec || vec.length !== queryVec.length) continue;
-        const raw = cosine(queryVec, vec);
-        // Below the floor this is noise, not a signal. Recording it anyway would
-        // make every embedded memory "relevant" and defeat the relevance filter.
-        if (raw < this.config.memory.semanticFloor) continue;
-        scores.set(memory.id, (raw + 1) / 2);
+        raw.push({ id: memory.id, sim: cosine(queryVec, vec) });
       }
+      const nullBaseline = await this.nullBaseline(queryVec);
+      const calibrated = calibrateSemantic(raw, {
+        absoluteFloor: this.config.memory.semanticFloor,
+        margin: this.config.memory.semanticMargin,
+        ...(nullBaseline ? { nullBaseline } : {}),
+      });
+      for (const [id, score] of calibrated) scores.set(id, score);
     } catch (error) {
       this.semanticDisabled = true;
       log.warn('semantic retrieval unavailable, using lexical only', {
@@ -571,6 +578,25 @@ export class MemoryService {
       });
     }
     return scores;
+  }
+
+  /**
+   * Similarity statistics for this query against topically neutral text.
+   * Embedded once per process; the cost is six short passages.
+   */
+  private async nullBaseline(queryVec: Float32Array): Promise<{ mean: number; stdev: number } | null> {
+    try {
+      this.anchorVectors ??= await this.embeddings.embedPassages([...NULL_ANCHORS]);
+      const sims = this.anchorVectors
+        .filter((v) => v.length === queryVec.length)
+        .map((v) => cosine(queryVec, v));
+      if (sims.length < 3) return null;
+      const mean = sims.reduce((a, b) => a + b, 0) / sims.length;
+      const stdev = Math.sqrt(sims.reduce((a, b) => a + (b - mean) ** 2, 0) / sims.length);
+      return { mean, stdev };
+    } catch {
+      return null;
+    }
   }
 
   private fuse(
@@ -826,6 +852,27 @@ export class MemoryService {
 }
 
 /**
+ * Function words carry no retrieval signal but match nearly every document.
+ * With an OR query they are actively harmful: "what is the capital of Peru"
+ * matches any memory containing "the". FTS5's unicode61 tokenizer has no
+ * built-in stoplist, so we filter before querying. EN + FR, since Jarvis is used
+ * in both.
+ */
+const STOPWORDS = new Set([
+  // English
+  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out',
+  'his', 'has', 'had', 'him', 'she', 'its', 'who', 'get', 'why', 'how', 'what', 'when', 'where',
+  'which', 'that', 'this', 'with', 'from', 'they', 'them', 'were', 'been', 'have', 'does', 'did',
+  'about', 'would', 'could', 'should', 'there', 'their', 'then', 'than', 'into', 'some', 'any',
+  'more', 'most', 'much', 'very', 'just', 'also', 'only', 'over', 'such', 'each', 'both', 'does',
+  // French
+  'les', 'des', 'une', 'que', 'qui', 'pour', 'dans', 'sur', 'pas', 'avec', 'sont', 'est', 'ete',
+  'aux', 'par', 'plus', 'mais', 'nous', 'vous', 'ils', 'elle', 'elles', 'son', 'ses', 'leur',
+  'comment', 'quand', 'quel', 'quelle', 'quels', 'quelles', 'quoi', 'cette', 'ces', 'cela',
+  'faire', 'fait', 'etre', 'avoir', 'tout', 'tous', 'toute', 'toutes', 'donc', 'alors', 'ainsi',
+]);
+
+/**
  * Turn free text into a safe FTS5 MATCH expression.
  * Quoting each term avoids FTS syntax errors from user punctuation, and OR keeps
  * partial matches useful (AND would return nothing for most natural questions).
@@ -833,10 +880,77 @@ export class MemoryService {
 export function toFtsQuery(text: string): string | null {
   const terms = normaliseForHash(text)
     .split(' ')
-    .filter((t) => t.length > 1)
+    .filter((t) => t.length > 2 && !STOPWORDS.has(t))
     .slice(0, 24);
   if (terms.length === 0) return null;
-  return terms.map((t) => `"${t}"`).join(' OR ');
+  return [...new Set(terms)].map((t) => `"${t}"`).join(' OR ');
+}
+
+/**
+ * Turn raw cosine similarities into a relevance signal.
+ *
+ * Embedding models differ wildly in how they use the cosine range: e5 scores
+ * *everything* around 0.75-0.85, while MiniLM-style models sit near 0.1-0.5. A
+ * fixed cosine cutoff is therefore meaningless across models — with e5 it either
+ * admits every memory in scope (recreating the "dump everything" failure) or
+ * rejects all of them.
+ *
+ * So the cutoff is derived from the batch itself: a memory counts as a semantic
+ * hit only if it stands out from the other candidates for THIS query. Scores are
+ * then rescaled onto the gap above the cutoff, so fusion weights mean the same
+ * thing regardless of which model produced them.
+ */
+export interface SemanticCalibration {
+  /** Hard minimum cosine, whatever the statistics say. */
+  absoluteFloor: number;
+  /** How far above the null baseline a memory must score to count as a hit. */
+  margin: number;
+  /** Similarity of this query to topically neutral text, if measurable. */
+  nullBaseline?: { mean: number; stdev: number };
+  /** Standard deviations above the candidate mean required (batch-relative gate). */
+  z?: number;
+}
+
+export function calibrateSemantic(
+  raw: Array<{ id: string; sim: number }>,
+  options: SemanticCalibration,
+): Map<string, number> {
+  const out = new Map<string, number>();
+  if (raw.length === 0) return out;
+  const z = options.z ?? 0.5;
+
+  // Gate 1 — absolute: measured against what "unrelated" looks like for this
+  // model and query. This is what stops a query about Peru matching a memory
+  // about PDF rendering just because it is the least-bad option available.
+  let floor = options.absoluteFloor;
+  if (options.nullBaseline) {
+    floor = Math.max(floor, options.nullBaseline.mean + Math.max(options.margin, 1.5 * options.nullBaseline.stdev));
+  }
+
+  const passing = raw.filter((r) => r.sim >= floor);
+  if (passing.length === 0) return out;
+
+  // Gate 2 — batch-relative: among what is left, require standing out from the
+  // other candidates. Skipped when there are too few for meaningful statistics.
+  let cutoff = floor;
+  if (raw.length >= 3) {
+    const sims = raw.map((r) => r.sim);
+    const mean = sims.reduce((a, b) => a + b, 0) / sims.length;
+    const stdev = Math.sqrt(sims.reduce((a, b) => a + (b - mean) ** 2, 0) / sims.length);
+    cutoff = Math.max(cutoff, mean + z * stdev);
+  }
+
+  const survivors = raw.filter((r) => r.sim >= cutoff);
+  if (survivors.length === 0) return out;
+
+  // Rescale onto the gap above the cutoff so the semantic leg means the same
+  // thing to the fusion step regardless of the model's native cosine range.
+  const max = Math.max(...survivors.map((r) => r.sim));
+  const span = max - cutoff;
+  for (const { id, sim } of survivors) {
+    out.set(id, span <= 1e-6 ? 1 : Math.min(1, (sim - cutoff) / span));
+  }
+  return out;
 }
 
 /**

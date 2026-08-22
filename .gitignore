@@ -1,0 +1,43 @@
+# deps
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+*.tsbuildinfo
+apps/web/dist/
+
+# --- Jarvis runtime state (NEVER commit) ---
+# Local database, memory DB, logs, worktrees, artifacts
+.jarvis/
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# local model cache (embeddings) if ever placed in-repo
+.cache/
+models/
+.transformers-cache/
+
+# artifacts: screenshots, agent transcripts, verification logs
+artifacts/
+screenshots/
+test-results/
+playwright-report/
+.playwright/
+
+# secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+
+# os / editor
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,168 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs';
+import { openDb, type Db } from '../db/index.js';
+import { loadConfig } from '../config.js';
+import { EventBus } from '../events/bus.js';
+import { VerificationEngine } from './engine.js';
+import { ToolRegistry, riskExceeds, ToolPermissionError } from '../tools/registry.js';
+import { z } from 'zod';
+
+let home: string;
+let db: Db;
+let bus: EventBus;
+let engine: VerificationEngine;
+const JOB_ID = 'job_verify';
+
+// `echo` and `exit` exist on both cmd.exe and POSIX shells.
+const OK = 'echo verification-ran';
+const FAIL = 'echo boom && exit 3';
+
+beforeEach(() => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-verify-'));
+  const config = loadConfig({ home });
+  db = openDb(config);
+  bus = new EventBus(db);
+  engine = new VerificationEngine(db, config.artifactsDir, bus);
+  // FK target for verifications.job_id
+  db.exec(`
+    INSERT INTO projects (id,name,root_path,default_branch,created_at,updated_at)
+      VALUES ('prj_v','v','${home.replace(/\\/g, '/')}','main','now','now');
+    INSERT INTO jobs (id,project_id,request,goal,stage,status,created_at,updated_at)
+      VALUES ('${JOB_ID}','prj_v','r','g','verifying','running','now','now');
+  `);
+});
+
+afterEach(() => {
+  db.close();
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+describe('deterministic verification', () => {
+  it('runs configured commands and records real exit codes', async () => {
+    const report = await engine.run({ jobId: JOB_ID, cwd: home, commands: { lint: OK, test: OK } });
+    expect(report.passed).toBe(true);
+    expect(report.ran).toBe(2);
+    expect(report.results.every((r) => r.exitCode === 0)).toBe(true);
+    expect(report.results[0]?.output).toContain('verification-ran');
+  });
+
+  it('reports a real failure and captures the output', async () => {
+    const report = await engine.run({ jobId: JOB_ID, cwd: home, commands: { lint: OK, test: FAIL } });
+    expect(report.passed).toBe(false);
+    const failed = report.results.find((r) => r.name === 'test');
+    expect(failed?.status).toBe('failed');
+    expect(failed?.exitCode).toBe(3);
+    expect(report.failureSummary).toContain('test');
+    expect(report.failureSummary).toContain('boom');
+  });
+
+  it('runs cheap checks before expensive ones', async () => {
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { build: OK, test: OK, typecheck: OK, lint: OK },
+    });
+    expect(report.results.map((r) => r.name)).toEqual(['lint', 'typecheck', 'test', 'build']);
+  });
+
+  it('skips silently when a project has no verification commands', async () => {
+    const report = await engine.run({ jobId: JOB_ID, cwd: home, commands: {} });
+    expect(report.ran).toBe(0);
+    // `passed` is vacuously true, but `ran: 0` is what tells the caller nothing was proven.
+    expect(report.failureSummary).toBe('');
+  });
+
+  it('persists results and writes a full log file', async () => {
+    await engine.run({ jobId: JOB_ID, cwd: home, commands: { test: OK } });
+    const stored = engine.list(JOB_ID);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.outputPath).toBeTruthy();
+    expect(fs.existsSync(stored[0]!.outputPath!)).toBe(true);
+  });
+
+  it('emits step and completion events', async () => {
+    await engine.run({ jobId: JOB_ID, cwd: home, commands: { lint: OK } });
+    const types = bus.list({ jobId: JOB_ID }).map((e) => e.type);
+    expect(types).toContain('verification.started');
+    expect(types).toContain('verification.step');
+    expect(types).toContain('verification.completed');
+  });
+
+  it('marks a command that cannot start as an error, not a pass', async () => {
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: path.join(home, 'does-not-exist'),
+      commands: { test: OK },
+    });
+    expect(report.passed).toBe(false);
+  });
+
+  it('redacts credential-like strings from stored output', async () => {
+    await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { test: 'echo token=ghp_abcdefghijklmnopqrstuvwxyz0123456789' },
+    });
+    const stored = engine.list(JOB_ID);
+    expect(stored[0]?.output).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz');
+    expect(stored[0]?.output).toContain('[redacted:');
+  });
+});
+
+describe('tool registry risk gating', () => {
+  it('orders risk levels correctly', () => {
+    expect(riskExceeds('destructive', 'observe')).toBe(true);
+    expect(riskExceeds('observe', 'destructive')).toBe(false);
+    expect(riskExceeds('reversible_modification', 'reversible_modification')).toBe(false);
+  });
+
+  it('refuses a tool above the caller ceiling', async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: 'danger.delete',
+      description: 'deletes things',
+      risk: 'destructive',
+      input: z.object({}),
+      execute: async () => 'deleted',
+    });
+    await expect(registry.execute('danger.delete', {}, { maxRisk: 'observe' })).rejects.toThrow(ToolPermissionError);
+  });
+
+  it('validates input against the schema before executing', async () => {
+    const registry = new ToolRegistry();
+    let ran = false;
+    registry.register({
+      name: 'demo.echo',
+      description: 'echo',
+      risk: 'observe',
+      input: z.object({ text: z.string().min(1) }),
+      execute: async (input) => {
+        ran = true;
+        return input.text;
+      },
+    });
+    await expect(registry.execute('demo.echo', { text: 123 }, { maxRisk: 'observe' })).rejects.toThrow(/invalid input/);
+    expect(ran).toBe(false);
+    expect(await registry.execute('demo.echo', { text: 'hi' }, { maxRisk: 'observe' })).toBe('hi');
+  });
+
+  it('rejects an unknown tool', async () => {
+    await expect(new ToolRegistry().execute('nope', {}, { maxRisk: 'destructive' })).rejects.toThrow(/unknown tool/);
+  });
+
+  it('exposes a JSON schema for each tool', () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: 'demo.schema',
+      description: 'demo',
+      risk: 'observe',
+      input: z.object({ id: z.string() }),
+      execute: async () => null,
+    });
+    const [listed] = registry.list();
+    expect(listed?.name).toBe('demo.schema');
+    expect(JSON.stringify(listed?.schema)).toContain('id');
+  });
+});

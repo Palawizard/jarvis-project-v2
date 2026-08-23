@@ -11,6 +11,7 @@
     "dev": "node scripts/dev.mjs",
     "dev:orchestrator": "pnpm --filter @jarvis/orchestrator dev",
     "dev:web": "pnpm --filter @jarvis/web dev",
+    "supervisor": "node scripts/supervisor.mjs",
     "build": "pnpm -r build",
     "typecheck": "pnpm --filter @jarvis/core build && pnpm -r typecheck",
     "lint": "eslint .",

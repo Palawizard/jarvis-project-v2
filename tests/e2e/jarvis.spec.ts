@@ -14,7 +14,9 @@ test('command, projects, jobs and controllable memory work in the real UI', asyn
   await page.goto('/');
   await expect(page.getByText('Jarvis', { exact: true })).toBeVisible();
   await expect(page.getByText('jarvis', { exact: true }).last()).toBeVisible();
-  await expect(page.getByText('claude').locator('..')).toContainText(/ready|off/);
+  await expect(page.getByText('claude').locator('..')).toContainText(
+    /available|unavailable|cooldown/,
+  );
 
   await page.getByRole('button', { name: 'Projects' }).click();
   await expect(page.getByText('jarvis', { exact: true }).first()).toBeVisible();

@@ -150,16 +150,31 @@ export class AgentRegistry {
   decisions(jobId: string): RoutingDecision[] {
     if (!this.deps.db) return [];
     const rows = this.deps.db
-      .prepare('SELECT payload FROM routing_decisions WHERE job_id = ? ORDER BY created_at ASC')
-      .all(jobId) as Array<{ payload: string }>;
-    return rows.map((row) => JSON.parse(row.payload) as RoutingDecision);
+      .prepare('SELECT * FROM routing_decisions WHERE job_id = ? ORDER BY created_at ASC')
+      .all(jobId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: row.id as string,
+      jobId: (row.job_id as string) ?? null,
+      role: row.role as AgentRole,
+      provider: (row.provider as ProviderId) ?? null,
+      model: (row.model as string) ?? null,
+      reason: row.reason as string,
+      avoid: (row.avoid_provider as ProviderId) ?? null,
+      explicitPreference: (row.explicit_preference as ProviderId) ?? null,
+      availability: JSON.parse(
+        (row.provider_availability as string) || '[]',
+      ) as RoutingDecision['availability'],
+      taskProfile: JSON.parse((row.task_profile as string) || '{}') as TaskProfile,
+      createdAt: row.created_at as string,
+    }));
   }
 
   private persistDecision(decision: RoutingDecision): void {
     this.deps.db
       ?.prepare(
-        `INSERT INTO routing_decisions (id, job_id, role, provider, model, reason, payload, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO routing_decisions (id, job_id, role, provider, model, reason, avoid_provider,
+          explicit_preference, provider_availability, task_profile, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         decision.id,
@@ -168,7 +183,10 @@ export class AgentRegistry {
         decision.provider,
         decision.model,
         decision.reason,
-        JSON.stringify(decision),
+        decision.avoid,
+        decision.explicitPreference,
+        JSON.stringify(decision.availability),
+        JSON.stringify(decision.taskProfile),
         decision.createdAt,
       );
     this.deps.bus?.emit({

@@ -176,6 +176,12 @@ export class CandidateApplicationService {
         'candidate_missing',
       );
     }
+    if (project.isSelf) {
+      throw new CandidateApplicationError(
+        'Jarvis candidates must be activated through the supervised self-upgrade path',
+        'supervised_upgrade_required',
+      );
+    }
     const startedAt = nowIso();
     const claimed = this.db
       .prepare(

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ToolRegistry } from './registry.js';
+import { ToolRegistry, type ToolRegistryOptions } from './registry.js';
 import type { MemoryService } from '../memory/service.js';
 import type { ProjectService } from '../projects/service.js';
 import type { JobService } from '../jobs/service.js';
@@ -24,14 +24,18 @@ const KINDS = [
  *
  * Everything else in the roadmap (screen, desktop control, gmail, calendar)
  * registers the same way; none of it is stubbed here, because a stub that
- * returns nothing is worse than an honestly absent tool.
+ * returns nothing is worse than an honestly absent tool. The only thing a new
+ * tool has to get right is its `risk` — the policy in policy.ts does the rest.
  */
-export function registerBuiltinTools(deps: {
-  memory: MemoryService;
-  projects: ProjectService;
-  jobs: JobService;
-}): ToolRegistry {
-  const registry = new ToolRegistry();
+export function registerBuiltinTools(
+  deps: {
+    memory: MemoryService;
+    projects: ProjectService;
+    jobs: JobService;
+  },
+  options: ToolRegistryOptions,
+): ToolRegistry {
+  const registry = new ToolRegistry(options);
 
   registry.register({
     name: 'memory.search',
@@ -105,6 +109,17 @@ export function registerBuiltinTools(deps: {
     input: z.object({ id: z.string() }),
     async execute(input) {
       return { forgotten: deps.memory.forget(input.id) };
+    },
+  });
+
+  registry.register({
+    name: 'memory.purge',
+    description:
+      'Permanently erase a memory and its embedding. There is no undo and no audit copy of the content.',
+    risk: 'destructive',
+    input: z.object({ id: z.string() }),
+    async execute(input) {
+      return { purged: deps.memory.purge(input.id) };
     },
   });
 

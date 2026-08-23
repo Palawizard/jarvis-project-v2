@@ -5,6 +5,10 @@
 --   * timestamps are ISO-8601 TEXT (UTC), not SQLite julian/unix helpers
 -- The ONLY SQLite-specific pieces are the FTS5 index and the embedding BLOBs,
 -- both of which live behind the retrieval interface (swap for tsvector/pgvector).
+--
+-- This file is the version-1 baseline and is re-executed (IF NOT EXISTS) on every
+-- open. Tables added later belong in MIGRATIONS in db/index.ts and nowhere else,
+-- or the migration would try to create a table this file just made.
 
 CREATE TABLE IF NOT EXISTS schema_meta (
   key   TEXT PRIMARY KEY,

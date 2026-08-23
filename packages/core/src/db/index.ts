@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const MIGRATIONS = new Map<number, string>([
   [
@@ -72,6 +72,48 @@ const MIGRATIONS = new Map<number, string>([
       created_at            TEXT NOT NULL
     );
     CREATE INDEX idx_routing_decisions_job ON routing_decisions(job_id, created_at);`,
+  ],
+  [
+    3,
+    `CREATE TABLE tool_executions (
+      id           TEXT PRIMARY KEY,
+      tool_name    TEXT NOT NULL,
+      risk         TEXT NOT NULL,
+      actor        TEXT NOT NULL,
+      decision     TEXT NOT NULL,
+      status       TEXT NOT NULL,
+      reason       TEXT NOT NULL DEFAULT '',
+      session_id   TEXT,
+      project_id   TEXT,
+      job_id       TEXT,
+      agent_run_id TEXT,
+      input        TEXT,
+      result       TEXT,
+      error        TEXT,
+      grant_id     TEXT,
+      approved_by  TEXT,
+      requested_at TEXT NOT NULL,
+      started_at   TEXT,
+      finished_at  TEXT,
+      duration_ms  INTEGER,
+      updated_at   TEXT NOT NULL
+    );
+    CREATE INDEX idx_tool_executions_status ON tool_executions(status, requested_at DESC);
+    CREATE INDEX idx_tool_executions_tool ON tool_executions(tool_name, requested_at DESC);
+    CREATE INDEX idx_tool_executions_job ON tool_executions(job_id, requested_at DESC);
+
+    CREATE TABLE tool_grants (
+      id         TEXT PRIMARY KEY,
+      tool_name  TEXT NOT NULL,
+      actor      TEXT NOT NULL,
+      project_id TEXT,
+      session_id TEXT,
+      note       TEXT,
+      created_at TEXT NOT NULL,
+      expires_at TEXT,
+      revoked_at TEXT
+    );
+    CREATE INDEX idx_tool_grants_lookup ON tool_grants(tool_name, actor, revoked_at);`,
   ],
 ]);
 

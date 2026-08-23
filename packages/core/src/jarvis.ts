@@ -87,11 +87,16 @@ export class Jarvis {
       this.applications,
       config,
     );
-    this.tools = registerBuiltinTools({
-      memory: this.memory,
-      projects: this.projects,
-      jobs: this.jobs,
-    });
+    this.tools = registerBuiltinTools(
+      { memory: this.memory, projects: this.projects, jobs: this.jobs },
+      {
+        db: this.db,
+        bus: this.bus,
+        defaultTimeoutMs: config.tools.defaultTimeoutMs,
+        approvalTtlMs: config.tools.approvalTtlMs,
+        maxRecordChars: config.tools.maxRecordChars,
+      },
+    );
     this.pipeline = new JobPipeline({
       db: this.db,
       bus: this.bus,
@@ -119,11 +124,15 @@ export class Jarvis {
    */
   async boot(): Promise<{
     recovered: { jobs: number; runs: number };
+    tools: { interrupted: number; expired: number };
     expired: number;
     selfProject: string | null;
   }> {
     const recovered = this.jobs.recoverInterrupted();
     const interruptedApplications = this.applications.recoverInterrupted();
+    // A tool that died mid-action may have had an effect on the outside world,
+    // so it is surfaced as interrupted and never replayed automatically.
+    const tools = this.tools.recoverInterrupted();
     if (recovered.jobs || recovered.runs) {
       log.warn('recovered interrupted work from a previous run', recovered);
     }
@@ -135,12 +144,13 @@ export class Jarvis {
     const expired = this.memory.expireStale();
     this.memory.trimCoreUserMemory();
     this.sessions.pruneHistory(this.config.pipeline.rawHistoryRetentionDays);
+    this.tools.pruneAudit(this.config.tools.auditRetentionDays);
 
     const selfProject = await this.registerSelf().catch((error: unknown) => {
       log.warn('could not register Jarvis as a project', { error: String(error) });
       return null;
     });
-    return { recovered, expired, selfProject: selfProject?.id ?? null };
+    return { recovered, tools, expired, selfProject: selfProject?.id ?? null };
   }
 
   /**

@@ -197,6 +197,7 @@ select {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px;
+  min-width: 0;
 }
 .card + .card {
   margin-top: 12px;
@@ -357,6 +358,12 @@ textarea {
   color: var(--text-faint);
 }
 
+/* Wide tables scroll inside their own box; cards stay non-clipping so
+   dropdowns and popovers can still overflow them. */
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
 table {
   width: 100%;
   border-collapse: collapse;
@@ -623,19 +630,24 @@ code {
   .sidebar {
     flex-direction: row;
     overflow-x: auto;
-    padding: 8px;
+    padding: 8px 4px;
     gap: 2px;
     border-right: 0;
     border-bottom: 1px solid var(--border);
   }
   .brand {
-    padding: 4px 8px;
+    padding: 4px;
+    gap: 0;
     flex: 0 0 auto;
+  }
+  .brand-dot {
+    display: none;
   }
   .sidebar .nav-item {
     flex: 0 0 auto;
     width: auto;
     gap: 6px;
+    padding-inline: 8px;
   }
   .sidebar-foot {
     display: none;

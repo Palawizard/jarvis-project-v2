@@ -96,16 +96,23 @@ describe('provider process protocol', () => {
     }
   });
 
-  it('removes API billing keys only from provider child environments', () => {
+  it('removes API billing keys and the control-plane address from provider children', () => {
     const source = {
       PATH: 'kept',
       ANTHROPIC_API_KEY: 'secret',
       OPENAI_API_KEY: 'secret',
       CODEX_API_KEY: 'secret',
+      JARVIS_PORT: '4319',
+      JARVIS_WEB_PORT: '5199',
+      JARVIS_RUNTIME_NONCE: 'nonce',
     };
     expect(subscriptionProviderEnv(source)).toMatchObject({ PATH: 'kept', NO_COLOR: '1' });
     expect(subscriptionProviderEnv(source)).not.toHaveProperty('ANTHROPIC_API_KEY');
+    // An agent's privileged path is the in-process tool boundary, not the API.
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_PORT');
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_RUNTIME_NONCE');
     expect(source).toHaveProperty('ANTHROPIC_API_KEY', 'secret');
+    expect(source).toHaveProperty('JARVIS_PORT', '4319');
   });
 
   it('does not expose API billing keys to a spawned provider process', async () => {

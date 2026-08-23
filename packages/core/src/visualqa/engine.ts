@@ -6,6 +6,7 @@ import { newId, nowIso } from '../ids.js';
 import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
 import { killTree } from '../agents/spawn.js';
+import type { VisualInteraction } from '../projects/service.js';
 
 const log = createLogger('visual-qa');
 
@@ -49,6 +50,7 @@ export class VisualQaEngine {
     baseUrl: string;
     routes: string[];
     viewports?: ('desktop' | 'mobile')[];
+    interactions?: VisualInteraction[];
     signal?: AbortSignal;
   }): Promise<VisualQaShot[]> {
     const viewports = opts.viewports ?? ['desktop', 'mobile'];
@@ -114,7 +116,12 @@ export class VisualQaEngine {
 
   private async captureRoute(
     context: import('playwright').BrowserContext,
-    opts: { jobId?: string | null; projectId?: string | null; baseUrl: string },
+    opts: {
+      jobId?: string | null;
+      projectId?: string | null;
+      baseUrl: string;
+      interactions?: VisualInteraction[];
+    },
     route: string,
     viewport: 'desktop' | 'mobile',
     outDir: string,
@@ -146,6 +153,7 @@ export class VisualQaEngine {
 
     try {
       await page.goto(url, { waitUntil: 'networkidle', timeout: 30_000 });
+      await runInteractions(page, opts.baseUrl, opts.interactions ?? [], outDir, viewport);
       // Let entry animations settle so screenshots are comparable run to run.
       await page.waitForTimeout(400);
       await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -270,6 +278,50 @@ export class VisualQaEngine {
       reviewedBy: (row.reviewed_by as string) ?? null,
       createdAt: row.created_at as string,
     }));
+  }
+}
+
+async function runInteractions(
+  page: import('playwright').Page,
+  baseUrl: string,
+  interactions: VisualInteraction[],
+  outDir: string,
+  viewport: 'desktop' | 'mobile',
+): Promise<void> {
+  if (interactions.length > 50) throw new Error('visual interaction script exceeds 50 actions');
+  let screenshotIndex = 0;
+  for (const step of interactions) {
+    switch (step.action) {
+      case 'goto':
+        await page.goto(new URL(step.route, baseUrl).toString(), {
+          waitUntil: 'networkidle',
+          timeout: 30_000,
+        });
+        break;
+      case 'click':
+        await page.locator(step.selector).click({ timeout: 15_000 });
+        break;
+      case 'fill':
+        await page.locator(step.selector).fill(step.value, { timeout: 15_000 });
+        break;
+      case 'wait':
+        if (step.selector) {
+          await page.locator(step.selector).waitFor({
+            timeout: Math.min(Math.max(step.timeoutMs ?? 15_000, 0), 30_000),
+          });
+        } else {
+          await page.waitForTimeout(Math.min(Math.max(step.timeoutMs ?? 250, 0), 30_000));
+        }
+        break;
+      case 'screenshot': {
+        const safeName = (step.name ?? `step-${++screenshotIndex}`).replace(/[^a-z0-9_-]+/gi, '_');
+        await page.screenshot({
+          path: path.join(outDir, `${safeName}-${viewport}.png`),
+          fullPage: true,
+        });
+        break;
+      }
+    }
   }
 }
 

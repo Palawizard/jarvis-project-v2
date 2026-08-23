@@ -10,7 +10,8 @@ import type { ContextPackBuilder } from '../context/pack.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import type { VerificationEngine, VerificationReport } from '../verification/engine.js';
 import type { ReviewEngine, Review } from '../review/engine.js';
-import { VisualQaEngine, startDevServer } from '../visualqa/engine.js';
+import { VisualQaEngine } from '../visualqa/engine.js';
+import { startCandidateRuntime } from '../runtime/candidate.js';
 import { GitWorkspace } from '../git/workspace.js';
 import { MEMORY_PROPOSAL_INSTRUCTIONS } from '../agents/proposals.js';
 import {
@@ -270,10 +271,20 @@ export class JobPipeline {
     }
 
     // ------------------------------------------------------------ visual QA --
-    const shouldVisualQa = Boolean(project.commands.dev && project.devUrl);
+    const visualConfig = project.config.visualQa;
+    const uiChanged = changes.files.some((file) =>
+      /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i.test(file.path),
+    );
+    const shouldVisualQa = Boolean(visualConfig && (!visualConfig.required || uiChanged));
     if (shouldVisualQa) {
       jobs.transition(jobId, 'visual_qa');
-      await this.runVisualQa(jobId, project, worktree.path, signal);
+      await this.runVisualQa(
+        jobId,
+        project,
+        worktree.path,
+        signal,
+        Boolean(visualConfig?.required),
+      );
     }
     if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
 
@@ -313,33 +324,41 @@ export class JobPipeline {
     project: Project,
     cwd: string,
     signal: AbortSignal,
+    required: boolean,
   ): Promise<void> {
-    if (!project.commands.dev || !project.devUrl) return;
-    let server: Awaited<ReturnType<typeof startDevServer>> | undefined;
+    const visual = project.config.visualQa;
+    if (!visual) return;
+    let server: Awaited<ReturnType<typeof startCandidateRuntime>> | undefined;
     try {
-      server = await startDevServer({
-        command: project.commands.dev,
+      server = await startCandidateRuntime({
+        project,
         cwd,
-        url: project.devUrl,
+        jobId,
+        config: this.config,
         signal,
       });
-      await this.visualQa.capture({
+      const shots = await this.visualQa.capture({
         jobId,
         projectId: project.id,
-        baseUrl: project.devUrl,
-        routes: project.stack.webRoutes?.length ? project.stack.webRoutes : ['/'],
+        baseUrl: server.baseUrl,
+        routes: visual.routes?.length
+          ? visual.routes
+          : project.stack.webRoutes?.length
+            ? project.stack.webRoutes
+            : ['/'],
+        ...(visual.interactions ? { interactions: visual.interactions } : {}),
         signal,
       });
+      if (required && shots.some((shot) => shot.status !== 'captured')) {
+        throw new Error('required visual QA did not capture every configured route and viewport');
+      }
     } catch (error) {
       if (signal.aborted) return;
-      // Visual QA failing must never fail the job — it is evidence, not a gate.
-      // But record WHY, as a real row: an empty screenshot list with no
-      // explanation is indistinguishable from "the page was fine".
       const message = error instanceof Error ? error.message : String(error);
       this.visualQa.recordFailure({
         jobId,
         projectId: project.id,
-        route: project.devUrl ?? '(dev server)',
+        route: '(candidate runtime)',
         error: `Could not start the dev server for visual QA: ${message}`,
       });
       this.deps.bus.emit({
@@ -347,6 +366,7 @@ export class JobPipeline {
         jobId,
         payload: { error: message, captured: 0 },
       });
+      if (required) throw new Error(`Required visual QA failed: ${message}`);
     } finally {
       await server?.stop();
     }

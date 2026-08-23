@@ -224,6 +224,80 @@ describe('explicit remember and forget', () => {
     // Still inspectable.
     expect(memory.get(stored.memory.id)?.status).toBe('deleted');
   });
+
+  it('resolves an explicit memory id and unique exact subject or content', async () => {
+    const stored = await memory.remember({
+      scope: 'user',
+      kind: 'fact',
+      subject: 'deployment.server',
+      content: 'The staging server is vm-apps.',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+    if (stored.status !== 'stored') throw new Error('setup failed');
+
+    expect(await memory.resolveForget(stored.memory.id, [{ scope: 'user' }])).toMatchObject({
+      status: 'resolved',
+      matchedBy: 'id',
+      memory: { id: stored.memory.id },
+    });
+    expect(await memory.resolveForget('deployment server', [{ scope: 'user' }])).toMatchObject({
+      status: 'resolved',
+      matchedBy: 'subject',
+      memory: { id: stored.memory.id },
+    });
+    expect(
+      await memory.resolveForget('The staging server is vm-apps', [{ scope: 'user' }]),
+    ).toMatchObject({ status: 'resolved', matchedBy: 'content' });
+  });
+
+  it('returns ambiguous candidates without deleting a plausible or duplicate match', async () => {
+    const stored = await Promise.all(
+      ['deployment.primary', 'deployment.secondary'].map((subject) =>
+        memory.remember({
+          scope: 'project',
+          scopeId: PROJECT_A,
+          kind: 'fact',
+          subject,
+          content: 'Deployment requires manual approval.',
+          sourceType: 'user_explicit',
+          explicit: true,
+        }),
+      ),
+    );
+    const ids = stored.flatMap((outcome) =>
+      outcome.status === 'stored' ? [outcome.memory.id] : [],
+    );
+
+    const exact = await memory.resolveForget('Deployment requires manual approval', [
+      { scope: 'project', scopeId: PROJECT_A },
+    ]);
+    expect(exact.status).toBe('ambiguous');
+    if (exact.status === 'ambiguous') expect(exact.candidates).toHaveLength(2);
+
+    const plausible = await memory.resolveForget('deployment approval', [
+      { scope: 'project', scopeId: PROJECT_A },
+    ]);
+    expect(plausible.status).toBe('ambiguous');
+    expect(ids.every((id) => memory.get(id)?.status === 'active')).toBe(true);
+  });
+
+  it('does not resolve an exact id outside the allowed scopes', async () => {
+    const stored = await memory.remember({
+      scope: 'project',
+      scopeId: PROJECT_B,
+      kind: 'fact',
+      content: 'Project B deployment setting.',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+    if (stored.status !== 'stored') throw new Error('setup failed');
+
+    expect(await memory.resolveForget(stored.memory.id, [{ scope: 'user' }])).toEqual({
+      status: 'not_found',
+      candidates: [],
+    });
+  });
 });
 
 describe('temporal correction', () => {

@@ -19,6 +19,7 @@ import type {
   MemoryInput,
   MemoryKind,
   MemoryScope,
+  ForgetResolution,
   RememberOutcome,
   RetrievedMemory,
   RetrieveOptions,
@@ -836,6 +837,69 @@ export class MemoryService {
       id,
     );
     return outcome;
+  }
+
+  /**
+   * Resolve a natural-language forget request without guessing. Only an exact,
+   * unique identity is safe to delete automatically; all fuzzy hits require a
+   * user choice.
+   */
+  async resolveForget(
+    query: string,
+    scopes: ScopeSelector[],
+    limit = 5,
+  ): Promise<ForgetResolution> {
+    const requested = normaliseForHash(query);
+    if (!requested || scopes.length === 0) return { status: 'not_found', candidates: [] };
+    const candidateLimit = Math.max(1, Math.min(50, Math.trunc(limit) || 5));
+
+    const clauses: string[] = [];
+    const params: string[] = [];
+    const seenScopes = new Set<string>();
+    for (const selector of scopes) {
+      const scopeId = selector.scopeId ?? null;
+      const key = `${selector.scope}\0${scopeId ?? ''}`;
+      if (seenScopes.has(key)) continue;
+      seenScopes.add(key);
+      clauses.push(`(scope = ? AND ${scopeId === null ? 'scope_id IS NULL' : 'scope_id = ?'})`);
+      params.push(selector.scope);
+      if (scopeId !== null) params.push(scopeId);
+    }
+
+    const active = (
+      this.db
+        .prepare(`${SELECT_MEMORY} WHERE status = 'active' AND (${clauses.join(' OR ')})`)
+        .all(...params) as Row[]
+    ).map(rowToMemory);
+
+    const byId = active.find((memory) => memory.id === query.trim());
+    if (byId) return { status: 'resolved', memory: byId, matchedBy: 'id' };
+
+    const exact = active.filter(
+      (memory) =>
+        (memory.subject !== null && normaliseForHash(memory.subject) === requested) ||
+        normaliseForHash(memory.content) === requested,
+    );
+    if (exact.length === 1) {
+      const memory = exact[0] as Memory;
+      return {
+        status: 'resolved',
+        memory,
+        matchedBy:
+          memory.subject !== null && normaliseForHash(memory.subject) === requested
+            ? 'subject'
+            : 'content',
+      };
+    }
+    if (exact.length > 1)
+      return { status: 'ambiguous', candidates: exact.slice(0, candidateLimit) };
+
+    const candidates = (
+      await this.retrieve({ query, scopes, limit: candidateLimit, lexicalOnly: true })
+    ).map((result) => result.memory);
+    return candidates.length
+      ? { status: 'ambiguous', candidates }
+      : { status: 'not_found', candidates: [] };
   }
 
   /** Soft delete: the row survives for audit, retrieval ignores it. */

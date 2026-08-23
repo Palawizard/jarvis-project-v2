@@ -98,6 +98,11 @@ export interface ScopeSelector {
   scopeId?: string | null;
 }
 
+export type ForgetResolution =
+  | { status: 'resolved'; memory: Memory; matchedBy: 'id' | 'subject' | 'content' }
+  | { status: 'ambiguous'; candidates: Memory[] }
+  | { status: 'not_found'; candidates: [] };
+
 export interface RetrieveOptions {
   query: string;
   /** Retrieval is scope-filtered BEFORE ranking; unrelated projects never compete. */

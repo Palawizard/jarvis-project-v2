@@ -8,6 +8,7 @@ export * from './memory/types.js';
 export { scanForSecrets, redactSecrets } from './memory/secrets.js';
 export {
   detectExplicitCommand,
+  classifyExplicitMemory,
   scoreCandidate,
   jaccard,
   foldAccents,

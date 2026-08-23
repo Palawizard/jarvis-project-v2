@@ -6,7 +6,7 @@ import { buildClaudeArgs, handleClaudeEvent } from './claude.js';
 import { buildCodexArgs } from './codex.js';
 import { jsonlProtocolError, killTree, runJsonlProcess } from './spawn.js';
 import { parseReviewOutput } from '../review/engine.js';
-import { detectExplicitCommand, scoreCandidate } from '../memory/policy.js';
+import { classifyExplicitMemory, detectExplicitCommand, scoreCandidate } from '../memory/policy.js';
 import type { AgentEvent } from './types.js';
 
 describe('provider process protocol', () => {
@@ -322,6 +322,21 @@ describe('explicit memory command detection (Stage A, no LLM)', () => {
   it('does not fire on an ordinary development request', () => {
     expect(detectExplicitCommand('Add a dark mode toggle to the settings page')).toBeNull();
     expect(detectExplicitCommand('Can you fix the failing build?')).toBeNull();
+  });
+});
+
+describe('explicit memory classification (no LLM)', () => {
+  it.each([
+    ['I prefer dark mode', 'user', 'preference'],
+    ['Je préfère travailler en français', 'user', 'preference'],
+    ['Never push automatically', 'user', 'constraint'],
+    ['Ne pousse jamais automatiquement', 'project', 'constraint'],
+    ['We decided to use SQLite for V1', 'project', 'decision'],
+    ['Nous avons décidé d’utiliser SQLite pour la V1', 'project', 'decision'],
+    ['The staging server is vm-apps', 'user', 'fact'],
+    ['The staging server is vm-apps', 'project', 'project_knowledge'],
+  ] as const)('classifies %j in %s scope as %s', (content, scope, expected) => {
+    expect(classifyExplicitMemory(content, scope)).toBe(expected);
   });
 });
 

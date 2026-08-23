@@ -1,4 +1,4 @@
-import type { MemoryInput, MemoryKind } from './types.js';
+import type { MemoryInput, MemoryKind, MemoryScope } from './types.js';
 
 /**
  * Stage A of the memory write pipeline: deterministic signal detection.
@@ -53,6 +53,31 @@ export function detectExplicitCommand(text: string): ExplicitCommand | null {
     if (m?.[1]) return { action: 'remember', payload: m[1].trim() };
   }
   return null;
+}
+
+/** Classify an explicit remember command without spending agent quota. */
+export function classifyExplicitMemory(content: string, scope: MemoryScope): MemoryKind {
+  const text = foldAccents(content);
+
+  if (/\b(?:i prefer|my preference is|je prefere|ma preference est|j['’ ]aime)\b/i.test(text)) {
+    return 'preference';
+  }
+  if (
+    /\b(?:never|must(?: not)?|do not|don't|should not|il faut|interdit|ne pas)\b/i.test(text) ||
+    /\bne\b.+\bjamais\b/i.test(text)
+  ) {
+    return 'constraint';
+  }
+  if (
+    /\b(?:we|i) decided\b|\bdecision\s*:|\b(?:nous avons|on a) decide\b|\bj['’ ]ai decide\b/i.test(
+      text,
+    )
+  ) {
+    return 'decision';
+  }
+
+  // An unmarked statement is knowledge, not evidence of a preference.
+  return scope === 'project' ? 'project_knowledge' : 'fact';
 }
 
 /** Content that is structurally worthless as durable memory. */

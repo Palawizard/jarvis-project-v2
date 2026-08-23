@@ -119,8 +119,12 @@ export function App() {
           {health.data?.providers.map((p) => (
             <div key={p.id} title={p.reason ?? p.authMethod ?? ''}>
               <span>{p.id}</span>
-              <span style={{ color: p.available ? 'var(--ok)' : 'var(--err)' }}>
-                {p.available ? 'ready' : 'off'}
+              <span
+                style={{
+                  color: p.cooldownUntil ? 'var(--warn)' : p.available ? 'var(--ok)' : 'var(--err)',
+                }}
+              >
+                {p.cooldownUntil ? 'cooldown' : p.available ? 'available' : 'unavailable'}
               </span>
             </div>
           ))}

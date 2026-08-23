@@ -16,6 +16,10 @@ export interface Project {
   devUrl: string | null;
   summary: string | null;
   isSelf: boolean;
+  config: {
+    candidateRuntime?: unknown;
+    visualQa?: { required?: boolean; routes?: string[] };
+  };
   createdAt: string;
   updatedAt: string;
 }
@@ -139,6 +143,15 @@ export interface VisualShot {
   status: string;
   error: string | null;
   reviewedBy: string | null;
+  reviewVerdict: 'pass' | 'needs_fix' | null;
+  reviewFindings: Array<{
+    severity: 'high' | 'medium' | 'low' | 'info';
+    route: string;
+    viewport: 'desktop' | 'mobile';
+    category: string;
+    description: string;
+    recommendation: string;
+  }>;
   createdAt: string;
 }
 
@@ -178,6 +191,8 @@ export interface JobDetail {
   running: boolean;
   acceptanceEligible: boolean;
   acceptanceError: string | null;
+  application: CandidateApplication | null;
+  routingDecisions: RoutingDecision[];
   runs: AgentRun[];
   candidate: CandidateChanges | null;
   verifications: Verification[];
@@ -189,6 +204,29 @@ export interface JobDetail {
   project: Project | null;
 }
 
+export interface CandidateApplication {
+  id: string;
+  status: 'approved' | 'applying' | 'applied' | 'failed' | 'inspection_required';
+  candidateBase: string;
+  candidateHead: string;
+  targetBranch: string | null;
+  targetHeadBefore: string | null;
+  targetHeadAfter: string | null;
+  method: 'ff-only';
+  failure: string | null;
+  approvedAt: string;
+  completedAt: string | null;
+}
+
+export interface RoutingDecision {
+  id: string;
+  role: string;
+  provider: string | null;
+  model: string | null;
+  reason: string;
+  createdAt: string;
+}
+
 export interface ProviderCapability {
   id: string;
   available: boolean;
@@ -197,6 +235,7 @@ export interface ProviderCapability {
   authenticated: boolean;
   authMethod?: string;
   models: string[];
+  cooldownUntil?: string;
 }
 
 export interface Health {
@@ -290,7 +329,7 @@ export const api = {
     }),
 
   command: (text: string, sessionId: string, projectId: string | null) =>
-    request<{ kind: string; reply: string; job?: Job }>('/api/command', {
+    request<{ kind: string; reply: string; job?: Job; candidates?: Memory[] }>('/api/command', {
       method: 'POST',
       body: JSON.stringify({ text, sessionId, projectId }),
     }),
@@ -307,7 +346,10 @@ export const api = {
     request<{ started: boolean }>(`/api/jobs/${id}/start`, { method: 'POST' }),
   cancelJob: (id: string) =>
     request<{ cancelled: boolean }>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
-  acceptJob: (id: string) => request<Job>(`/api/jobs/${id}/accept`, { method: 'POST' }),
+  approveJob: (id: string) =>
+    request<CandidateApplication>(`/api/jobs/${id}/approve`, { method: 'POST' }),
+  applyJob: (id: string) =>
+    request<CandidateApplication>(`/api/jobs/${id}/apply`, { method: 'POST' }),
 
   memory: (params: Record<string, string>) =>
     request<{ items: Memory[]; total: number }>(`/api/memory?${new URLSearchParams(params)}`),

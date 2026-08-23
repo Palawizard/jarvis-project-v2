@@ -23,6 +23,7 @@ export function JobDetailView({
 }) {
   const detail = useAsync(() => api.job(jobId), [jobId]);
   const [pack, setPack] = useState<ContextPack | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // Live refresh, but only for events belonging to this job.
   useEffect(() => {
@@ -55,12 +56,14 @@ export function JobDetailView({
     contextPacks,
     running,
     project,
+    application,
+    routingDecisions,
   } = detail.data;
   const review = reviews[reviews.length - 1];
   const implementationRun = runs.findLast(
     (run) => (run.role === 'implementer' || run.role === 'fixer') && !!run.result,
   );
-  const skipped = project?.commands.dev && project.devUrl ? [] : (['visual_qa'] as const);
+  const skipped = project?.config.visualQa ? [] : (['visual_qa'] as const);
 
   return (
     <div className="page wide">
@@ -88,12 +91,43 @@ export function JobDetailView({
             Start
           </button>
         )}
-        {job.stage === 'awaiting_user' && detail.data.acceptanceEligible && (
+        {job.stage === 'awaiting_user' &&
+          detail.data.acceptanceEligible &&
+          application?.status !== 'approved' &&
+          application?.status !== 'applied' && (
+            <button
+              className="btn sm primary"
+              onClick={() =>
+                void api
+                  .approveJob(job.id)
+                  .then(() => {
+                    setActionError(null);
+                    detail.reload();
+                  })
+                  .catch((error: unknown) =>
+                    setActionError(error instanceof Error ? error.message : String(error)),
+                  )
+              }
+            >
+              Approve Candidate
+            </button>
+          )}
+        {application?.status === 'approved' && !project?.isSelf && (
           <button
             className="btn sm primary"
-            onClick={() => void api.acceptJob(job.id).then(detail.reload)}
+            onClick={() =>
+              void api
+                .applyJob(job.id)
+                .then(() => {
+                  setActionError(null);
+                  detail.reload();
+                })
+                .catch((error: unknown) =>
+                  setActionError(error instanceof Error ? error.message : String(error)),
+                )
+            }
           >
-            Accept candidate
+            Apply to Project
           </button>
         )}
       </div>
@@ -103,6 +137,7 @@ export function JobDetailView({
           <div style={{ color: 'var(--err)' }}>{job.error}</div>
         </Card>
       )}
+      {actionError && <div className="alert error">{actionError}</div>}
       {job.stage === 'awaiting_user' && detail.data.acceptanceError && (
         <div className="alert error">
           This stored candidate cannot be accepted: {detail.data.acceptanceError}
@@ -131,6 +166,47 @@ export function JobDetailView({
             {job.worktreePath && (
               <div className="tiny faint mono" style={{ marginTop: 6, overflowWrap: 'anywhere' }}>
                 {job.worktreePath}
+              </div>
+            )}
+          </Card>
+
+          <Card title={project?.isSelf ? 'Self-upgrade application' : 'Candidate application'}>
+            {!application ? (
+              <Empty>Not approved. Approval records intent but does not modify Git.</Empty>
+            ) : (
+              <div className="grid" style={{ gap: 7 }}>
+                <div className="row">
+                  <Badge
+                    tone={
+                      application.status === 'applied'
+                        ? 'ok'
+                        : application.status === 'failed' ||
+                            application.status === 'inspection_required'
+                          ? 'err'
+                          : 'warn'
+                    }
+                  >
+                    {application.status.replace('_', ' ')}
+                  </Badge>
+                  <span className="small dim">{application.method}</span>
+                </div>
+                <div className="mono tiny">
+                  {application.candidateBase.slice(0, 8)} → {application.candidateHead.slice(0, 8)}
+                </div>
+                {application.targetBranch && (
+                  <div className="small dim">target branch: {application.targetBranch}</div>
+                )}
+                {application.failure && (
+                  <div className="small" style={{ color: 'var(--err)' }}>
+                    {application.failure}
+                  </div>
+                )}
+                {project?.isSelf && application.status === 'approved' && (
+                  <div className="small dim">
+                    This is a self-upgrade. Activation requires the external supervisor and a
+                    separate explicit confirmation.
+                  </div>
+                )}
               </div>
             )}
           </Card>
@@ -311,6 +387,7 @@ export function JobDetailView({
                           <Badge tone="accent">{r.provider}</Badge>
                         </div>
                         <div className="tiny faint">{r.role}</div>
+                        {r.model && <div className="tiny faint mono">{r.model}</div>}
                       </td>
                       <td>
                         <Badge
@@ -352,6 +429,25 @@ export function JobDetailView({
               </table>
             )}
           </Card>
+
+          {routingDecisions.length > 0 && (
+            <Card title="Routing decisions">
+              <div className="grid" style={{ gap: 7 }}>
+                {routingDecisions.map((decision) => (
+                  <div key={decision.id} className="mem-item">
+                    <div className="row">
+                      <Badge>{decision.role}</Badge>
+                      <span className="small">
+                        {decision.provider ?? 'none'}
+                        {decision.model ? ` / ${decision.model}` : ''}
+                      </span>
+                    </div>
+                    <div className="tiny dim">{decision.reason}</div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
 
           {pack && (
             <Card
@@ -425,9 +521,9 @@ export function JobDetailView({
           <Card title="Visual QA evidence">
             {visualQa.length === 0 ? (
               <Empty>
-                {project?.commands.dev && project.devUrl
+                {project?.config.visualQa
                   ? 'No screenshots captured.'
-                  : 'Skipped — project has no dev command + dev URL configured.'}
+                  : 'Skipped — project has no isolated visual-QA runtime configured.'}
               </Empty>
             ) : (
               <div className="shots">
@@ -462,6 +558,20 @@ export function JobDetailView({
                           ? `reviewed by ${s.reviewedBy}`
                           : 'evidence only — not AI-reviewed'}
                       </div>
+                      {s.reviewVerdict && (
+                        <Badge tone={s.reviewVerdict === 'pass' ? 'ok' : 'err'}>
+                          visual {s.reviewVerdict.replace('_', ' ')}
+                        </Badge>
+                      )}
+                      {s.reviewFindings.map((finding, index) => (
+                        <div key={index} className="tiny" style={{ marginTop: 4 }}>
+                          <Badge tone={finding.severity === 'high' ? 'err' : 'warn'}>
+                            {finding.severity}
+                          </Badge>{' '}
+                          {finding.description}
+                          {finding.recommendation ? ` — ${finding.recommendation}` : ''}
+                        </div>
+                      ))}
                     </div>
                   </div>
                 ))}

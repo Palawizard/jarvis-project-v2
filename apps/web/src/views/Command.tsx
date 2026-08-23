@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { api, type JarvisEvent, type Project, type Session } from '../api.ts';
+import { api, type JarvisEvent, type Memory, type Project, type Session } from '../api.ts';
 import { useAsync } from '../hooks.ts';
 import { Card, Badge, Empty } from '../components.tsx';
 
@@ -29,6 +29,7 @@ export function CommandView({
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [forgetCandidates, setForgetCandidates] = useState<Memory[]>([]);
   const conversation = useAsync(() => api.session(), []);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -50,6 +51,7 @@ export function CommandView({
     try {
       const result = await api.command(value, session.id, projectId);
       setText('');
+      setForgetCandidates(result.candidates ?? []);
       conversation.reload();
       if (result.job) onOpenJob(result.job.id);
     } catch (e) {
@@ -111,6 +113,28 @@ export function CommandView({
               {error && (
                 <div className="small" style={{ color: 'var(--err)' }}>
                   {error}
+                </div>
+              )}
+              {forgetCandidates.length > 0 && (
+                <div className="grid" style={{ gap: 6, marginTop: 10 }}>
+                  {forgetCandidates.map((memory) => (
+                    <div key={memory.id} className="spread mem-item">
+                      <span className="small">{memory.content}</span>
+                      <button
+                        className="btn sm danger"
+                        onClick={() =>
+                          void api.deleteMemory(memory.id).then(() => {
+                            setForgetCandidates((items) =>
+                              items.filter((item) => item.id !== memory.id),
+                            );
+                            conversation.reload();
+                          })
+                        }
+                      >
+                        Forget this one
+                      </button>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>

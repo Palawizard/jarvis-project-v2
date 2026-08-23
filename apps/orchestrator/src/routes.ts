@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import {
   detectExplicitCommand,
+  classifyExplicitMemory,
   candidateRejectionReason,
   GitWorkspace,
   repoStatus,
@@ -223,10 +224,11 @@ export function createRoutes(jarvis: Jarvis): Hono {
     if (explicit) {
       const projectId = body.projectId ?? session.projectId;
       if (explicit.action === 'remember') {
+        const scope: MemoryScope = projectId ? 'project' : 'user';
         const outcome = await jarvis.memory.remember({
-          scope: projectId ? 'project' : 'user',
+          scope,
           scopeId: projectId ?? null,
-          kind: 'preference',
+          kind: classifyExplicitMemory(explicit.payload, scope),
           content: explicit.payload,
           sourceType: 'user_explicit',
           sourceRef: { sessionId: session.id },
@@ -243,29 +245,35 @@ export function createRoutes(jarvis: Jarvis): Hono {
       }
 
       if (explicit.action === 'forget') {
-        const matches = await jarvis.memory.retrieve({
-          query: explicit.payload,
-          scopes: [
-            { scope: 'user', scopeId: null },
-            ...(projectId ? [{ scope: 'project' as MemoryScope, scopeId: projectId }] : []),
-          ],
-          limit: 5,
-        });
-        const target = matches[0];
-        if (!target) {
+        const resolution = await jarvis.memory.resolveForget(explicit.payload, [
+          { scope: 'user', scopeId: null },
+          ...(projectId ? [{ scope: 'project' as MemoryScope, scopeId: projectId }] : []),
+        ]);
+        if (resolution.status === 'not_found') {
           const reply = `I could not find a memory matching "${explicit.payload}".`;
           jarvis.sessions.addMessage(session.id, 'assistant', reply);
           return c.json({ kind: 'memory', action: 'forget', reply, candidates: [] });
         }
-        jarvis.memory.forget(target.memory.id);
-        const reply = `Forgot: "${target.memory.content}"`;
+        if (resolution.status === 'ambiguous') {
+          const reply = 'Several memories could match. Choose the exact one to forget.';
+          jarvis.sessions.addMessage(session.id, 'assistant', reply);
+          return c.json({
+            kind: 'memory',
+            action: 'forget',
+            reply,
+            resolution: 'ambiguous',
+            candidates: resolution.candidates,
+          });
+        }
+        jarvis.memory.forget(resolution.memory.id);
+        const reply = `Forgot: "${resolution.memory.content}"`;
         jarvis.sessions.addMessage(session.id, 'assistant', reply);
         return c.json({
           kind: 'memory',
           action: 'forget',
           reply,
-          forgotten: target.memory,
-          candidates: matches.slice(1).map((m) => m.memory),
+          forgotten: resolution.memory,
+          candidates: [],
         });
       }
 
@@ -365,6 +373,8 @@ export function createRoutes(jarvis: Jarvis): Hono {
       running,
       acceptanceEligible: job.stage === 'awaiting_user' && !acceptanceError,
       acceptanceError,
+      application: jarvis.applications.getForJob(job.id),
+      routingDecisions: jarvis.agents.decisions(job.id),
       runs,
       candidate,
       verifications: jarvis.verification.list(job.id),
@@ -390,28 +400,31 @@ export function createRoutes(jarvis: Jarvis): Hono {
     return c.json({ cancelled });
   });
 
-  /** User accepts the candidate. V1 never auto-merges; this only records the decision. */
-  app.post('/api/jobs/:id/accept', async (c) => {
-    const job = jarvis.jobs.get(c.req.param('id'));
-    if (!job) return fail('job not found', 404);
-    if (job.stage !== 'awaiting_user') return fail(`job is ${job.stage}, not awaiting_user`, 409);
-    const evidenceError = candidateRejectionReason(
-      jarvis.verification.latestReport(job.id),
-      jarvis.review.list(job.id).at(-1)?.verdict ?? 'error',
-    );
-    if (evidenceError) return fail(`candidate is not acceptable: ${evidenceError}`, 409);
-    if (!job.worktreePath || !job.baseRef || !job.headRef || !fs.existsSync(job.worktreePath)) {
-      return fail('candidate worktree or reviewed identity is unavailable', 409);
-    }
+  const approveCandidate = async (jobId: string) => {
     try {
-      await git.validateCandidate(job.worktreePath, job.baseRef, job.headRef);
+      return { application: await jarvis.applications.approve(jobId), error: null };
     } catch (error) {
-      return fail(
-        `candidate no longer matches the reviewed identity: ${error instanceof Error ? error.message : String(error)}`,
-        409,
-      );
+      return { application: null, error: error instanceof Error ? error.message : String(error) };
     }
-    return c.json(jarvis.jobs.transition(job.id, 'completed'));
+  };
+
+  app.post('/api/jobs/:id/approve', async (c) => {
+    const result = await approveCandidate(c.req.param('id'));
+    return result.error ? fail(result.error, 409) : c.json(result.application);
+  });
+
+  /** Compatibility alias: acceptance now means approval, never Git mutation. */
+  app.post('/api/jobs/:id/accept', async (c) => {
+    const result = await approveCandidate(c.req.param('id'));
+    return result.error ? fail(result.error, 409) : c.json(result.application);
+  });
+
+  app.post('/api/jobs/:id/apply', async (c) => {
+    try {
+      return c.json(await jarvis.applications.apply(c.req.param('id')));
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
+    }
   });
 
   // ------------------------------------------------------------------ memory --

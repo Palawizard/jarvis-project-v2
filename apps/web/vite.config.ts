@@ -7,6 +7,9 @@ const PORT = Number.parseInt(process.env.JARVIS_WEB_PORT ?? '5199', 10);
 export default defineConfig({
   plugins: [react()],
   server: {
+    // Bind the loopback IPv4 address explicitly: 'localhost' resolves to ::1
+    // first on Windows, and candidate visual QA opens http://127.0.0.1:<port>.
+    host: '127.0.0.1',
     port: Number.isFinite(PORT) ? PORT : 5199,
     strictPort: true,
     // Proxy keeps the browser on one origin: no CORS, and SSE works unchanged.

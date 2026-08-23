@@ -210,46 +210,48 @@ export function ToolsView({
         {(grants.data ?? []).length === 0 ? (
           <Empty>No standing permissions. Every confirmation is asked each time.</Empty>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Tool</th>
-                <th>For</th>
-                <th>Scope</th>
-                <th>Expires</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {(grants.data ?? []).map((grant) => (
-                <tr key={grant.id}>
-                  <td>
-                    <code className="mono">{grant.toolName}</code>
-                  </td>
-                  <td>{grant.actor}</td>
-                  <td className="tiny dim">{projectLabel(projects, grant.projectId)}</td>
-                  <td className="tiny dim">
-                    {grant.expiresAt ? new Date(grant.expiresAt).toLocaleString() : 'never'}
-                  </td>
-                  <td>
-                    <button
-                      className="btn sm danger"
-                      disabled={busy === grant.id}
-                      onClick={() =>
-                        void act(
-                          grant.id,
-                          () => api.revokeToolGrant(grant.id),
-                          `Revoked the standing permission for ${grant.toolName}.`,
-                        )
-                      }
-                    >
-                      Revoke
-                    </button>
-                  </td>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Tool</th>
+                  <th>For</th>
+                  <th>Scope</th>
+                  <th>Expires</th>
+                  <th />
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {(grants.data ?? []).map((grant) => (
+                  <tr key={grant.id}>
+                    <td>
+                      <code className="mono">{grant.toolName}</code>
+                    </td>
+                    <td>{grant.actor}</td>
+                    <td className="tiny dim">{projectLabel(projects, grant.projectId)}</td>
+                    <td className="tiny dim">
+                      {grant.expiresAt ? new Date(grant.expiresAt).toLocaleString() : 'never'}
+                    </td>
+                    <td>
+                      <button
+                        className="btn sm danger"
+                        disabled={busy === grant.id}
+                        onClick={() =>
+                          void act(
+                            grant.id,
+                            () => api.revokeToolGrant(grant.id),
+                            `Revoked the standing permission for ${grant.toolName}.`,
+                          )
+                        }
+                      >
+                        Revoke
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </Card>
 
@@ -257,67 +259,69 @@ export function ToolsView({
         {executions.length === 0 ? (
           <Empty>No tool has been run yet.</Empty>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Tool</th>
-                <th>Risk</th>
-                <th>Asked by</th>
-                <th>Outcome</th>
-                <th>Detail</th>
-                <th>When</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {executions.map((execution) => (
-                <tr key={execution.id}>
-                  <td>
-                    <code className="mono">{execution.toolName}</code>
-                  </td>
-                  <td className="tiny dim">{execution.risk.replace(/_/g, ' ')}</td>
-                  <td className="tiny dim">{execution.actor}</td>
-                  <td>
-                    <Badge tone={STATUS_TONE[execution.status]}>
-                      {execution.status.replace(/_/g, ' ')}
-                    </Badge>
-                  </td>
-                  <td className="tiny dim">{execution.error ?? execution.reason}</td>
-                  <td className="tiny dim nowrap">
-                    {new Date(execution.requestedAt).toLocaleString()}
-                    {execution.durationMs !== null && ` · ${execution.durationMs}ms`}
-                  </td>
-                  <td>
-                    {(execution.status === 'interrupted' ||
-                      execution.status === 'timed_out' ||
-                      execution.status === 'expired' ||
-                      execution.status === 'failed') &&
-                      execution.inputValidated && (
-                        <button
-                          className="btn sm"
-                          disabled={busy === execution.id}
-                          title={
-                            execution.effectUnknown
-                              ? 'Jarvis cannot tell whether this action already took effect. ' +
-                                'Re-issuing it may do it twice.'
-                              : 'Re-issue this action. It goes through the policy again.'
-                          }
-                          onClick={() =>
-                            void act(
-                              execution.id,
-                              () => api.retryTool(execution.id),
-                              `Re-issued ${execution.toolName}.`,
-                            )
-                          }
-                        >
-                          {execution.effectUnknown ? 'Re-issue anyway' : 'Re-issue'}
-                        </button>
-                      )}
-                  </td>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Tool</th>
+                  <th>Risk</th>
+                  <th>Asked by</th>
+                  <th>Outcome</th>
+                  <th>Detail</th>
+                  <th>When</th>
+                  <th />
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {executions.map((execution) => (
+                  <tr key={execution.id}>
+                    <td>
+                      <code className="mono">{execution.toolName}</code>
+                    </td>
+                    <td className="tiny dim">{execution.risk.replace(/_/g, ' ')}</td>
+                    <td className="tiny dim">{execution.actor}</td>
+                    <td>
+                      <Badge tone={STATUS_TONE[execution.status]}>
+                        {execution.status.replace(/_/g, ' ')}
+                      </Badge>
+                    </td>
+                    <td className="tiny dim">{execution.error ?? execution.reason}</td>
+                    <td className="tiny dim nowrap">
+                      {new Date(execution.requestedAt).toLocaleString()}
+                      {execution.durationMs !== null && ` · ${execution.durationMs}ms`}
+                    </td>
+                    <td>
+                      {(execution.status === 'interrupted' ||
+                        execution.status === 'timed_out' ||
+                        execution.status === 'expired' ||
+                        execution.status === 'failed') &&
+                        execution.inputValidated && (
+                          <button
+                            className="btn sm"
+                            disabled={busy === execution.id}
+                            title={
+                              execution.effectUnknown
+                                ? 'Jarvis cannot tell whether this action already took effect. ' +
+                                  'Re-issuing it may do it twice.'
+                                : 'Re-issue this action. It goes through the policy again.'
+                            }
+                            onClick={() =>
+                              void act(
+                                execution.id,
+                                () => api.retryTool(execution.id),
+                                `Re-issued ${execution.toolName}.`,
+                              )
+                            }
+                          >
+                            {execution.effectUnknown ? 'Re-issue anyway' : 'Re-issue'}
+                          </button>
+                        )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </Card>
 
@@ -330,30 +334,32 @@ export function ToolsView({
         {(catalog.data ?? []).length === 0 ? (
           <Empty>No tools are registered.</Empty>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Tool</th>
-                <th>Risk</th>
-                <th>For you</th>
-                <th>Description</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(catalog.data ?? []).map((tool) => (
-                <tr key={tool.name}>
-                  <td>
-                    <code className="mono">{tool.name}</code>
-                  </td>
-                  <td>
-                    <Badge tone={RISK_TONE[tool.risk]}>{tool.risk.replace(/_/g, ' ')}</Badge>
-                  </td>
-                  <td className="tiny dim">{DECISION_LABEL[tool.decision]}</td>
-                  <td className="tiny dim">{tool.description}</td>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Tool</th>
+                  <th>Risk</th>
+                  <th>For you</th>
+                  <th>Description</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {(catalog.data ?? []).map((tool) => (
+                  <tr key={tool.name}>
+                    <td>
+                      <code className="mono">{tool.name}</code>
+                    </td>
+                    <td>
+                      <Badge tone={RISK_TONE[tool.risk]}>{tool.risk.replace(/_/g, ' ')}</Badge>
+                    </td>
+                    <td className="tiny dim">{DECISION_LABEL[tool.decision]}</td>
+                    <td className="tiny dim">{tool.description}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </Card>
     </div>

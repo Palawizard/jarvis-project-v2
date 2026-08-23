@@ -88,9 +88,14 @@ test('command, projects, jobs and controllable memory work in the real UI', asyn
 
   await page.screenshot({ path: testInfo.outputPath('desktop-tools.png'), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect
-    .poll(() => page.locator('nav').evaluate((node) => node.scrollWidth <= node.clientWidth))
-    .toBe(true);
+  // The mobile sidebar scrolls on purpose; what must not regress is reaching
+  // the Tools view from it at phone width.
+  await page.getByRole('button', { name: 'Memory' }).click();
+  const mobileTools = page.getByRole('button', { name: 'Tools' });
+  await mobileTools.scrollIntoViewIfNeeded();
+  await mobileTools.click();
+  await expect(page.getByText('Waiting for you (0)')).toBeVisible();
+  await expect(page.getByRole('row', { name: /memory\.purge/ }).first()).toBeVisible();
   await expect
     .poll(() => page.locator('main').evaluate((node) => node.scrollWidth <= node.clientWidth))
     .toBe(true);

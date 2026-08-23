@@ -83,6 +83,7 @@ async function candidate(
     worktreePath: worktree.path,
     baseRef: worktree.baseRef,
     headRef: head,
+    reviewedHead: head,
   });
   jobs.transition(job.id, 'implementing');
   jobs.transition(job.id, 'verifying');
@@ -106,9 +107,20 @@ async function candidate(
   jobs.transition(job.id, 'reviewing');
   const reviewId = `rev_${job.id}`;
   db.prepare(
-    `INSERT INTO reviews (id, job_id, provider, verdict, summary, findings, created_at)
-     VALUES (?,?,?,?,?,?,?)`,
-  ).run(reviewId, job.id, 'fixture', options.review ?? 'approve', 'fixture review', '[]', nowIso());
+    `INSERT INTO reviews
+      (id, job_id, provider, verdict, summary, findings, head_ref, blocking, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    reviewId,
+    job.id,
+    'fixture',
+    options.review ?? 'approve',
+    'fixture review',
+    '[]',
+    head,
+    options.review === 'request_changes' ? 1 : 0,
+    nowIso(),
+  );
   jobs.transition(job.id, 'awaiting_user');
   const prepared = jobs.get(job.id);
   if (!prepared) throw new Error('prepared job missing');

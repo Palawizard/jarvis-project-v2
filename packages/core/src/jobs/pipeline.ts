@@ -3,13 +3,13 @@ import { getConfig, type JarvisConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
 import type { JobService, Job } from './service.js';
-import type { ProjectService, Project } from '../projects/service.js';
+import type { ProjectService, Project, VisualQaScenario } from '../projects/service.js';
 import type { SessionService } from '../sessions/service.js';
 import type { MemoryService } from '../memory/service.js';
 import type { ContextPackBuilder } from '../context/pack.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import type { VerificationEngine, VerificationReport } from '../verification/engine.js';
-import type { ReviewEngine, Review } from '../review/engine.js';
+import type { ReviewEngine, Review, ReviewFinding } from '../review/engine.js';
 import { VisualQaEngine } from '../visualqa/engine.js';
 import { VisualReviewer } from '../visualqa/reviewer.js';
 import { startCandidateRuntime } from '../runtime/candidate.js';
@@ -22,6 +22,8 @@ import {
   type ProviderId,
 } from '../agents/types.js';
 import type { MemoryInput } from '../memory/types.js';
+import type { AgentRole } from '../agents/types.js';
+import type { VisualReview } from '../visualqa/reviewer.js';
 
 const log = createLogger('pipeline');
 
@@ -67,6 +69,256 @@ export class JobPipeline {
       new VisualReviewer(deps.db, deps.agents, deps.jobs, this.config.artifactsDir, deps.bus);
   }
 
+  private async runCandidateGates(input: {
+    job: Job;
+    project: Project;
+    cwd: string;
+    contextPackId: string;
+    implementerSummary: string;
+    implementerProvider?: ProviderId;
+    proposals: ReturnType<typeof proposalToInput>[];
+    runId: string;
+    signal: AbortSignal;
+  }): Promise<void> {
+    const { jobs, verification, review, context, sessions } = this.deps;
+    const { jobId } = { jobId: input.job.id };
+    let job = jobs.get(jobId) as Job;
+    let provider = input.implementerProvider;
+    for (;;) {
+      if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
+
+      // Verification failures have their own bounded repair budget.
+      let report: VerificationReport;
+      for (;;) {
+        jobs.transition(jobId, 'verifying', { pauseReason: null, error: null });
+        job = jobs.get(jobId) as Job;
+        report = await verification.run({
+          jobId,
+          cwd: input.cwd,
+          commands: input.project.commands,
+          steps: input.project.config.verification?.steps,
+          cycle: job.fixCycles + job.reviewFixCycles + job.visualFixCycles,
+          signal: input.signal,
+        });
+        if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
+        if (report.passed) break;
+        if (job.fixCycles >= this.config.pipeline.maxFixCycles) {
+          this.pause(
+            jobId,
+            'verifying',
+            report.failureSummary || 'deterministic verification failed',
+          );
+          return;
+        }
+        const cycle = job.fixCycles + 1;
+        jobs.transition(jobId, 'fixing', { fixCycles: cycle });
+        const fixed = await this.runAgentStage({
+          jobId,
+          role: 'fixer',
+          cwd: input.cwd,
+          contextPackId: input.contextPackId,
+          prompt: buildFixerPrompt({ job, failures: report.failureSummary }),
+          signal: input.signal,
+          preferredProvider: provider,
+          resumeSessionId: job.resumeSessionId ?? undefined,
+        });
+        if (fixed.status === 'cancelled' || input.signal.aborted) {
+          jobs.transition(jobId, 'cancelled');
+          return;
+        }
+        if (fixed.status !== 'completed') {
+          this.pause(
+            jobId,
+            'fixing',
+            `${fixed.error ?? 'verification fixer provider attempts exhausted'}\n\n${report.failureSummary}`,
+          );
+          return;
+        }
+        provider = fixed.provider;
+        await this.git.commitPending(input.cwd, `jarvis: verification fix ${cycle}`);
+        job = jobs.patch(jobId, {
+          reviewedHead: null,
+          visualHead: null,
+          headRef: await this.git.resolveCommit(input.cwd, 'HEAD'),
+        });
+      }
+
+      await this.git.commitPending(input.cwd, 'jarvis: deterministic verification updates');
+      const changes = await this.git.validateCandidate(input.cwd, job.baseRef as string);
+      job = jobs.patch(jobId, { headRef: changes.head, reviewedHead: null, visualHead: null });
+
+      const session = job.sessionId ? sessions.get(job.sessionId) : null;
+      const reviewerPack = await context.build({
+        role: 'reviewer',
+        query: `${job.goal}\n${job.request}`,
+        projectId: input.project.id,
+        sessionId: job.sessionId,
+        jobId,
+        projectSnapshot: renderProjectSnapshot(input.project),
+        sessionState: session ? sessions.renderState(session.state) : null,
+      });
+      jobs.transition(jobId, 'reviewing');
+      const reviewResult = await review.review({
+        jobId,
+        cwd: input.cwd,
+        request: job.request,
+        goal: job.goal,
+        acceptance: job.acceptance,
+        diff: changes.diff,
+        files: changes.files,
+        verification: report,
+        contextPack: reviewerPack.rendered,
+        contextPackId: reviewerPack.id,
+        ...(provider ? { implementerProvider: provider } : {}),
+        implementerSummary: input.implementerSummary,
+        headRef: changes.head,
+        taskProfile: { selfDevelopment: input.project.isSelf },
+        signal: input.signal,
+      });
+      if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
+      if (reviewResult.verdict === 'error') {
+        this.pause(jobId, 'reviewing', reviewResult.summary);
+        return;
+      }
+      const blockers = reviewResult.findings.filter((finding) =>
+        this.config.pipeline.codeReviewBlockingSeverities.includes(finding.severity),
+      );
+      if (blockers.length) {
+        if (job.reviewFixCycles >= this.config.pipeline.maxReviewFixCycles) {
+          this.pause(jobId, 'reviewing', renderCodeBlockers(blockers));
+          return;
+        }
+        const cycle = job.reviewFixCycles + 1;
+        jobs.transition(jobId, 'fixing', { reviewFixCycles: cycle });
+        const fixed = await this.runAgentStage({
+          jobId,
+          role: 'fixer',
+          cwd: input.cwd,
+          contextPackId: input.contextPackId,
+          prompt: buildReviewFixerPrompt({ job, blockers, verification: report }),
+          signal: input.signal,
+          preferredProvider: provider,
+          resumeSessionId: job.resumeSessionId ?? undefined,
+        });
+        if (fixed.status === 'cancelled' || input.signal.aborted) {
+          jobs.transition(jobId, 'cancelled');
+          return;
+        }
+        if (fixed.status !== 'completed') {
+          this.pause(
+            jobId,
+            'fixing',
+            `${fixed.error ?? 'code-review fixer provider attempts exhausted'}\n\n${renderCodeBlockers(blockers)}`,
+          );
+          return;
+        }
+        provider = fixed.provider;
+        await this.git.commitPending(input.cwd, `jarvis: code review fix ${cycle}`);
+        jobs.patch(jobId, { reviewedHead: null, visualHead: null });
+        continue;
+      }
+      job = jobs.patch(jobId, { reviewedHead: changes.head });
+
+      const visualConfig = resolveVisualConfig(job, input.project);
+      const uiChanged = changes.files.some((file) =>
+        /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i.test(file.path),
+      );
+      const shouldVisualQa = Boolean(
+        visualConfig && (visualConfig.required === true || uiChanged || job.visualQaConfig),
+      );
+      if (shouldVisualQa && visualConfig) {
+        jobs.transition(jobId, 'visual_qa');
+        const visual = await this.runVisualQa({
+          job,
+          project: input.project,
+          cwd: input.cwd,
+          signal: input.signal,
+          config: visualConfig,
+          implementerProvider: provider,
+          headRef: changes.head,
+          cycle: job.visualFixCycles,
+        });
+        if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
+        if (visual.kind === 'infrastructure') {
+          this.pause(jobId, 'visual_qa', visual.error);
+          return;
+        } else if (visual.kind === 'blocking') {
+          const blockingReview = {
+            ...visual.review,
+            findings: visual.review.findings.filter((finding) =>
+              this.config.pipeline.visualBlockingSeverities.includes(finding.severity),
+            ),
+          };
+          if (job.visualFixCycles >= this.config.pipeline.maxVisualFixCycles) {
+            this.pause(jobId, 'visual_qa', renderVisualBlockers(blockingReview));
+            return;
+          }
+          const cycle = job.visualFixCycles + 1;
+          jobs.transition(jobId, 'fixing', { visualFixCycles: cycle });
+          const fixed = await this.runAgentStage({
+            jobId,
+            role: 'visual_fixer',
+            cwd: input.cwd,
+            contextPackId: input.contextPackId,
+            prompt: buildVisualFixerPrompt({ job, review: blockingReview, diff: changes.diff }),
+            imagePaths: visual.shots.flatMap((shot) =>
+              shot.screenshotPath ? [shot.screenshotPath] : [],
+            ),
+            signal: input.signal,
+            preferredProvider: provider,
+            resumeSessionId: job.resumeSessionId ?? undefined,
+          });
+          if (fixed.status === 'cancelled' || input.signal.aborted) {
+            jobs.transition(jobId, 'cancelled');
+            return;
+          }
+          if (fixed.status !== 'completed') {
+            this.pause(
+              jobId,
+              'fixing',
+              `${fixed.error ?? 'visual fixer provider attempts exhausted'}\n\n${renderVisualBlockers(blockingReview)}`,
+            );
+            return;
+          }
+          provider = fixed.provider;
+          await this.git.commitPending(input.cwd, `jarvis: visual fix ${cycle}`);
+          jobs.patch(jobId, { reviewedHead: null, visualHead: null });
+          continue;
+        } else {
+          job = jobs.patch(jobId, { visualHead: changes.head });
+        }
+      }
+
+      await this.git.validateCandidate(input.cwd, job.baseRef as string, changes.head);
+      job = jobs.get(jobId) as Job;
+      if (
+        job.reviewedHead !== changes.head ||
+        (shouldVisualQa && job.visualHead !== changes.head)
+      ) {
+        this.pause(
+          jobId,
+          shouldVisualQa ? 'visual_qa' : 'reviewing',
+          'candidate evidence identity is stale',
+        );
+        return;
+      }
+      const episodeId = await this.consolidate({
+        job,
+        project: input.project,
+        changes,
+        verification: report,
+        review: reviewResult,
+        implementerSummary: input.implementerSummary,
+        proposals: input.proposals,
+        runId: input.runId,
+      });
+      if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled', { episodeId });
+      jobs.transition(jobId, 'awaiting_user', { episodeId, pauseReason: null, error: null });
+      log.info('job finished', { jobId, verdict: reviewResult.verdict, verified: report.passed });
+      return;
+    }
+  }
+
   isRunning(jobId: string): boolean {
     return this.running.has(jobId);
   }
@@ -80,6 +332,18 @@ export class JobPipeline {
 
   /** Fire-and-forget entry point used by the HTTP layer. */
   start(jobId: string): void {
+    const job = this.deps.jobs.get(jobId);
+    if (!job || job.stage !== 'queued') return;
+    this.launch(jobId);
+  }
+
+  resume(jobId: string): void {
+    const job = this.deps.jobs.get(jobId);
+    if (!job || job.stage !== 'paused') return;
+    this.launch(jobId);
+  }
+
+  private launch(jobId: string): void {
     if (this.running.has(jobId)) return;
     const controller = new AbortController();
     this.running.set(jobId, controller);
@@ -88,10 +352,18 @@ export class JobPipeline {
         log.error('pipeline crashed', { jobId, error: String(error) });
         try {
           const job = this.deps.jobs.get(jobId);
-          if (job && job.status === 'running') {
-            this.deps.jobs.transition(jobId, 'failed', {
-              error: error instanceof Error ? error.message : String(error),
-            });
+          if (job) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (job.stage === 'paused') {
+              this.deps.jobs.patch(jobId, {
+                pauseReason: `Resume refused: ${message}`,
+                error: `Resume refused: ${message}`,
+              });
+            } else if (job.status === 'running' && job.worktreePath) {
+              this.pause(jobId, job.stage, message);
+            } else if (job.status === 'running') {
+              this.deps.jobs.transition(jobId, 'failed', { error: message });
+            }
           }
         } catch {
           /* job already terminal */
@@ -101,16 +373,108 @@ export class JobPipeline {
   }
 
   private async execute(jobId: string, signal: AbortSignal): Promise<void> {
-    const { jobs, projects, context, agents, verification, review, sessions, bus } = this.deps;
+    const { jobs, projects, context, sessions, bus } = this.deps;
     let job = jobs.get(jobId);
     if (!job) throw new Error(`job not found: ${jobId}`);
     const project = projects.get(job.projectId);
     if (!project) throw new Error(`project not found: ${job.projectId}`);
 
+    const session = job.sessionId ? sessions.get(job.sessionId) : null;
+
+    if (job.stage === 'paused') {
+      const resumeStage = job.resumeStage ?? 'verifying';
+      if (!job.worktreePath || !job.baseRef) {
+        if (resumeStage !== 'planning') {
+          jobs.patch(jobId, {
+            pauseReason: 'Resume refused: paused job has no recoverable worktree checkpoint',
+            error: 'Resume refused: paused job has no recoverable worktree checkpoint',
+          });
+          return;
+        }
+        job = jobs.transition(jobId, 'planning', { pauseReason: null, error: null });
+      }
+    }
+
+    if (job.stage === 'paused' && job.worktreePath && job.baseRef) {
+      const resumeStage = job.resumeStage ?? 'verifying';
+      await this.git.validateRecoveryWorkspace({
+        repoRoot: project.rootPath,
+        worktreePath: job.worktreePath,
+        baseRef: job.baseRef,
+        expectedHead: job.headRef,
+        allowDirty: resumeStage === 'implementing' || resumeStage === 'fixing',
+      });
+      const pack = await context.build({
+        role: 'implementer',
+        query: `${job.goal}\n${job.request}`,
+        projectId: project.id,
+        sessionId: job.sessionId,
+        jobId,
+        projectSnapshot: renderProjectSnapshot(project),
+        sessionState: session ? sessions.renderState(session.state) : null,
+      });
+      let summary =
+        jobs
+          .runs(jobId)
+          .filter((run) => run.result)
+          .at(-1)?.result ?? 'resumed candidate';
+      let provider = job.lastProvider ?? undefined;
+      let runId = jobs.runs(jobId).at(-1)?.id ?? '';
+      if (resumeStage === 'implementing' || resumeStage === 'fixing') {
+        jobs.transition(jobId, resumeStage, { pauseReason: null, error: null });
+        const resumed = await this.runAgentStage({
+          jobId,
+          role: resumeStage === 'implementing' ? 'implementer' : 'fixer',
+          cwd: job.worktreePath,
+          contextPackId: pack.id,
+          prompt: buildResumePrompt(job, resumeStage),
+          signal,
+          preferredProvider: provider,
+          resumeSessionId: job.resumeSessionId ?? undefined,
+        });
+        if (resumed.status === 'cancelled' || signal.aborted) {
+          jobs.transition(jobId, 'cancelled');
+          return;
+        }
+        if (resumed.status !== 'completed') {
+          this.pause(jobId, resumeStage, resumed.error ?? 'resumed agent stage exhausted');
+          return;
+        }
+        await this.git.commitPending(job.worktreePath, `jarvis: resume ${resumeStage}`);
+        summary = resumed.result;
+        provider = resumed.provider;
+        runId = resumed.runId;
+      }
+      await this.runCandidateGates({
+        job: jobs.get(jobId) as Job,
+        project,
+        cwd: job.worktreePath,
+        contextPackId: pack.id,
+        implementerSummary: summary,
+        implementerProvider: provider,
+        proposals: [],
+        runId,
+        signal,
+      });
+      return;
+    }
+
     // ------------------------------------------------------------- planning --
-    job = jobs.transition(jobId, 'planning');
+    if (job.stage !== 'planning') job = jobs.transition(jobId, 'planning');
+    const source =
+      job.validationOnly && job.candidateBaseSha && job.candidateSourceSha
+        ? await this.git.validateCandidateSource(
+            project.rootPath,
+            job.candidateBaseSha,
+            job.candidateSourceSha,
+          )
+        : null;
     const worktree = await this.git
-      .createWorktree({ repoRoot: project.rootPath, jobId })
+      .createWorktree({
+        repoRoot: project.rootPath,
+        jobId,
+        ...(source ? { baseRef: source.baseSha } : {}),
+      })
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         jobs.transition(jobId, 'failed', { error: `Worktree creation failed: ${message}` });
@@ -131,7 +495,6 @@ export class JobPipeline {
       baseRef: worktree.baseRef,
     });
 
-    const session = job.sessionId ? sessions.get(job.sessionId) : null;
     const pack = await context.build({
       role: 'implementer',
       query: `${job.goal}\n${job.request}`,
@@ -144,273 +507,234 @@ export class JobPipeline {
 
     if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
 
-    // --------------------------------------------------------- implementing --
-    job = jobs.transition(jobId, 'implementing');
-    const routed = await agents.route('implementer', {
-      prefer: this.config.agents.implementerProvider,
-      jobId,
-      taskProfile: { selfDevelopment: project.isSelf },
-    });
-    if (!routed.provider) {
-      jobs.transition(jobId, 'failed', { error: `No coding agent available: ${routed.reason}` });
+    if (source) {
+      const head = await this.git.materializeCandidate(
+        worktree.path,
+        source.baseSha,
+        source.sourceSha,
+      );
+      job = jobs.patch(jobId, {
+        headRef: head,
+        candidateBaseSha: source.baseSha,
+        candidateSourceSha: source.sourceSha,
+      });
+      await this.runCandidateGates({
+        job,
+        project,
+        cwd: worktree.path,
+        contextPackId: pack.id,
+        implementerSummary: `Validation-only import of ${source.sourceSha}`,
+        proposals: [],
+        runId: '',
+        signal,
+      });
       return;
     }
-    const providerId = routed.provider.id as ProviderId;
 
-    const implResult = await this.runAgent({
+    job = jobs.transition(jobId, 'implementing');
+    const implResult = await this.runAgentStage({
       jobId,
-      provider: providerId,
       role: 'implementer',
       cwd: worktree.path,
       contextPackId: pack.id,
-      model: routed.decision?.model ?? undefined,
       prompt: buildImplementerPrompt({ job, project, contextPack: pack.rendered }),
       signal,
+      preferredProvider: this.config.agents.implementerProvider,
     });
-
     if (implResult.status === 'cancelled' || signal.aborted) {
       jobs.transition(jobId, 'cancelled');
       return;
     }
     if (implResult.status !== 'completed') {
-      jobs.transition(jobId, 'failed', {
-        error: `Implementer failed: ${implResult.error ?? 'unknown'}`,
-      });
-      return;
-    }
-
-    // Agents do not reliably commit; make the candidate a real ref either way.
-    await this.git.commitPending(worktree.path, `jarvis: ${job.goal}`);
-
-    // ------------------------------------------------ verifying (+ fixing) ---
-    let verificationReport: VerificationReport | null = null;
-    let cycle = 0;
-    for (;;) {
-      if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
-      jobs.transition(jobId, 'verifying');
-      verificationReport = await verification.run({
+      this.pause(
         jobId,
-        cwd: worktree.path,
-        commands: project.commands,
-        cycle,
-        signal,
-      });
-      if (verificationReport.passed || verificationReport.ran === 0) break;
-      if (cycle >= this.config.pipeline.maxFixCycles) {
-        bus.emit({
-          type: 'verification.completed',
-          jobId,
-          payload: {
-            note: `verification still failing after ${cycle} fix cycle(s); continuing to review`,
-          },
-        });
-        break;
-      }
-
-      cycle += 1;
-      jobs.transition(jobId, 'fixing', { fixCycles: cycle });
-      const fixResult = await this.runAgent({
-        jobId,
-        provider: providerId,
-        role: 'fixer',
-        cwd: worktree.path,
-        contextPackId: pack.id,
-        prompt: buildFixerPrompt({ job, failures: verificationReport.failureSummary }),
-        signal,
-        // Resuming the implementer's session keeps its working context without
-        // re-sending it, which is both cheaper and more accurate.
-        resumeSessionId: implResult.sessionId,
-      });
-      await this.git.commitPending(worktree.path, `jarvis: fix cycle ${cycle}`);
-      if (fixResult.status === 'cancelled') return void jobs.transition(jobId, 'cancelled');
-    }
-
-    await this.git.commitPending(worktree.path, 'jarvis: deterministic verification updates');
-    const changes = await this.git.validateCandidate(worktree.path, worktree.baseRef);
-    job = jobs.patch(jobId, { headRef: changes.head });
-
-    // ------------------------------------------------------------ reviewing --
-    if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
-    const reviewerPack = await context.build({
-      role: 'reviewer',
-      query: `${job.goal}\n${job.request}`,
-      projectId: project.id,
-      sessionId: job.sessionId,
-      jobId,
-      projectSnapshot: renderProjectSnapshot(project),
-      sessionState: session ? sessions.renderState(session.state) : null,
-    });
-    jobs.transition(jobId, 'reviewing');
-    const reviewResult = await review.review({
-      jobId,
-      cwd: worktree.path,
-      request: job.request,
-      goal: job.goal,
-      acceptance: job.acceptance,
-      diff: changes.diff,
-      files: changes.files,
-      verification: verificationReport,
-      contextPack: reviewerPack.rendered,
-      contextPackId: reviewerPack.id,
-      implementerProvider: providerId,
-      implementerSummary: implResult.result,
-      taskProfile: { selfDevelopment: project.isSelf },
-      signal,
-    });
-
-    if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
-    const rejection = candidateRejectionReason(verificationReport, reviewResult.verdict);
-    if (rejection) {
-      const episodeId = await this.consolidate({
-        job,
-        project,
-        changes,
-        verification: verificationReport,
-        review: reviewResult,
-        implementerSummary: implResult.result,
-        proposals: [],
-        runId: implResult.runId,
-      });
-      jobs.transition(jobId, 'failed', {
-        episodeId,
-        error: rejection,
-      });
-      return;
-    }
-
-    // ------------------------------------------------------------ visual QA --
-    const visualConfig = project.config.visualQa;
-    const uiChanged = changes.files.some((file) =>
-      /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i.test(file.path),
-    );
-    const shouldVisualQa = Boolean(visualConfig && (!visualConfig.required || uiChanged));
-    if (shouldVisualQa) {
-      jobs.transition(jobId, 'visual_qa');
-      await this.runVisualQa(
-        jobId,
-        project,
-        worktree.path,
-        signal,
-        Boolean(visualConfig?.required),
-        providerId,
-        job,
+        'implementing',
+        `Implementer unavailable: ${implResult.error ?? 'unknown'}`,
       );
-    }
-    if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
-
-    try {
-      await this.git.validateCandidate(worktree.path, worktree.baseRef, changes.head);
-    } catch (error) {
-      jobs.transition(jobId, 'failed', {
-        error: `Candidate changed after review: ${error instanceof Error ? error.message : String(error)}`,
-      });
       return;
     }
-
-    // ------------------------------------------- memory consolidation + done --
-    const episodeId = await this.consolidate({
-      job,
+    await this.git.commitPending(worktree.path, `jarvis: ${job.goal}`);
+    await this.runCandidateGates({
+      job: jobs.get(jobId) as Job,
       project,
-      changes,
-      verification: verificationReport,
-      review: reviewResult,
+      cwd: worktree.path,
+      contextPackId: pack.id,
       implementerSummary: implResult.result,
+      implementerProvider: implResult.provider,
       proposals: implResult.proposals,
       runId: implResult.runId,
-    });
-    if (signal.aborted) return void jobs.transition(jobId, 'cancelled', { episodeId });
-
-    // V1 safety rule: a successful job NEVER auto-merges. The user decides.
-    jobs.transition(jobId, 'awaiting_user', { episodeId });
-    log.info('job finished', {
-      jobId,
-      verdict: reviewResult.verdict,
-      verified: verificationReport.passed,
+      signal,
     });
   }
 
-  private async runVisualQa(
-    jobId: string,
-    project: Project,
-    cwd: string,
-    signal: AbortSignal,
-    required: boolean,
-    implementerProvider: ProviderId,
-    job: Job,
-  ): Promise<void> {
-    const visual = project.config.visualQa;
-    if (!visual) return;
+  private async runVisualQa(opts: {
+    job: Job;
+    project: Project;
+    cwd: string;
+    signal: AbortSignal;
+    config: { required?: boolean; scenarios: VisualQaScenario[] };
+    implementerProvider?: ProviderId;
+    headRef: string;
+    cycle: number;
+  }): Promise<
+    | { kind: 'pass'; review: VisualReview; shots: Awaited<ReturnType<VisualQaEngine['capture']>> }
+    | {
+        kind: 'blocking';
+        review: VisualReview;
+        shots: Awaited<ReturnType<VisualQaEngine['capture']>>;
+      }
+    | { kind: 'infrastructure'; error: string }
+  > {
+    let outcome:
+      | {
+          kind: 'pass';
+          review: VisualReview;
+          shots: Awaited<ReturnType<VisualQaEngine['capture']>>;
+        }
+      | {
+          kind: 'blocking';
+          review: VisualReview;
+          shots: Awaited<ReturnType<VisualQaEngine['capture']>>;
+        }
+      | { kind: 'infrastructure'; error: string };
     let server: Awaited<ReturnType<typeof startCandidateRuntime>> | undefined;
     try {
       server = await startCandidateRuntime({
-        project,
-        cwd,
-        jobId,
+        project: opts.project,
+        cwd: opts.cwd,
+        jobId: opts.job.id,
         config: this.config,
-        signal,
+        signal: opts.signal,
       });
       const shots = await this.visualQa.capture({
-        jobId,
-        projectId: project.id,
+        jobId: opts.job.id,
+        projectId: opts.project.id,
         baseUrl: server.baseUrl,
-        routes: visual.routes?.length
-          ? visual.routes
-          : project.stack.webRoutes?.length
-            ? project.stack.webRoutes
-            : ['/'],
-        ...(visual.interactions ? { interactions: visual.interactions } : {}),
-        signal,
+        routes: opts.config.scenarios.map((scenario) => scenario.route),
+        scenarios: opts.config.scenarios,
+        signal: opts.signal,
+        headRef: opts.headRef,
+        cycle: opts.cycle,
       });
-      if (required && shots.some((shot) => shot.status !== 'captured')) {
-        throw new Error('required visual QA did not capture every configured route and viewport');
-      }
-      const review = await this.visualReviewer.review({
-        jobId,
-        cwd,
-        goal: job.goal,
-        acceptance: job.acceptance,
-        shots,
-        implementerProvider,
-        selfDevelopment: project.isSelf,
-        signal,
-      });
-      if (required && review.verdict !== 'pass') {
-        throw new Error(
+      if (shots.some((shot) => shot.status !== 'captured')) {
+        outcome = { kind: 'infrastructure', error: 'visual QA did not capture every scenario' };
+      } else {
+        const review = await this.visualReviewer.review({
+          jobId: opts.job.id,
+          cwd: opts.cwd,
+          goal: opts.job.goal,
+          acceptance: opts.job.acceptance,
+          shots,
+          ...(opts.implementerProvider ? { implementerProvider: opts.implementerProvider } : {}),
+          selfDevelopment: opts.project.isSelf,
+          signal: opts.signal,
+        });
+        outcome =
           review.verdict === 'error'
-            ? `required visual reviewer failed: ${review.error ?? 'unknown error'}`
-            : 'required visual review found blocking UI issues',
-        );
+            ? { kind: 'infrastructure', error: review.error ?? 'visual reviewer failed' }
+            : review.verdict === 'needs_fix'
+              ? { kind: 'blocking', review, shots }
+              : { kind: 'pass', review, shots };
       }
     } catch (error) {
-      if (signal.aborted) return;
       const message = error instanceof Error ? error.message : String(error);
       this.visualQa.recordFailure({
-        jobId,
-        projectId: project.id,
+        jobId: opts.job.id,
+        projectId: opts.project.id,
         route: '(candidate runtime)',
         error: `Could not start the dev server for visual QA: ${message}`,
+        headRef: opts.headRef,
+        cycle: opts.cycle,
       });
       this.deps.bus.emit({
         type: 'visual_qa.completed',
-        jobId,
+        jobId: opts.job.id,
         payload: { error: message, captured: 0 },
       });
-      if (required) throw new Error(`Required visual QA failed: ${message}`);
+      outcome = { kind: 'infrastructure', error: message };
     } finally {
-      await server?.stop();
+      try {
+        await server?.stop();
+      } catch (error) {
+        outcome = {
+          kind: 'infrastructure',
+          error: `candidate runtime cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
     }
+    return outcome;
+  }
+
+  private async runAgentStage(opts: {
+    jobId: string;
+    role: 'implementer' | 'fixer' | 'visual_fixer';
+    cwd: string;
+    prompt: string;
+    contextPackId: string;
+    signal: AbortSignal;
+    preferredProvider?: ProviderId;
+    resumeSessionId?: string;
+    imagePaths?: string[];
+  }): Promise<Awaited<ReturnType<JobPipeline['runAgent']>> & { provider?: ProviderId }> {
+    let preferred = opts.preferredProvider;
+    let resumeSessionId = opts.resumeSessionId;
+    let last:
+      (Awaited<ReturnType<JobPipeline['runAgent']>> & { provider?: ProviderId }) | undefined;
+    for (let attempt = 0; attempt <= this.config.pipeline.agentStageRetries; attempt++) {
+      const routed = await this.deps.agents.route(opts.role, {
+        ...(preferred ? { prefer: preferred } : {}),
+        jobId: opts.jobId,
+        taskProfile: {
+          selfDevelopment: this.deps.projects.get(this.deps.jobs.get(opts.jobId)?.projectId ?? '')
+            ?.isSelf,
+        },
+      });
+      if (!routed.provider) {
+        last = {
+          status: 'failed',
+          result: '',
+          error: `No healthy provider: ${routed.reason}`,
+          proposals: [],
+          runId: '',
+        };
+      } else {
+        const provider = routed.provider.id;
+        const result = await this.runAgent({
+          ...opts,
+          provider,
+          model: routed.decision.model ?? undefined,
+          ...(resumeSessionId && provider === preferred ? { resumeSessionId } : {}),
+        });
+        last = { ...result, provider };
+        if (result.status === 'completed' || result.status === 'cancelled') return last;
+        preferred = undefined;
+        resumeSessionId = undefined;
+      }
+      this.deps.bus.emit({
+        type: 'agent.stage.retry',
+        jobId: opts.jobId,
+        payload: {
+          stage: opts.role,
+          attempt: attempt + 1,
+          provider: last.provider,
+          error: last.error,
+        },
+      });
+    }
+    return last as Awaited<ReturnType<JobPipeline['runAgent']>> & { provider?: ProviderId };
   }
 
   private async runAgent(opts: {
     jobId: string;
     provider: ProviderId;
-    role: 'implementer' | 'fixer';
+    role: Extract<AgentRole, 'implementer' | 'fixer' | 'visual_fixer'>;
     cwd: string;
     prompt: string;
     contextPackId: string;
     model?: string;
     signal: AbortSignal;
     resumeSessionId?: string | undefined;
+    imagePaths?: string[];
   }): Promise<{
     status: string;
     result: string;
@@ -432,6 +756,15 @@ export class JobPipeline {
 
     const onEvent = (event: AgentEvent) => {
       switch (event.kind) {
+        case 'started':
+          if (event.sessionId) {
+            jobs.checkpointRunSession(run.id, event.sessionId);
+            jobs.patch(opts.jobId, {
+              lastProvider: opts.provider,
+              resumeSessionId: event.sessionId,
+            });
+          }
+          break;
         case 'text':
           bus.emit({
             type: 'agent.output',
@@ -487,6 +820,7 @@ export class JobPipeline {
           ...(opts.model ? { model: opts.model } : {}),
           signal: opts.signal,
           ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
+          ...(opts.imagePaths?.length ? { imagePaths: opts.imagePaths } : {}),
         },
         onEvent,
       );
@@ -507,6 +841,10 @@ export class JobPipeline {
       error: result.error ?? null,
       externalSessionId: result.sessionId ?? null,
       usage: result.usage ?? {},
+    });
+    jobs.patch(opts.jobId, {
+      lastProvider: opts.provider,
+      resumeSessionId: result.sessionId ?? opts.resumeSessionId ?? null,
     });
     bus.emit({
       type: result.status === 'completed' ? 'agent.completed' : 'agent.failed',
@@ -530,6 +868,19 @@ export class JobPipeline {
       ),
       runId: run.id,
     };
+  }
+
+  private pause(jobId: string, resumeStage: Job['stage'], reason: string): void {
+    this.deps.jobs.transition(jobId, 'paused', {
+      resumeStage,
+      pauseReason: reason.slice(0, 20_000),
+      error: reason.slice(0, 20_000),
+    });
+    this.deps.bus.emit({
+      type: 'system.recovery',
+      jobId,
+      payload: { reason: 'pipeline_paused', resumeStage, detail: reason.slice(0, 2_000) },
+    });
   }
 
   /**
@@ -719,4 +1070,88 @@ ${input.failures.slice(0, 12_000)}
 Fix the underlying cause, not the symptom. Do not disable, skip or weaken checks
 to make them pass. If a failure is pre-existing and unrelated to your change, say
 so explicitly in your summary instead of papering over it.`;
+}
+
+function resolveVisualConfig(
+  job: Job,
+  project: Project,
+): { required?: boolean; scenarios: VisualQaScenario[] } | null {
+  if (job.visualQaConfig) return job.visualQaConfig;
+  const visual = project.config.visualQa;
+  if (!visual) return null;
+  const routes = visual.routes?.length
+    ? visual.routes
+    : project.stack.webRoutes?.length
+      ? project.stack.webRoutes
+      : ['/'];
+  return {
+    required: visual.required,
+    scenarios: visual.scenarios?.length
+      ? visual.scenarios
+      : routes.map((route) => ({
+          name: route === '/' ? 'default' : route,
+          route,
+          ...(visual.interactions ? { interactions: visual.interactions } : {}),
+        })),
+  };
+}
+
+function renderCodeBlockers(findings: ReviewFinding[]): string {
+  return `Code review repair budget exhausted. Blocking findings:\n${JSON.stringify(findings, null, 2)}`;
+}
+
+function renderVisualBlockers(review: VisualReview): string {
+  return `Visual repair budget exhausted. Blocking findings:\n${JSON.stringify(review.findings, null, 2)}`;
+}
+
+function buildReviewFixerPrompt(input: {
+  job: Job;
+  blockers: ReviewFinding[];
+  verification: VerificationReport;
+}): string {
+  return `Fix the exact blocking findings from an independent code review in this same worktree.
+
+## Request
+${input.job.request}
+
+## Acceptance criteria
+${input.job.acceptance.map((item) => `- ${item}`).join('\n') || '- none supplied'}
+
+## Blocking structured findings
+${JSON.stringify(input.blockers, null, 2)}
+
+## Latest deterministic verification
+${input.verification.results.map((result) => `- ${result.name}: ${result.status}`).join('\n')}
+
+Do not weaken checks or address advisory findings unless the blocking fix requires it. Finish with a concise summary.`;
+}
+
+function buildVisualFixerPrompt(input: { job: Job; review: VisualReview; diff: string }): string {
+  return `Fix only the visible product issues shown in the attached screenshots.
+
+## Request
+${input.job.request}
+
+## Acceptance criteria
+${input.job.acceptance.map((item) => `- ${item}`).join('\n') || '- none supplied'}
+
+## Blocking structured visual findings
+${JSON.stringify(input.review.findings, null, 2)}
+
+## Current diff summary
+${input.diff.slice(0, 12_000)}
+
+The screenshots are evidence. Do not infer or rewrite unrelated hidden behavior. Finish with a concise summary.`;
+}
+
+function buildResumePrompt(job: Job, stage: Job['stage']): string {
+  return `Resume the interrupted ${stage} stage in the existing worktree.
+
+Original request: ${job.request}
+Acceptance criteria:\n${job.acceptance.map((item) => `- ${item}`).join('\n') || '- none supplied'}
+
+Checkpoint reason and exact known stage context:
+${job.pauseReason ?? job.error ?? 'orchestrator interruption'}
+
+Inspect the current worktree first; it may contain partial edits from the interrupted session. Continue safely without creating another worktree or changing Git history outside this branch.`;
 }

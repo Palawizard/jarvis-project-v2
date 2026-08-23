@@ -11,9 +11,13 @@ export function JobsView({
   onOpen: (id: string) => void;
 }) {
   const byId = new Map(projects.map((p) => [p.id, p]));
-  const active = jobs.filter((j) => j.status === 'running' || j.status === 'pending');
+  const active = jobs.filter(
+    (j) => j.status === 'running' || j.status === 'pending' || j.status === 'paused',
+  );
   const awaiting = jobs.filter((j) => j.status === 'awaiting_user');
-  const done = jobs.filter((j) => !['running', 'pending', 'awaiting_user'].includes(j.status));
+  const done = jobs.filter(
+    (j) => !['running', 'pending', 'paused', 'awaiting_user'].includes(j.status),
+  );
 
   const table = (list: Job[]) => (
     <table>

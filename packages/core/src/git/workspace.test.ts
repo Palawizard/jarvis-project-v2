@@ -71,6 +71,15 @@ describe('worktree isolation', () => {
     expect(git(['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('main');
   });
 
+  it('recovers the same validated job worktree after a planning interruption', async () => {
+    const first = await workspace.createWorktree({ repoRoot: repo, jobId: 'resume-planning' });
+    const second = await workspace.createWorktree({ repoRoot: repo, jobId: 'resume-planning' });
+
+    expect(second.path).toBe(first.path);
+    expect(second.branch).toBe(first.branch);
+    expect(second.warnings.join(' ')).toContain('Recovered');
+  });
+
   it('NEVER destroys uncommitted user work', async () => {
     const scratch = path.join(repo, 'important-unsaved.txt');
     fs.writeFileSync(scratch, 'hours of unsaved work');
@@ -98,8 +107,9 @@ describe('worktree isolation', () => {
     expect(fs.existsSync(path.join(b.path, 'only-a.txt'))).toBe(false);
   });
 
-  it('refuses to reuse an existing worktree path', async () => {
-    await workspace.createWorktree({ repoRoot: repo, jobId: 'job_dup' });
+  it('refuses to reuse an ambiguous existing worktree', async () => {
+    const existing = await workspace.createWorktree({ repoRoot: repo, jobId: 'job_dup' });
+    fs.writeFileSync(path.join(existing.path, 'unexpected.txt'), 'ambiguous');
     await expect(workspace.createWorktree({ repoRoot: repo, jobId: 'job_dup' })).rejects.toThrow(
       GitError,
     );
@@ -190,6 +200,80 @@ describe('collecting the candidate change', () => {
     expect(changes.diffTruncated).toBe(true);
     expect(changes.diff).toContain('[diff truncated');
     expect(changes.diff.length).toBeLessThan(260_000);
+  });
+});
+
+describe('immutable candidate materialization', () => {
+  it('reproduces the pinned source tree including deletes, binary bytes, and modes', async () => {
+    fs.writeFileSync(path.join(repo, 'deleted.txt'), 'remove me\n');
+    fs.writeFileSync(path.join(repo, 'mode.sh'), '#!/bin/sh\necho base\n');
+    git(['add', '-A']);
+    git(['commit', '-qm', 'candidate base']);
+    const base = git(['rev-parse', 'HEAD']);
+
+    git(['switch', '-qc', 'candidate-source']);
+    fs.rmSync(path.join(repo, 'deleted.txt'));
+    fs.writeFileSync(path.join(repo, 'added.txt'), 'added\n');
+    fs.writeFileSync(path.join(repo, 'binary.bin'), Buffer.from([0, 255, 1, 2, 128, 13, 10]));
+    fs.writeFileSync(path.join(repo, 'mode.sh'), '#!/bin/sh\necho source\n');
+    git(['add', '-A']);
+    git(['update-index', '--chmod=+x', 'mode.sh']);
+    git(['commit', '-qm', 'candidate source']);
+    const source = git(['rev-parse', 'HEAD']);
+    const sourceRefBefore = git(['rev-parse', 'candidate-source']);
+    git(['switch', '-q', 'main']);
+
+    await expect(workspace.validateCandidateSource(repo, base, source)).resolves.toEqual({
+      baseSha: base,
+      sourceSha: source,
+    });
+    const worktree = await workspace.createWorktree({
+      repoRoot: repo,
+      jobId: 'job_import',
+      baseRef: base,
+    });
+    const materialized = await workspace.materializeCandidate(worktree.path, base, source);
+
+    expect(git(['rev-parse', `${materialized}^{tree}`], worktree.path)).toBe(
+      git(['rev-parse', `${source}^{tree}`]),
+    );
+    expect(fs.existsSync(path.join(worktree.path, 'deleted.txt'))).toBe(false);
+    expect(fs.readFileSync(path.join(worktree.path, 'added.txt'), 'utf8')).toBe('added\n');
+    expect(fs.readFileSync(path.join(worktree.path, 'binary.bin'))).toEqual(
+      Buffer.from([0, 255, 1, 2, 128, 13, 10]),
+    );
+    expect(git(['ls-tree', 'HEAD', 'mode.sh'], worktree.path)).toMatch(/^100755 /);
+    expect(git(['rev-parse', 'candidate-source'])).toBe(sourceRefBefore);
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('main');
+  });
+
+  it('rejects a source outside the registered repository and an unrelated base', async () => {
+    const foreign = path.join(home, 'foreign');
+    fs.mkdirSync(foreign);
+    execFileSync('git', ['init', '-q'], { cwd: foreign });
+    execFileSync('git', ['config', 'user.email', 't@t'], { cwd: foreign });
+    execFileSync('git', ['config', 'user.name', 't'], { cwd: foreign });
+    fs.writeFileSync(path.join(foreign, 'foreign.txt'), 'foreign');
+    execFileSync('git', ['add', '-A'], { cwd: foreign });
+    execFileSync('git', ['commit', '-qm', 'foreign'], { cwd: foreign });
+    const foreignSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: foreign,
+      encoding: 'utf8',
+    }).trim();
+    await expect(
+      workspace.validateCandidateSource(repo, git(['rev-parse', 'HEAD']), foreignSha),
+    ).rejects.toMatchObject({ code: 'commit_missing' });
+
+    const base = git(['rev-parse', 'HEAD']);
+    git(['switch', '--orphan', 'unrelated']);
+    fs.writeFileSync(path.join(repo, 'unrelated.txt'), 'unrelated');
+    git(['add', '-A']);
+    git(['commit', '-qm', 'unrelated source']);
+    const unrelated = git(['rev-parse', 'HEAD']);
+    git(['switch', '-q', 'main']);
+    await expect(workspace.validateCandidateSource(repo, base, unrelated)).rejects.toMatchObject({
+      code: 'candidate_source_base_mismatch',
+    });
   });
 });
 

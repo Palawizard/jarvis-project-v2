@@ -5,7 +5,7 @@ import { GitWorkspace, repoStatus } from '../git/workspace.js';
 import { newId, nowIso } from '../ids.js';
 import { candidateRejectionReason } from '../jobs/pipeline.js';
 import type { JobService } from '../jobs/service.js';
-import type { ProjectService } from '../projects/service.js';
+import type { ProjectService, VisualQaScenario } from '../projects/service.js';
 import type { ReviewEngine } from '../review/engine.js';
 import type { VerificationEngine } from '../verification/engine.js';
 
@@ -341,31 +341,64 @@ export class CandidateApplicationService {
         'candidate_missing',
       );
     }
-    const changes = await this.git.validateCandidate(job.worktreePath, job.baseRef, job.headRef);
+    if (
+      latestReview.headRef !== job.headRef ||
+      latestReview.blocking ||
+      job.reviewedHead !== job.headRef
+    ) {
+      throw new CandidateApplicationError(
+        'code review identity is stale or still blocking',
+        'review_identity_mismatch',
+      );
+    }
+    await this.git.validateCandidate(job.worktreePath, job.baseRef, job.headRef);
     const project = this.projects.get(job.projectId);
-    const uiChanged = changes.files.some((file) =>
-      /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i.test(file.path),
-    );
-    if (project?.config.visualQa?.required && uiChanged) {
+    const visualRequired = job.visualQaConfig?.required ?? project?.config.visualQa?.required;
+    if (visualRequired || job.visualHead) {
+      if (job.visualHead !== job.headRef) {
+        throw new CandidateApplicationError(
+          'visual evidence identity is stale',
+          'visual_identity_mismatch',
+        );
+      }
       const rows = this.db
         .prepare(
-          `SELECT status, reviewed_by, review_findings FROM visual_qa WHERE job_id=? ORDER BY created_at`,
+          `SELECT scenario_name,route,viewport,status,reviewed_by,review_findings FROM visual_qa
+           WHERE job_id=? AND head_ref=? ORDER BY created_at DESC, rowid DESC`,
         )
-        .all(jobId) as Array<{
+        .all(jobId, job.headRef) as Array<{
+        scenario_name: string;
+        route: string;
+        viewport: string;
         status: string;
         reviewed_by: string | null;
         review_findings: string | null;
       }>;
-      const passed =
-        rows.length > 0 &&
-        rows.every((row) => {
+      const projectVisual = project?.config.visualQa;
+      const configuredScenarios = job.visualQaConfig?.scenarios ?? projectVisual?.scenarios;
+      const scenarios: VisualQaScenario[] = configuredScenarios?.length
+        ? configuredScenarios
+        : (projectVisual?.routes?.length
+            ? projectVisual.routes
+            : (project?.stack.webRoutes ?? ['/'])
+          ).map((route) => ({ name: route === '/' ? 'default' : route, route }));
+      const passed = scenarios.every((scenario) =>
+        (scenario.viewports ?? ['desktop', 'mobile']).every((viewport) => {
+          const row = rows.find(
+            (candidate) =>
+              candidate.scenario_name === scenario.name &&
+              candidate.route === scenario.route &&
+              candidate.viewport === viewport,
+          );
+          if (!row) return false;
           if (row.status !== 'captured' || !row.reviewed_by || !row.review_findings) return false;
           try {
             return (JSON.parse(row.review_findings) as { verdict?: string }).verdict === 'pass';
           } catch {
             return false;
           }
-        });
+        }),
+      );
       if (!passed) {
         throw new CandidateApplicationError(
           'required visual review is missing, failed, or contains blocking findings',

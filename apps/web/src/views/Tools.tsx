@@ -7,6 +7,7 @@ import {
   type RiskLevel,
   type ToolExecution,
   type ToolExecutionStatus,
+  type ToolCapabilities,
   type ToolGrant,
   type ToolSummary,
 } from '../api.ts';
@@ -65,6 +66,7 @@ export function ToolsView({
   lastEvent: JarvisEvent | null;
 }) {
   const catalog = useAsync<ToolSummary[]>(() => api.tools(), []);
+  const capabilities = useAsync<ToolCapabilities>(() => api.toolCapabilities(), []);
   const history = useAsync<{ pending: ToolExecution[]; executions: ToolExecution[] }>(
     () => api.toolExecutions(),
     [],
@@ -94,7 +96,7 @@ export function ToolsView({
     try {
       const outcome = (await run()) as { status?: string; error?: string } | null;
       const status = outcome?.status;
-      if (status === 'denied' || status === 'failed') {
+      if (status === 'denied' || status === 'failed' || status === 'timed_out') {
         setActionError(outcome?.error ?? `The action was ${status}.`);
       } else {
         setNotice(done);
@@ -110,7 +112,7 @@ export function ToolsView({
 
   const pending = history.data?.pending ?? [];
   const executions = history.data?.executions ?? [];
-  const loadErrors = [catalog.error, history.error, grants.error].filter(
+  const loadErrors = [catalog.error, capabilities.error, history.error, grants.error].filter(
     (error): error is string => !!error,
   );
 
@@ -127,6 +129,11 @@ export function ToolsView({
         </div>
       )}
       {notice && <div className="tiny dim">{notice}</div>}
+      {capabilities.data && !capabilities.data.sensitiveAgentTools.active && (
+        <div className="alert" role="status">
+          Sensitive agent tools are disabled: {capabilities.data.sensitiveAgentTools.reason}
+        </div>
+      )}
 
       <Card title={`Waiting for you (${pending.length})`}>
         {pending.length === 0 ? (

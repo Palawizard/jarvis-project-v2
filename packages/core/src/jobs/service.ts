@@ -2,6 +2,8 @@ import type { Db } from '../db/index.js';
 import { parseJson } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
+import type { ProviderId } from '../agents/types.js';
+import type { VisualQaScenario } from '../projects/service.js';
 import {
   assertTransition,
   isTerminal,
@@ -25,6 +27,18 @@ export interface Job {
   baseRef: string | null;
   headRef: string | null;
   fixCycles: number;
+  reviewFixCycles: number;
+  visualFixCycles: number;
+  resumeStage: JobStage | null;
+  pauseReason: string | null;
+  lastProvider: ProviderId | null;
+  resumeSessionId: string | null;
+  reviewedHead: string | null;
+  visualHead: string | null;
+  candidateBaseSha: string | null;
+  candidateSourceSha: string | null;
+  validationOnly: boolean;
+  visualQaConfig: { required?: boolean; scenarios: VisualQaScenario[] } | null;
   episodeId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -66,6 +80,21 @@ function rowToJob(row: Row): Job {
     baseRef: (row.base_ref as string) ?? null,
     headRef: (row.head_ref as string) ?? null,
     fixCycles: Number(row.fix_cycles ?? 0),
+    reviewFixCycles: Number(row.review_fix_cycles ?? 0),
+    visualFixCycles: Number(row.visual_fix_cycles ?? 0),
+    resumeStage: (row.resume_stage as JobStage) ?? null,
+    pauseReason: (row.pause_reason as string) ?? null,
+    lastProvider: (row.last_provider as ProviderId) ?? null,
+    resumeSessionId: (row.resume_session_id as string) ?? null,
+    reviewedHead: (row.reviewed_head as string) ?? null,
+    visualHead: (row.visual_head as string) ?? null,
+    candidateBaseSha: (row.candidate_base_sha as string) ?? null,
+    candidateSourceSha: (row.candidate_source_sha as string) ?? null,
+    validationOnly: Number(row.validation_only) === 1,
+    visualQaConfig: parseJson(
+      row.visual_qa_config as string,
+      null as { required?: boolean; scenarios: VisualQaScenario[] } | null,
+    ),
     episodeId: (row.episode_id as string) ?? null,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
@@ -104,7 +133,16 @@ export class JobService {
     request: string;
     goal?: string;
     acceptance?: string[];
+    candidateSource?: { baseSha: string; sourceSha: string };
+    validationOnly?: boolean;
+    visualQa?: { required?: boolean; scenarios: VisualQaScenario[] };
   }): Job {
+    if (Boolean(input.candidateSource) !== Boolean(input.validationOnly)) {
+      throw new Error('candidateSource and validationOnly must be supplied together');
+    }
+    if (input.visualQa && input.visualQa.scenarios.length === 0) {
+      throw new Error('job visual QA override requires at least one scenario');
+    }
     const now = nowIso();
     const job: Job = {
       id: newId('job'),
@@ -123,6 +161,18 @@ export class JobService {
       baseRef: null,
       headRef: null,
       fixCycles: 0,
+      reviewFixCycles: 0,
+      visualFixCycles: 0,
+      resumeStage: null,
+      pauseReason: null,
+      lastProvider: null,
+      resumeSessionId: null,
+      reviewedHead: null,
+      visualHead: null,
+      candidateBaseSha: input.candidateSource?.baseSha ?? null,
+      candidateSourceSha: input.candidateSource?.sourceSha ?? null,
+      validationOnly: input.validationOnly ?? false,
+      visualQaConfig: input.visualQa ?? null,
       episodeId: null,
       createdAt: now,
       updatedAt: now,
@@ -131,7 +181,9 @@ export class JobService {
     this.db
       .prepare(
         `INSERT INTO jobs (id, session_id, project_id, request, goal, acceptance, stage, status,
-          fix_cycles, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+          fix_cycles, review_fix_cycles, visual_fix_cycles, candidate_base_sha,
+          candidate_source_sha, validation_only, visual_qa_config, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         job.id,
@@ -143,6 +195,12 @@ export class JobService {
         job.stage,
         job.status,
         0,
+        0,
+        0,
+        job.candidateBaseSha,
+        job.candidateSourceSha,
+        job.validationOnly ? 1 : 0,
+        job.visualQaConfig ? JSON.stringify(job.visualQaConfig) : null,
         now,
         now,
       );
@@ -194,7 +252,10 @@ export class JobService {
     this.db
       .prepare(
         `UPDATE jobs SET stage=?, status=?, error=?, branch=?, worktree_path=?, base_ref=?, head_ref=?,
-          fix_cycles=?, episode_id=?, goal=?, acceptance=?, updated_at=?, finished_at=? WHERE id=?`,
+          fix_cycles=?, review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?,
+          last_provider=?, resume_session_id=?, reviewed_head=?, visual_head=?, candidate_base_sha=?,
+          candidate_source_sha=?, validation_only=?, visual_qa_config=?, episode_id=?, goal=?,
+          acceptance=?, updated_at=?, finished_at=? WHERE id=?`,
       )
       .run(
         next.stage,
@@ -205,6 +266,18 @@ export class JobService {
         next.baseRef,
         next.headRef,
         next.fixCycles,
+        next.reviewFixCycles,
+        next.visualFixCycles,
+        next.resumeStage,
+        next.pauseReason,
+        next.lastProvider,
+        next.resumeSessionId,
+        next.reviewedHead,
+        next.visualHead,
+        next.candidateBaseSha,
+        next.candidateSourceSha,
+        next.validationOnly ? 1 : 0,
+        next.visualQaConfig ? JSON.stringify(next.visualQaConfig) : null,
         next.episodeId,
         next.goal,
         JSON.stringify(next.acceptance),
@@ -235,7 +308,10 @@ export class JobService {
     this.db
       .prepare(
         `UPDATE jobs SET error=?, branch=?, worktree_path=?, base_ref=?, head_ref=?, fix_cycles=?,
-          episode_id=?, goal=?, acceptance=?, updated_at=? WHERE id=?`,
+          review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?, last_provider=?,
+          resume_session_id=?, reviewed_head=?, visual_head=?, candidate_base_sha=?,
+          candidate_source_sha=?, validation_only=?, visual_qa_config=?, episode_id=?, goal=?,
+          acceptance=?, updated_at=? WHERE id=?`,
       )
       .run(
         next.error,
@@ -244,6 +320,18 @@ export class JobService {
         next.baseRef,
         next.headRef,
         next.fixCycles,
+        next.reviewFixCycles,
+        next.visualFixCycles,
+        next.resumeStage,
+        next.pauseReason,
+        next.lastProvider,
+        next.resumeSessionId,
+        next.reviewedHead,
+        next.visualHead,
+        next.candidateBaseSha,
+        next.candidateSourceSha,
+        next.validationOnly ? 1 : 0,
+        next.visualQaConfig ? JSON.stringify(next.visualQaConfig) : null,
         next.episodeId,
         next.goal,
         JSON.stringify(next.acceptance),
@@ -329,6 +417,14 @@ export class JobService {
       );
   }
 
+  checkpointRunSession(runId: string, externalSessionId: string): void {
+    this.db
+      .prepare(
+        `UPDATE agent_runs SET external_session_id=? WHERE id=? AND status='running' AND external_session_id IS NULL`,
+      )
+      .run(externalSessionId, runId);
+  }
+
   runs(jobId: string): AgentRun[] {
     const rows = this.db
       .prepare('SELECT * FROM agent_runs WHERE job_id = ? ORDER BY started_at ASC')
@@ -339,9 +435,8 @@ export class JobService {
   /**
    * Crash recovery.
    *
-   * Any job left mid-flight by a killed orchestrator is marked failed with an
-   * explicit reason. We never resume automatically: the worktree state after an
-   * abrupt kill is unknown, and silently continuing would be worse than saying so.
+   * Jobs are never resumed automatically. Their exact stage and worktree are
+   * checkpointed as paused so an explicit resume can validate the workspace.
    */
   recoverInterrupted(): { jobs: number; runs: number } {
     const now = nowIso();
@@ -358,11 +453,13 @@ export class JobService {
     for (const job of stale) {
       this.db
         .prepare(
-          `UPDATE jobs SET stage='failed', status='failed', error=?, updated_at=?, finished_at=? WHERE id=?`,
+          `UPDATE jobs SET stage='paused', status='paused', resume_stage=?, pause_reason=?, error=?,
+             updated_at=?, finished_at=NULL WHERE id=?`,
         )
         .run(
-          `Orchestrator restarted during stage "${job.stage}". Worktree preserved; re-run to continue.`,
-          now,
+          job.stage,
+          'orchestrator_restart',
+          `Orchestrator restarted during stage "${job.stage}". Worktree preserved; resume after validation.`,
           now,
           job.id,
         );

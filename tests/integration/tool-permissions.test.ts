@@ -38,6 +38,7 @@ function boot(home: string): Jarvis {
 function registerOutsideWorldTool(jarvis: Jarvis, outbox: string) {
   jarvis.tools.register({
     name: 'test.send',
+    revision: '1',
     description: 'Pretends to send something to the outside world.',
     risk: 'sensitive',
     input: z.object({ to: z.string().min(1), body: z.string().min(1) }),
@@ -155,6 +156,7 @@ describe('tool permission layer end to end', () => {
     let started = 0;
     first.tools.register({
       name: 'test.slow',
+      revision: '1',
       description: 'A long action the process does not outlive.',
       risk: 'reversible_modification',
       input: z.object({ note: z.string() }),
@@ -172,8 +174,8 @@ describe('tool permission layer end to end', () => {
       { note: 'half done' },
       { actor: 'user' },
     );
-    expect(outcome.status).toBe('failed');
-    if (outcome.status !== 'failed') return;
+    expect(outcome.status).toBe('timed_out');
+    if (outcome.status !== 'timed_out') return;
     expect(outcome.error).toMatch(/timed out/);
     expect(started).toBe(1);
 

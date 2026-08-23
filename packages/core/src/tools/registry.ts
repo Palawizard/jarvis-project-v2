@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { transaction, type Db } from '../db/index.js';
 import type { EventBus } from '../events/bus.js';
@@ -21,6 +23,8 @@ export interface ToolDefinition<TInput = unknown, TOutput = unknown> {
   name: string;
   description: string;
   risk: RiskLevel;
+  /** Bump when the schema or security-relevant meaning changes. */
+  revision: string;
   input: z.ZodType<TInput>;
   /** Hard ceiling for one invocation. Falls back to the registry default. */
   timeoutMs?: number;
@@ -60,6 +64,8 @@ export interface ToolCallContext {
   agentRunId?: string | null;
   /** Voluntary extra ceiling. Can only tighten what the actor is already allowed. */
   maxRisk?: RiskLevel | undefined;
+  /** Internal audit link used by explicit re-issue. */
+  parentExecutionId?: string | null;
 }
 
 export type ToolExecutionStatus =
@@ -84,6 +90,7 @@ export interface ToolExecution {
   id: string;
   toolName: string;
   risk: RiskLevel;
+  definitionRevision: string | null;
   actor: ToolActor;
   decision: PolicyDecision;
   status: ToolExecutionStatus;
@@ -92,7 +99,9 @@ export interface ToolExecution {
   projectId: string | null;
   jobId: string | null;
   agentRunId: string | null;
+  parentExecutionId: string | null;
   input: unknown;
+  inputHash: string | null;
   /**
    * Whether `input` is the schema-validated payload the tool would receive.
    * Denied and malformed attempts keep their arguments for the audit trail only
@@ -139,6 +148,7 @@ export interface GrantInput {
 export type ToolExecutionOutcome =
   | { status: 'succeeded'; execution: ToolExecution; result: unknown }
   | { status: 'failed'; execution: ToolExecution; error: string }
+  | { status: 'timed_out'; execution: ToolExecution; error: string; effectUnknown: true }
   | { status: 'denied'; execution: ToolExecution; error: string }
   | { status: 'pending_approval'; execution: ToolExecution };
 
@@ -202,6 +212,9 @@ export class ToolRegistry {
 
   register<TInput, TOutput>(tool: ToolDefinition<TInput, TOutput>): void {
     if (this.#tools.has(tool.name)) throw new Error(`tool already registered: ${tool.name}`);
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(tool.revision)) {
+      throw new Error(`invalid tool revision for ${tool.name}`);
+    }
     this.#tools.set(tool.name, tool as unknown as ToolDefinition<never, unknown>);
   }
 
@@ -261,6 +274,7 @@ export class ToolRegistry {
         status: 'denied',
         reason: outcome.reason,
         inputJson: this.#record(rawInput ?? null),
+        inputValidated: false,
         grantId: null,
       });
       this.#emit('tool.execution.denied', execution);
@@ -279,6 +293,7 @@ export class ToolRegistry {
         status: 'failed',
         reason: 'invalid_input',
         inputJson: this.#record(rawInput ?? null),
+        inputValidated: false,
         grantId: grant?.id ?? null,
         error: message,
       });
@@ -295,6 +310,7 @@ export class ToolRegistry {
         status: 'denied',
         reason,
         inputJson: null,
+        inputValidated: false,
         grantId: null,
         error: message,
       });
@@ -309,6 +325,13 @@ export class ToolRegistry {
     const serialized = safeJson(parsed.data);
     if (serialized === null) {
       return refuse('unserialisable_input', 'refused: the arguments are not serialisable');
+    }
+    const canonicalInput = JSON.parse(serialized) as unknown;
+    if (!isDeepStrictEqual(parsed.data, canonicalInput)) {
+      return refuse(
+        'noncanonical_input',
+        'refused: transformed arguments do not round-trip through canonical JSON',
+      );
     }
     const secrets = scanForSecrets(serialized);
     if (!secrets.clean) {
@@ -333,6 +356,8 @@ export class ToolRegistry {
       status: outcome.decision === 'allow' ? 'running' : 'pending_approval',
       reason: outcome.reason,
       inputJson: serialized,
+      inputValidated: true,
+      inputHash: canonicalHash(serialized),
       grantId: grant?.id ?? null,
     });
 
@@ -342,7 +367,7 @@ export class ToolRegistry {
     }
 
     this.#emit('tool.execution.started', execution);
-    return this.#run(tool, execution, parsed.data);
+    return this.#run(tool, execution, canonicalInput);
   }
 
   /**
@@ -370,8 +395,21 @@ export class ToolRegistry {
       return { status: 'failed', execution: failed, error: failed.error ?? 'tool missing' };
     }
 
-    // Re-decide at approval time. A tool re-classified as riskier since the
-    // request was made, or a row edited underneath us, must not sail through.
+    if (
+      pending.risk !== tool.risk ||
+      pending.definitionRevision !== definitionRevision(tool) ||
+      !pending.inputValidated ||
+      !pending.inputHash ||
+      canonicalHash(safeJson(pending.input) ?? '') !== pending.inputHash
+    ) {
+      const message =
+        'tool definition or canonical input changed since review; create a new request';
+      const failed = this.#finish(executionId, 'failed', { error: message });
+      this.#emit('tool.execution.failed', failed);
+      return { status: 'failed', execution: failed, error: message };
+    }
+
+    // Re-decide at approval time as a second policy guard.
     const recheck = decide({
       risk: tool.risk,
       actor: pending.actor,
@@ -382,14 +420,6 @@ export class ToolRegistry {
       const denied = this.#finish(executionId, 'denied', { error: recheck.reason });
       this.#emit('tool.execution.denied', denied);
       return { status: 'denied', execution: denied, error: recheck.reason };
-    }
-
-    const parsed = (tool.input as z.ZodType).safeParse(pending.input);
-    if (!parsed.success) {
-      const message = `stored arguments no longer validate against ${tool.name}`;
-      const failed = this.#finish(executionId, 'failed', { error: message });
-      this.#emit('tool.execution.failed', failed);
-      return { status: 'failed', execution: failed, error: message };
     }
 
     // Refuse an impossible "always allow" *before* claiming the row: throwing
@@ -452,7 +482,7 @@ export class ToolRegistry {
     const execution = this.getExecution(executionId);
     if (!execution) throw new ToolPermissionError('tool execution vanished', 'execution_not_found');
     this.#emit('tool.execution.approved', execution);
-    return this.#run(tool, execution, parsed.data);
+    return this.#run(tool, execution, pending.input);
   }
 
   /**
@@ -490,10 +520,10 @@ export class ToolRegistry {
   async retry(executionId: string): Promise<ToolExecutionOutcome> {
     const previous = this.getExecution(executionId);
     if (!previous) throw new ToolPermissionError('tool execution not found', 'execution_not_found');
-    if (previous.status === 'pending_approval' || previous.status === 'running') {
+    if (!['interrupted', 'timed_out', 'expired', 'failed'].includes(previous.status)) {
       throw new ToolPermissionError(
-        `execution is still ${previous.status}`,
-        'execution_not_finished',
+        `execution status ${previous.status} cannot be re-issued`,
+        'execution_not_retryable',
       );
     }
     // Stored arguments of a rejected attempt are redacted audit text, not a
@@ -512,6 +542,8 @@ export class ToolRegistry {
       sessionId: previous.sessionId,
       projectId: previous.projectId,
       jobId: previous.jobId,
+      agentRunId: previous.agentRunId,
+      parentExecutionId: previous.id,
     });
   }
 
@@ -584,7 +616,14 @@ export class ToolRegistry {
         durationMs: Date.now() - startedAt,
       });
       this.#emit('tool.execution.failed', finished);
-      return { status: 'failed', execution: finished, error: finished.error ?? 'tool failed' };
+      return timedOut
+        ? {
+            status: 'timed_out',
+            execution: finished,
+            error: finished.error ?? 'tool timed out',
+            effectUnknown: true,
+          }
+        : { status: 'failed', execution: finished, error: finished.error ?? 'tool failed' };
     } finally {
       clearTimeout(timer);
     }
@@ -844,6 +883,8 @@ export class ToolRegistry {
     reason: string;
     /** Already serialised by the caller, which decides faithful vs audit-only. */
     inputJson: string | null;
+    inputValidated: boolean;
+    inputHash?: string | null;
     grantId: string | null;
     error?: string;
   }): ToolExecution {
@@ -853,14 +894,16 @@ export class ToolRegistry {
     this.#db
       .prepare(
         `INSERT INTO tool_executions
-           (id, tool_name, risk, actor, decision, status, reason, session_id, project_id, job_id,
-            agent_run_id, input, error, grant_id, requested_at, started_at, finished_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           (id, tool_name, risk, definition_revision, actor, decision, status, reason, session_id,
+            project_id, job_id, agent_run_id, parent_execution_id, input, input_hash,
+            input_validated, error, grant_id, requested_at, started_at, finished_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
         args.tool.name,
         args.tool.risk,
+        definitionRevision(args.tool),
         args.ctx.actor,
         args.decision,
         args.status,
@@ -869,7 +912,10 @@ export class ToolRegistry {
         args.ctx.projectId ?? null,
         args.ctx.jobId ?? null,
         args.ctx.agentRunId ?? null,
+        args.ctx.parentExecutionId ?? null,
         args.inputJson,
+        args.inputHash ?? null,
+        args.inputValidated ? 1 : 0,
         args.error === undefined ? null : this.#recordError(args.error),
         args.grantId,
         timestamp,
@@ -1005,6 +1051,7 @@ function rowToExecution(row: Row): ToolExecution {
     id: row.id as string,
     toolName: row.tool_name as string,
     risk: row.risk as RiskLevel,
+    definitionRevision: (row.definition_revision as string) ?? null,
     actor: row.actor as ToolActor,
     decision: row.decision as PolicyDecision,
     status: row.status as ToolExecutionStatus,
@@ -1013,8 +1060,10 @@ function rowToExecution(row: Row): ToolExecution {
     projectId: (row.project_id as string) ?? null,
     jobId: (row.job_id as string) ?? null,
     agentRunId: (row.agent_run_id as string) ?? null,
+    parentExecutionId: (row.parent_execution_id as string) ?? null,
     input: parseRecord(row.input),
-    inputValidated: row.decision !== 'deny' && row.reason !== 'invalid_input',
+    inputHash: (row.input_hash as string) ?? null,
+    inputValidated: Number(row.input_validated) === 1,
     effectUnknown: EFFECT_UNKNOWN_STATUSES.includes(row.status as ToolExecutionStatus),
     result: parseRecord(row.result),
     error: (row.error as string) ?? null,
@@ -1026,6 +1075,14 @@ function rowToExecution(row: Row): ToolExecution {
     durationMs: typeof row.duration_ms === 'number' ? row.duration_ms : null,
     updatedAt: row.updated_at as string,
   };
+}
+
+function definitionRevision(tool: Pick<ToolDefinition, 'revision'>): string {
+  return tool.revision;
+}
+
+function canonicalHash(serialized: string): string {
+  return createHash('sha256').update(serialized, 'utf8').digest('hex');
 }
 
 function rowToGrant(row: Row): ToolGrant {

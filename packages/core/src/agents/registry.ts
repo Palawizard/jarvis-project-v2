@@ -21,6 +21,25 @@ interface HealthState {
   lastSuccessAt?: string;
 }
 
+export type AgentFailureKind =
+  'cancelled' | 'quota' | 'cooldown' | 'unavailable' | 'timeout' | 'protocol' | 'agent_failure';
+
+export function classifyAgentFailure(
+  result: Pick<AgentRunResult, 'status' | 'error'>,
+): AgentFailureKind {
+  if (result.status === 'cancelled') return 'cancelled';
+  if (result.status === 'timeout') return 'timeout';
+  const error = result.error ?? '';
+  if (/rate[ -]?limit|usage limit|spend limit|session limit|too many requests|quota/i.test(error))
+    return 'quota';
+  if (/cooldown/i.test(error)) return 'cooldown';
+  if (/not found|could not start|could not be executed|not logged in|unavailable/i.test(error))
+    return 'unavailable';
+  if (/malformed JSONL|without a terminal structured event|protocol/i.test(error))
+    return 'protocol';
+  return 'agent_failure';
+}
+
 interface RegistryDeps {
   providers?: AgentProvider[];
   db?: Db;
@@ -93,9 +112,15 @@ export class AgentRegistry {
     const usable = caps.filter((capability) => capability.available);
     const profile = resolveModelProfile(opts.taskProfile);
     const order: ProviderId[] = [];
-    if (opts.prefer) order.push(opts.prefer);
     if ((role === 'reviewer' || role === 'visual_reviewer') && opts.avoid) {
+      if (opts.prefer && opts.prefer !== opts.avoid) order.push(opts.prefer);
       order.push(...usable.map((capability) => capability.id).filter((id) => id !== opts.avoid));
+      // Independence is preferred, not fabricated: the avoided provider remains
+      // a last resort when it is the only healthy option, always in fresh context.
+      if (opts.prefer) order.push(opts.prefer);
+      order.push(opts.avoid);
+    } else if (opts.prefer) {
+      order.push(opts.prefer);
     }
     order.push('claude', 'codex');
 
@@ -137,15 +162,12 @@ export class AgentRegistry {
       ...this.health.get(provider),
       lastFailureAt: at.toISOString(),
     };
-    if (
-      /rate[ -]?limit|usage limit|spend limit|session limit|too many requests|quota/i.test(
-        result.error ?? '',
-      )
-    ) {
+    const kind = classifyAgentFailure(result);
+    if (['quota', 'unavailable', 'timeout', 'protocol'].includes(kind)) {
       next.cooldownUntil = new Date(at.getTime() + this.config.agents.cooldownMs).toISOString();
       this.deps.bus?.emit({
-        type: 'agent.rate_limited',
-        payload: { provider, cooldownUntil: next.cooldownUntil },
+        type: kind === 'quota' ? 'agent.rate_limited' : 'agent.provider_unhealthy',
+        payload: { provider, kind, cooldownUntil: next.cooldownUntil },
       });
     }
     this.health.set(provider, next);

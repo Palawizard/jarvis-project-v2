@@ -4,21 +4,26 @@
 
 ```text
 queued -> planning -> implementing -> verifying
-                                |         |
-                                `-> fixing (bounded retry)
+                                |         `-> verification fixer (bounded) --+
+                                |                                             |
+                                +----> reviewing <----------------------------+
+                                          | critical/high
+                                          v
+                                     code fixer --commit--> verifying (max 2)
                                           |
-                                      reviewing
-                                          |
+                                          v pass/advisory
                                       visual_qa
+                                          | high/medium
+                                          v
+                                    visual fixer --commit--> verifying
+                                          |                    -> fresh review
+                                          +---------------------> fresh visual QA (max 2)
                                           |
-                                    awaiting_user
-                                          |
-                                      approved
-                                          |
-                                  FF-only applied
+                                          v pass/advisory
+                                    awaiting_user -> approved -> FF-only applied
 ```
 
-Any active stage may become `failed` or `cancelled`. `awaiting_user` means a candidate passed configured gates and remains isolated. State transitions are validated centrally and persisted as events.
+Any active stage may become `paused` or `cancelled`. Provider exhaustion, restart, or bounded repair exhaustion is recoverable and preserves the same worktree/head; `failed` is for irrecoverable setup or corrupt state. `awaiting_user` means a candidate passed configured gates and remains isolated. State transitions are validated centrally and persisted as events.
 
 Planning is deterministic: inspect the committed base, create an isolated worktree, and build an auditable Context Pack. This avoids a model call whose only purpose would be restating the request.
 
@@ -29,6 +34,8 @@ Planning is deterministic: inspect the committed base, create an isolated worktr
 - Claude Code uses official non-interactive `--print --output-format stream-json`, retains the session ID, and resumes fix work when possible.
 - Codex uses official `codex exec --json` JSONL and retains the thread ID. The installed app-server is currently experimental, so V1 deliberately uses the stable CLI surface.
 - Capability checks inspect CLI version and official login status and refresh periodically. Runtime rate limits enter a temporary cooldown.
+- Quota/spend/session limits, cooldown, unavailable/start errors, timeout, and protocol failures are classified centrally. The failed run remains in history and the same stage reroutes up to `JARVIS_AGENT_STAGE_RETRIES` (default 2 retries). Cancellation is not failure and is never rerouted.
+- Review always uses a fresh context, prefers a provider different from the implementer/fixer, and never resumes an implementation session. If only one provider is healthy, a fresh same-provider review is allowed.
 - Every deterministic routing decision records role, provider, model, reason, overrides, availability, avoidance, task profile, and time.
 - Model profiles are cheap rules: mechanical work uses economy, ordinary work balanced, and high-risk/self-development quality. Explicit provider environment overrides remain authoritative when usable.
 
@@ -36,9 +43,17 @@ Authentication is always delegated to the installed CLI. Jarvis never reads OAut
 
 ## Verification and review
 
-Project detection records package-manager, install, format/lint/typecheck/test/build/dev commands. Jarvis executes configured checks itself in cost order, stores exit code/duration/bounded output, and may invoke one bounded corrective cycle. A project with no configured deterministic check remains unverified and cannot reach user acceptance.
+Projects may define ordered `verification.steps` with `name`, `command`, `timeoutMs`, `required`, and `kind`. Setup/install is recorded separately from evidence. Jarvis executes the trusted-project commands itself, shows exactly what ran, and cannot call unit-only evidence “all tests.” For Jarvis, `pnpm verify` covers format, lint, typecheck, all non-live Vitest projects (unit and integration), build, and Playwright E2E. Live subscription-agent tests remain opt-in.
 
 Review runs in a fresh, read-only provider context with the original request, acceptance criteria, reviewer Context Pack, changed files/diff, implementer summary as an untrusted claim, and deterministic verification evidence. Unparseable or failed review output is an error, never approval.
+
+Structured severity, not the reviewer's prose/verdict alone, determines blocking. Code defaults to `critical,high`; medium/low/info remain persisted advisory findings. A source change clears the reviewed HEAD identity, so a new deterministic verification and independent review are mandatory. Limits are configurable through `JARVIS_MAX_REVIEW_FIX_CYCLES` and `JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES`.
+
+## Pause, resume, and validation-only recovery
+
+Running jobs checkpoint the logical stage, base, worktree, candidate HEAD, cycle counts, last provider, resumable external session, and evidence identities. On restart they become `paused`; `POST /api/jobs/:id/resume` first validates repository identity, worktree existence, base ancestry, expected HEAD, and understood cleanliness. Implementation/fix may resume the same external session; verification reruns; review is fresh; Visual QA restarts and recaptures.
+
+`POST /api/jobs` also accepts `validationOnly: true` with a pinned `candidateSource: { baseSha, sourceSha }`. Git plumbing verifies both commits and ancestry, creates the isolated job worktree from the explicit base, applies the exact binary base-to-source delta, proves tree parity, commits only on the job branch, skips implementation, and starts at verification. It never checks out or mutates the source ref.
 
 The candidate branch/worktree, implementation result, verification, structured findings, routing decisions, Context Pack selections, screenshots, and episode remain inspectable. Approval binds the exact clean reviewed HEAD. A separate application transaction requires a clean registered target at the candidate base and performs only `git merge --ff-only`; divergence fails closed, repeat apply is idempotent, candidate provenance is retained, and no remote push occurs.
 

@@ -9,9 +9,9 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
-const MIGRATIONS = new Map<number, string>([
+export const MIGRATIONS = new Map<number, string>([
   [
     2,
     `CREATE TABLE candidate_applications (
@@ -114,6 +114,41 @@ const MIGRATIONS = new Map<number, string>([
       revoked_at TEXT
     );
     CREATE INDEX idx_tool_grants_lookup ON tool_grants(tool_name, actor, revoked_at);`,
+  ],
+  [
+    4,
+    `ALTER TABLE tool_executions ADD COLUMN definition_revision TEXT;
+    ALTER TABLE tool_executions ADD COLUMN input_hash TEXT;
+    ALTER TABLE tool_executions ADD COLUMN input_validated INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE tool_executions ADD COLUMN parent_execution_id TEXT REFERENCES tool_executions(id);
+    UPDATE tool_executions
+      SET status='expired', error='approval predates canonical input integrity metadata; create a new request',
+          finished_at=updated_at
+      WHERE status='pending_approval';
+
+    ALTER TABLE jobs ADD COLUMN resume_stage TEXT;
+    ALTER TABLE jobs ADD COLUMN pause_reason TEXT;
+    ALTER TABLE jobs ADD COLUMN review_fix_cycles INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN visual_fix_cycles INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN last_provider TEXT;
+    ALTER TABLE jobs ADD COLUMN resume_session_id TEXT;
+    ALTER TABLE jobs ADD COLUMN reviewed_head TEXT;
+    ALTER TABLE jobs ADD COLUMN visual_head TEXT;
+    ALTER TABLE jobs ADD COLUMN candidate_base_sha TEXT;
+    ALTER TABLE jobs ADD COLUMN candidate_source_sha TEXT;
+    ALTER TABLE jobs ADD COLUMN validation_only INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN visual_qa_config TEXT;
+
+    ALTER TABLE reviews ADD COLUMN head_ref TEXT;
+    ALTER TABLE reviews ADD COLUMN blocking INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE visual_qa ADD COLUMN scenario_name TEXT NOT NULL DEFAULT 'default';
+    ALTER TABLE visual_qa ADD COLUMN head_ref TEXT;
+    ALTER TABLE visual_qa ADD COLUMN cycle INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE verifications ADD COLUMN kind TEXT NOT NULL DEFAULT 'check';
+    ALTER TABLE verifications ADD COLUMN required INTEGER NOT NULL DEFAULT 1;
+    CREATE INDEX idx_tool_executions_parent ON tool_executions(parent_execution_id);
+    CREATE INDEX idx_reviews_head ON reviews(job_id, head_ref);
+    CREATE INDEX idx_visualqa_head ON visual_qa(job_id, head_ref);`,
   ],
 ]);
 

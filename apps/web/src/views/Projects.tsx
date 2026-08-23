@@ -167,6 +167,9 @@ function ProjectDetail({
 }) {
   const detail = useAsync(() => api.project(id), [id]);
   const [request, setRequest] = useState('');
+  const [validationOnly, setValidationOnly] = useState(false);
+  const [candidateBase, setCandidateBase] = useState('');
+  const [candidateSource, setCandidateSource] = useState('');
   const [busy, setBusy] = useState(false);
 
   if (detail.error)
@@ -188,8 +191,20 @@ function ProjectDetail({
     if (!request.trim()) return;
     setBusy(true);
     try {
-      const job = await api.createJob(project.id, request.trim(), [], true);
+      const job = await api.createJob(project.id, request.trim(), [], true, {
+        ...(validationOnly
+          ? {
+              validationOnly: true,
+              candidateSource: {
+                baseSha: candidateBase.trim(),
+                sourceSha: candidateSource.trim(),
+              },
+            }
+          : {}),
+      });
       setRequest('');
+      setCandidateBase('');
+      setCandidateSource('');
       onOpenJob(job.id);
     } finally {
       setBusy(false);
@@ -227,12 +242,40 @@ function ProjectDetail({
               placeholder="Describe the change in plain language…"
               aria-label="Job request"
             />
+            <label className="row small" style={{ marginTop: 8 }}>
+              <input
+                type="checkbox"
+                checked={validationOnly}
+                onChange={(event) => setValidationOnly(event.target.checked)}
+              />
+              Validate an immutable existing candidate (skip implementer)
+            </label>
+            {validationOnly && (
+              <div className="grid cols-2" style={{ marginTop: 8 }}>
+                <input
+                  value={candidateBase}
+                  onChange={(event) => setCandidateBase(event.target.value)}
+                  placeholder="Base commit SHA"
+                  aria-label="Candidate base commit SHA"
+                />
+                <input
+                  value={candidateSource}
+                  onChange={(event) => setCandidateSource(event.target.value)}
+                  placeholder="Source commit SHA"
+                  aria-label="Candidate source commit SHA"
+                />
+              </div>
+            )}
             <div className="spread" style={{ marginTop: 8 }}>
               <span className="small faint">Runs in an isolated worktree. Never auto-merged.</span>
               <button
                 className="btn primary"
                 onClick={() => void createJob()}
-                disabled={busy || !request.trim()}
+                disabled={
+                  busy ||
+                  !request.trim() ||
+                  (validationOnly && (!candidateBase.trim() || !candidateSource.trim()))
+                }
               >
                 Start job
               </button>

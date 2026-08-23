@@ -1,0 +1,127 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { AgentRegistry } from '../agents/registry.js';
+import type {
+  AgentProvider,
+  AgentRunResult,
+  AgentStartOptions,
+  ProviderCapabilities,
+  ProviderId,
+} from '../agents/types.js';
+import { loadConfig } from '../config.js';
+import { openDb } from '../db/index.js';
+import { EventBus } from '../events/bus.js';
+import { JobService } from '../jobs/service.js';
+import { parseReviewOutput, ReviewEngine } from './engine.js';
+
+const homes: string[] = [];
+afterEach(() => {
+  for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true });
+});
+
+class ReviewProvider implements AgentProvider {
+  calls = 0;
+  lastOptions: AgentStartOptions | null = null;
+
+  constructor(
+    readonly id: ProviderId,
+    private readonly result: AgentRunResult,
+  ) {}
+
+  async capabilities(): Promise<ProviderCapabilities> {
+    return {
+      id: this.id,
+      available: true,
+      authenticated: true,
+      streaming: true,
+      resumable: true,
+      models: [],
+      structuredOutput: true,
+    };
+  }
+
+  async run(options: AgentStartOptions): Promise<AgentRunResult> {
+    this.calls++;
+    this.lastOptions = options;
+    return this.result;
+  }
+}
+
+describe('review provider resilience', () => {
+  it('records a spend-limit failure, cools down Claude, and reroutes the same review to Codex', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-review-route-'));
+    homes.push(home);
+    const base = loadConfig({ home, dbPath: ':memory:' });
+    const config = loadConfig({
+      home,
+      dbPath: ':memory:',
+      pipeline: { ...base.pipeline, agentStageRetries: 2 },
+      agents: { ...base.agents, reviewerProvider: 'claude' },
+    });
+    const db = openDb(config);
+    const bus = new EventBus(db);
+    db.prepare(
+      `INSERT INTO projects
+        (id,name,root_path,default_branch,stack,commands,is_self,config,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run('project-review', 'review-route', home, 'main', '{}', '{}', 0, '{}', 'now', 'now');
+    const jobs = new JobService(db, bus);
+    const job = jobs.create({ projectId: 'project-review', request: 'Review a candidate.' });
+    const claude = new ReviewProvider('claude', {
+      status: 'failed',
+      result: '',
+      error: "You've hit your monthly spend limit for this session",
+      memoryProposals: [],
+    });
+    const codex = new ReviewProvider('codex', {
+      status: 'completed',
+      result: '```json\n{"verdict":"approve","summary":"looks good","findings":[]}\n```',
+      memoryProposals: [],
+    });
+    const agents = new AgentRegistry(config, { providers: [claude, codex], db, bus });
+    const result = await new ReviewEngine(db, agents, bus, config).review({
+      jobId: job.id,
+      cwd: home,
+      request: job.request,
+      goal: job.goal,
+      acceptance: [],
+      diff: 'diff --git a/a b/a',
+      files: [{ path: 'a', added: 1, removed: 0 }],
+      verification: { passed: true, ran: 1, failureSummary: '', results: [] },
+      contextPack: '',
+      contextPackId: 'fixture-pack',
+      implementerProvider: 'codex',
+      implementerSummary: 'implemented',
+      headRef: 'a'.repeat(40),
+    });
+
+    expect(result.verdict).toBe('approve');
+    expect(result.provider).toBe('codex');
+    expect(claude.calls).toBe(1);
+    expect(codex.calls).toBe(1);
+    expect(codex.lastOptions?.resumeSessionId).toBeUndefined();
+    expect(codex.lastOptions?.prompt).toContain('Visual QA runs later');
+    expect(codex.lastOptions?.prompt).toContain('do not claim visual validation');
+    expect(
+      (await agents.capabilities()).find((item) => item.id === 'claude')?.cooldownUntil,
+    ).toBeTruthy();
+    expect(
+      jobs.runs(job.id).map((run) => ({ provider: run.provider, status: run.status })),
+    ).toEqual([
+      { provider: 'claude', status: 'failed' },
+      { provider: 'codex', status: 'completed' },
+    ]);
+    expect(bus.list().some((event) => event.type === 'agent.rate_limited')).toBe(true);
+    db.close();
+  });
+
+  it('normalizes an advisory-only request_changes claim to approve', () => {
+    const result = parseReviewOutput(
+      '```json\n{"verdict":"request_changes","summary":"advisory","findings":[{"severity":"medium","category":"style","description":"Optional cleanup","recommendation":"Consider renaming"}]}\n```',
+    );
+    expect(result.verdict).toBe('approve');
+    expect(result.findings[0]?.severity).toBe('medium');
+  });
+});

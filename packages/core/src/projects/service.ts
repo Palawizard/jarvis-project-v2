@@ -31,6 +31,21 @@ export type VisualInteraction =
   | { action: 'wait'; selector?: string; timeoutMs?: number }
   | { action: 'screenshot'; name?: string };
 
+export interface VisualQaScenario {
+  name: string;
+  route: string;
+  interactions?: VisualInteraction[];
+  viewports?: ('desktop' | 'mobile')[];
+}
+
+export interface VerificationStep {
+  name: string;
+  command: string;
+  timeoutMs?: number;
+  required?: boolean;
+  kind?: 'setup' | 'check' | 'integration' | 'e2e';
+}
+
 export interface CandidateRuntimeConfig {
   /** Executable + argv are trusted project configuration; ports are supplied through env only. */
   command: { executable: string; args: string[] };
@@ -43,9 +58,11 @@ export interface ProjectConfig {
   candidateRuntime?: CandidateRuntimeConfig;
   visualQa?: {
     required?: boolean;
+    scenarios?: VisualQaScenario[];
     routes?: string[];
     interactions?: VisualInteraction[];
   };
+  verification?: { steps: VerificationStep[] };
 }
 
 export interface Project {

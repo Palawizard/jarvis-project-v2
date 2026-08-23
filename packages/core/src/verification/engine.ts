@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { Db } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
-import type { ProjectCommands } from '../projects/service.js';
+import type { ProjectCommands, VerificationStep } from '../projects/service.js';
 import { redactSecrets } from '../memory/secrets.js';
 
 export interface VerificationResult {
@@ -17,6 +17,8 @@ export interface VerificationResult {
   outputPath: string | null;
   durationMs: number;
   cycle: number;
+  kind: NonNullable<VerificationStep['kind']>;
+  required: boolean;
 }
 
 export interface VerificationReport {
@@ -53,6 +55,7 @@ export class VerificationEngine {
     jobId: string;
     cwd: string;
     commands: ProjectCommands;
+    steps?: VerificationStep[];
     cycle?: number;
     signal?: AbortSignal;
   }): Promise<VerificationReport> {
@@ -66,20 +69,42 @@ export class VerificationEngine {
     // A git worktree is a fresh checkout with no node_modules, so every command
     // below would fail with "module not found" and look like a broken change.
     // Install once per worktree, and only when the deps are actually missing.
-    const steps: Array<{ name: string; command: string; timeoutMs: number }> = [];
+    const steps: Array<{
+      name: string;
+      command: string;
+      timeoutMs: number;
+      kind: NonNullable<VerificationStep['kind']>;
+      required: boolean;
+    }> = [];
     if (opts.commands.install && needsInstall(opts.cwd)) {
       steps.push({
         name: 'install',
         command: opts.commands.install,
         timeoutMs: INSTALL_TIMEOUT_MS,
+        kind: 'setup',
+        required: true,
       });
     }
-    for (const name of STEP_ORDER) {
-      const command = opts.commands[name];
-      if (command) steps.push({ name, command, timeoutMs: STEP_TIMEOUT_MS });
+    if (opts.steps?.length) {
+      for (const step of opts.steps) {
+        if (!step.name.trim() || !step.command.trim()) continue;
+        steps.push({
+          name: step.name,
+          command: step.command,
+          timeoutMs: step.timeoutMs ?? STEP_TIMEOUT_MS,
+          kind: step.kind ?? 'check',
+          required: step.required ?? true,
+        });
+      }
+    } else {
+      for (const name of STEP_ORDER) {
+        const command = opts.commands[name];
+        if (command)
+          steps.push({ name, command, timeoutMs: STEP_TIMEOUT_MS, kind: 'check', required: true });
+      }
     }
 
-    for (const { name, command, timeoutMs } of steps) {
+    for (const { name, command, timeoutMs, kind, required } of steps) {
       if (opts.signal?.aborted) break;
 
       const started = Date.now();
@@ -104,13 +129,15 @@ export class VerificationEngine {
         outputPath,
         durationMs,
         cycle,
+        kind,
+        required,
       };
       results.push(result);
 
       this.db
         .prepare(
           `INSERT INTO verifications (id, job_id, cycle, name, command, cwd, exit_code, status, output,
-            output_path, duration_ms, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            output_path, duration_ms, kind, required, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         )
         .run(
           result.id,
@@ -124,6 +151,8 @@ export class VerificationEngine {
           result.output,
           result.outputPath,
           result.durationMs,
+          result.kind,
+          result.required ? 1 : 0,
           nowIso(),
         );
 
@@ -140,10 +169,13 @@ export class VerificationEngine {
 
     // `install` is setup, not evidence: it must not make an unverified change
     // look verified, so it is excluded from the pass decision and the count.
-    const checks = results.filter((r) => r.name !== 'install');
-    const installFailed = results.some((r) => r.name === 'install' && r.status !== 'passed');
+    const checks = results.filter((r) => r.kind !== 'setup');
+    const required = results.filter((r) => r.required);
+    const installFailed = results.some((r) => r.kind === 'setup' && r.status !== 'passed');
     const passed =
-      !installFailed && checks.length > 0 && checks.every((r) => r.status === 'passed');
+      !installFailed &&
+      checks.some((r) => r.required) &&
+      required.every((r) => r.status === 'passed');
     const report: VerificationReport = {
       results,
       passed,
@@ -177,6 +209,8 @@ export class VerificationEngine {
       outputPath: (row.output_path as string) ?? null,
       durationMs: Number(row.duration_ms),
       cycle: Number(row.cycle),
+      kind: (row.kind as VerificationResult['kind']) ?? 'check',
+      required: Number(row.required ?? 1) === 1,
     }));
   }
 
@@ -185,8 +219,10 @@ export class VerificationEngine {
     const all = this.list(jobId);
     const cycle = all.reduce((latest, result) => Math.max(latest, result.cycle), -1);
     const results = all.filter((result) => result.cycle === cycle);
-    const checks = results.filter((result) => result.name !== 'install');
-    const passed = checks.length > 0 && results.every((result) => result.status === 'passed');
+    const checks = results.filter((result) => result.kind !== 'setup');
+    const passed =
+      checks.some((result) => result.required) &&
+      results.filter((result) => result.required).every((result) => result.status === 'passed');
     return { results, passed, ran: checks.length, failureSummary: summariseFailures(results) };
   }
 }

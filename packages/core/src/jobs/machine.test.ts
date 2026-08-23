@@ -58,6 +58,10 @@ describe('state machine transitions', () => {
     expect(canTransition('fixing', 'verifying')).toBe(true);
   });
 
+  it('allows a paused planning stage to resume in the same job', () => {
+    expect(canTransition('paused', 'planning')).toBe(true);
+  });
+
   it('rejects skipping straight from queued to completed', () => {
     expect(canTransition('queued', 'completed')).toBe(false);
     expect(() => assertTransition('queued', 'completed')).toThrow(InvalidTransitionError);
@@ -168,8 +172,12 @@ describe('job persistence and crash recovery', () => {
     expect(recovered.runs).toBe(1);
 
     const after = jobs.get(job.id);
-    expect(after?.status).toBe('failed');
+    expect(after?.status).toBe('paused');
+    expect(after?.stage).toBe('paused');
+    expect(after?.resumeStage).toBe('implementing');
+    expect(after?.finishedAt).toBeNull();
     // The reason must be explicit, not a silent reset.
+    expect(after?.pauseReason).toBe('orchestrator_restart');
     expect(after?.error).toContain('Orchestrator restarted');
     expect(jobs.runs(job.id)[0]?.status).toBe('interrupted');
     expect(bus.list({ jobId: job.id }).some((e) => e.type === 'system.recovery')).toBe(true);

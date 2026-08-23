@@ -37,7 +37,7 @@ pnpm build
 pnpm test:e2e
 ```
 
-`pnpm verify` runs format, lint, typecheck, all Vitest projects, and build. E2E is separate because it starts a real local server and browser.
+`pnpm verify` (and its alias `pnpm verify:full`) is the complete deterministic gate: format, lint, typecheck, every non-live Vitest project including integration, build, and Playwright E2E. `pnpm test` means unit tests only; `pnpm test:all` means all non-live Vitest projects.
 
 Real subscription-provider tests are separate and never run through `test`, `verify`, or CI:
 
@@ -54,14 +54,14 @@ The suite performs one tiny real edit per available CLI, strips API-key variable
 2. Enter a coding request in Command.
 3. Jarvis creates `jarvis/<job-id>` in an isolated worktree based on committed `HEAD`; dirty user files stay untouched and are excluded.
 4. A real Claude/Codex worker receives a bounded, inspectable Context Pack.
-5. Jarvis observes structured CLI events, runs configured verification commands, and performs an independent review.
-6. Configured web projects run on isolated dynamic ports and receive deterministic Playwright desktop/mobile evidence and subscription-backed visual review.
+5. Jarvis observes structured CLI events, runs explicit ordered verification steps, and performs an independent review. Critical/high code findings enter a bounded repair → verification → fresh-review loop.
+6. Configured web projects run on isolated dynamic ports and receive scenario-based Playwright desktop/mobile evidence and subscription-backed visual review. High/medium visible findings enter a bounded visual repair → verification → code review → recapture loop.
 7. Jarvis stores one compact project episode and validated memory proposals.
 8. The user approves the exact reviewed candidate, then separately applies it. Application is clean-target, exact-ancestry, FF-only, idempotent, persisted, and never pushes.
 
 For Jarvis itself, normal application is disabled. Run Jarvis through `pnpm supervisor <config.json>`; an approved candidate must pass isolated preflight, then a second explicit activation request lets the external supervisor apply, rebuild, restart, healthcheck, and roll back on failure.
 
-Failure, cancellation, review, verification, provider capability, and restart-recovery states are persisted and visible. Raw messages/events are audit history, not default model context.
+Recoverable provider exhaustion, repair-budget exhaustion, and orchestrator restart pause the same Job with its worktree and checkpoint preserved. Resume validates repository/base/HEAD/cleanliness before rerunning the appropriate gate. Raw messages/events are audit history, not default model context.
 
 ## Documentation
 

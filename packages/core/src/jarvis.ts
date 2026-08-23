@@ -6,7 +6,7 @@ import { ensureDirs, getConfig, loadConfig, setConfig, type JarvisConfig } from 
 import { EventBus } from './events/bus.js';
 import { MemoryService } from './memory/service.js';
 import { ContextPackBuilder } from './context/pack.js';
-import { ProjectService } from './projects/service.js';
+import { ProjectService, type ProjectConfig } from './projects/service.js';
 import { SessionService } from './sessions/service.js';
 import { JobService } from './jobs/service.js';
 import { JobPipeline } from './jobs/pipeline.js';
@@ -162,14 +162,39 @@ export class Jarvis {
     const repoRoot = findRepoRoot();
     if (!repoRoot) return null;
     const existing = this.projects.getSelf();
-    const config = {
+    const config: ProjectConfig = {
       candidateRuntime: {
-        command: { executable: 'pnpm', args: ['dev'] },
+        command: { executable: process.execPath, args: ['scripts/dev.mjs'] },
         portEnvironment: 'JARVIS_WEB_PORT',
         apiPortEnvironment: 'JARVIS_PORT',
         healthPath: '/health',
       },
-      visualQa: { required: true, routes: ['/'] },
+      visualQa: {
+        required: true,
+        scenarios: [
+          { name: 'command', route: '/', viewports: ['desktop', 'mobile'] },
+          {
+            name: 'tools',
+            route: '/',
+            interactions: [
+              { action: 'click', selector: "[data-testid='nav-tools']" },
+              { action: 'wait', selector: "[data-testid='tools-view']" },
+            ],
+            viewports: ['desktop', 'mobile'],
+          },
+        ],
+      },
+      verification: {
+        steps: [
+          { name: 'format', command: 'pnpm format:check' },
+          { name: 'lint', command: 'pnpm lint' },
+          { name: 'typecheck', command: 'pnpm typecheck' },
+          { name: 'unit', command: 'pnpm test', kind: 'check' },
+          { name: 'integration', command: 'pnpm test:integration', kind: 'integration' },
+          { name: 'build', command: 'pnpm build' },
+          { name: 'e2e', command: 'pnpm test:e2e', kind: 'e2e', timeoutMs: 20 * 60_000 },
+        ],
+      },
     };
     if (existing) {
       this.projects.update(existing.id, { config: { ...existing.config, ...config } });

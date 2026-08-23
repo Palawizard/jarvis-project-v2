@@ -94,7 +94,17 @@ export async function startCandidateRuntime(opts: {
   };
   child.stdout?.on('data', capture);
   child.stderr?.on('data', capture);
-  const stop = () => killTree(child);
+  let stopPromise: Promise<void> | undefined;
+  const stop = () =>
+    (stopPromise ??= (async () => {
+      await killTree(child);
+      const ownedPorts = [web, ...(api ? [api] : [])];
+      if (!(await waitForPortsClosed(ownedPorts, 3_000))) {
+        throw new Error(
+          `candidate runtime ports remain reachable after stop: ${ownedPorts.join(', ')}`,
+        );
+      }
+    })());
   const terminated = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
     (resolve) => child.once('exit', (code, signal) => resolve({ code, signal })),
   );
@@ -248,12 +258,12 @@ async function probeHealth(
   }
 }
 
-/** The frontend only has to answer: any normal response means it is listening. */
+/** Consume the complete response and accept only a successful final status. */
 async function probeWeb(baseUrl: string): Promise<boolean> {
   try {
     const response = await fetch(baseUrl, { signal: AbortSignal.timeout(2000) });
     await response.arrayBuffer();
-    return response.status < 500;
+    return response.ok;
   } catch {
     return false; // Still starting.
   }
@@ -265,4 +275,26 @@ function validateRuntimeConfig(executable: string, args: string[]): void {
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string' || /[\r\n\0]/.test(arg))) {
     throw new Error('invalid runtime arguments');
   }
+}
+
+async function waitForPortsClosed(ports: number[], timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await Promise.all(ports.map(portIsClosed))).every(Boolean)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return (await Promise.all(ports.map(portIsClosed))).every(Boolean);
+}
+
+function portIsClosed(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    const done = (closed: boolean) => {
+      socket.destroy();
+      resolve(closed);
+    };
+    socket.setTimeout(250, () => done(true));
+    socket.once('connect', () => done(false));
+    socket.once('error', () => done(true));
+  });
 }

@@ -17,6 +17,8 @@ import {
   type MemoryScope,
   type RiskLevel,
   type ToolExecutionStatus,
+  type VisualInteraction,
+  agentIsolationPreflight,
 } from '@jarvis/core';
 
 const MEMORY_SCOPES = new Set<MemoryScope>(['user', 'project', 'session', 'agent', 'procedure']);
@@ -345,14 +347,79 @@ export function createRoutes(jarvis: Jarvis): Hono {
       acceptance?: string[];
       sessionId?: string;
       autostart?: boolean;
+      validationOnly?: boolean;
+      candidateSource?: { baseSha?: string; sourceSha?: string };
+      visualQa?: {
+        required?: boolean;
+        scenarios?: Array<{
+          name?: string;
+          route?: string;
+          viewports?: Array<'desktop' | 'mobile'>;
+          interactions?: Array<Record<string, unknown>>;
+        }>;
+      };
     };
     if (!body.projectId || !body.request) return fail('projectId and request are required');
-    if (!jarvis.projects.get(body.projectId)) return fail('project not found', 404);
+    const project = jarvis.projects.get(body.projectId);
+    if (!project) return fail('project not found', 404);
+    if (body.validationOnly && !body.candidateSource) {
+      return fail('validationOnly requires candidateSource');
+    }
+    if (body.candidateSource && !body.validationOnly) {
+      return fail('candidateSource requires validationOnly');
+    }
+    if (body.visualQa?.scenarios && body.visualQa.scenarios.length === 0) {
+      return fail('visualQa.scenarios must not be empty');
+    }
+    let candidateSource: { baseSha: string; sourceSha: string } | undefined;
+    if (body.candidateSource) {
+      if (!body.candidateSource.baseSha || !body.candidateSource.sourceSha) {
+        return fail('candidateSource.baseSha and candidateSource.sourceSha are required');
+      }
+      try {
+        candidateSource = await git.validateCandidateSource(
+          project.rootPath,
+          body.candidateSource.baseSha,
+          body.candidateSource.sourceSha,
+        );
+      } catch (error) {
+        return fail(error instanceof Error ? error.message : String(error), 422);
+      }
+    }
+    let visualQa;
+    try {
+      visualQa = body.visualQa?.scenarios
+        ? {
+            required: body.visualQa.required,
+            scenarios: body.visualQa.scenarios.map((scenario, index) => {
+              if (!scenario.name?.trim() || !isConfinedVisualRoute(scenario.route)) {
+                throw new Error(`invalid visual QA scenario at index ${index}`);
+              }
+              if ((scenario.interactions?.length ?? 0) > 50) {
+                throw new Error(`visual QA scenario ${scenario.name} exceeds 50 interactions`);
+              }
+              return {
+                name: scenario.name.trim(),
+                route: scenario.route,
+                ...(scenario.viewports ? { viewports: scenario.viewports } : {}),
+                ...(scenario.interactions
+                  ? { interactions: scenario.interactions.map(parseVisualInteraction) }
+                  : {}),
+              };
+            }),
+          }
+        : undefined;
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error));
+    }
     const job = jarvis.jobs.create({
       projectId: body.projectId,
       request: body.request,
       acceptance: body.acceptance ?? [],
       sessionId: body.sessionId ?? null,
+      ...(candidateSource ? { candidateSource } : {}),
+      validationOnly: body.validationOnly ?? false,
+      ...(visualQa ? { visualQa } : {}),
     });
     if (body.autostart) jarvis.pipeline.start(job.id);
     return c.json(job, 201);
@@ -369,7 +436,9 @@ export function createRoutes(jarvis: Jarvis): Hono {
       jarvis.verification.latestReport(job.id),
       reviews.at(-1)?.verdict ?? 'error',
     );
-    const terminal = ['awaiting_user', 'completed', 'failed', 'cancelled'].includes(job.stage);
+    const terminal = ['paused', 'awaiting_user', 'completed', 'failed', 'cancelled'].includes(
+      job.stage,
+    );
     let candidate: Awaited<ReturnType<GitWorkspace['collectChanges']>> | null = null;
     if (
       (terminal || !running) &&
@@ -411,6 +480,14 @@ export function createRoutes(jarvis: Jarvis): Hono {
   app.post('/api/jobs/:id/cancel', (c) => {
     const cancelled = jarvis.pipeline.cancel(c.req.param('id'));
     return c.json({ cancelled });
+  });
+
+  app.post('/api/jobs/:id/resume', (c) => {
+    const job = jarvis.jobs.get(c.req.param('id'));
+    if (!job) return fail('job not found', 404);
+    if (job.stage !== 'paused') return fail(`job is ${job.stage}, not paused`, 409);
+    jarvis.pipeline.resume(job.id);
+    return c.json({ resumed: true });
   });
 
   const approveCandidate = async (jobId: string) => {
@@ -636,6 +713,9 @@ export function createRoutes(jarvis: Jarvis): Hono {
   // its own privileges. A request may never influence the policy input: see
   // docs/tool-permissions.md for the trust boundary this does and does not buy.
   app.get('/api/tools', (c) => c.json(jarvis.tools.list('user')));
+  app.get('/api/tools/capabilities', (c) =>
+    c.json({ sensitiveAgentTools: agentIsolationPreflight() }),
+  );
 
   app.post('/api/tools/:name', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as {
@@ -758,4 +838,46 @@ export function createRoutes(jarvis: Jarvis): Hono {
   app.get('/api/goal-preview', (c) => c.json({ goal: normaliseGoal(c.req.query('text') ?? '') }));
 
   return app;
+}
+
+function parseVisualInteraction(value: Record<string, unknown>): VisualInteraction {
+  const action = value.action;
+  if (action === 'goto' && isConfinedVisualRoute(value.route)) {
+    return { action, route: value.route };
+  }
+  if (action === 'click' && typeof value.selector === 'string' && value.selector) {
+    return { action, selector: value.selector };
+  }
+  if (
+    action === 'fill' &&
+    typeof value.selector === 'string' &&
+    value.selector &&
+    typeof value.value === 'string'
+  ) {
+    return { action, selector: value.selector, value: value.value };
+  }
+  if (action === 'wait') {
+    if (value.selector !== undefined && typeof value.selector !== 'string') {
+      throw new Error('visual wait selector must be a string');
+    }
+    if (value.timeoutMs !== undefined && typeof value.timeoutMs !== 'number') {
+      throw new Error('visual wait timeoutMs must be a number');
+    }
+    return {
+      action,
+      ...(value.selector ? { selector: value.selector } : {}),
+      ...(typeof value.timeoutMs === 'number' ? { timeoutMs: value.timeoutMs } : {}),
+    };
+  }
+  if (action === 'screenshot') {
+    if (value.name !== undefined && typeof value.name !== 'string') {
+      throw new Error('visual screenshot name must be a string');
+    }
+    return { action, ...(typeof value.name === 'string' ? { name: value.name } : {}) };
+  }
+  throw new Error(`unsupported visual interaction action: ${String(action)}`);
+}
+
+function isConfinedVisualRoute(value: unknown): value is string {
+  return typeof value === 'string' && /^\/(?!\/)/.test(value) && !value.includes('\\');
 }

@@ -30,7 +30,8 @@ export interface RoutingDecision {
   createdAt: string;
 }
 
-export type AgentRole = 'implementer' | 'reviewer' | 'fixer' | 'visual_reviewer' | 'chat';
+export type AgentRole =
+  'implementer' | 'reviewer' | 'fixer' | 'visual_fixer' | 'visual_reviewer' | 'chat';
 
 export interface ProviderCapabilities {
   id: ProviderId;

@@ -39,6 +39,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'memory.search',
+    revision: '1',
     description: 'Search Jarvis memory. Local-only: never makes a model or network call.',
     risk: 'observe',
     input: z.object({
@@ -72,6 +73,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'memory.store',
+    revision: '1',
     description:
       'Store a durable memory. Runs the full write policy (secrets, dedupe, supersession).',
     risk: 'reversible_modification',
@@ -104,6 +106,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'memory.forget',
+    revision: '1',
     description: 'Soft-delete a memory. It stops being retrievable but stays auditable.',
     risk: 'reversible_modification',
     input: z.object({ id: z.string() }),
@@ -114,6 +117,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'memory.purge',
+    revision: '1',
     description:
       'Permanently erase a memory and its embedding. There is no undo and no audit copy of the content.',
     risk: 'destructive',
@@ -125,6 +129,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'memory.purge_project',
+    revision: '1',
     description: 'Permanently erase every Jarvis memory belonging to one existing project.',
     risk: 'destructive',
     input: z.object({
@@ -140,6 +145,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'memory.update',
+    revision: '1',
     description: 'Correct a memory: stores the new value and supersedes the old one.',
     risk: 'reversible_modification',
     input: z.object({ id: z.string(), content: z.string().min(1) }),
@@ -152,6 +158,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'project.list',
+    revision: '1',
     description: 'List projects Jarvis knows about.',
     risk: 'observe',
     input: z.object({}),
@@ -168,6 +175,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'project.inspect',
+    revision: '1',
     description: 'Full detail for one project, including detected commands.',
     risk: 'observe',
     input: z.object({ id: z.string() }),
@@ -178,6 +186,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'job.create',
+    revision: '1',
     description: 'Create a development job against a project. Does not start it.',
     risk: 'reversible_modification',
     input: z.object({
@@ -197,6 +206,7 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'job.status',
+    revision: '1',
     description: 'Current stage, status and agent runs for a job.',
     risk: 'observe',
     input: z.object({ id: z.string() }),

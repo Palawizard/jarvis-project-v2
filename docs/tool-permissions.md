@@ -86,6 +86,8 @@ Stored arguments come in two flavours and the difference matters:
 - **Rejected** arguments are audit text only. They are redacted and bounded, and
   `inputValidated` is false, which is what blocks them from ever being replayed.
 
+An approval is bound to three persisted integrity values: the reviewed risk, the tool's required explicit `revision`, and SHA-256 of the canonical accepted JSON payload. Zod validation/transformation runs once when the request is created; approval passes that exact stored canonical value to the implementation without a second semantic transform. Any risk/revision/hash mismatch expires the request without running or creating a grant. Tool authors must bump `revision` whenever input schema or security-relevant semantics change; hashing function source or runtime internals is intentionally forbidden.
+
 Tool *results* are always redacted and bounded; a result is never re-executed,
 so redaction there is lossless.
 
@@ -114,6 +116,7 @@ so redaction there is lossless.
   24h) expire, so an old prompt cannot be answered later against changed state.
 - Approval survives a restart: the request holds the validated payload, so
   answering it after a reboot runs exactly what was asked for.
+- Only `interrupted`, `timed_out`, `expired`, and `failed` executions may be explicitly re-issued. Succeeded, running, pending, and freshly denied rows are not retryable. Every re-issue re-enters current policy and records its parent execution and original run attribution.
 - Finished rows are pruned after `JARVIS_TOOL_AUDIT_RETENTION_DAYS` (default 90).
   Open rows are never pruned.
 
@@ -132,8 +135,10 @@ so redaction there is lossless.
 - **Grant escalation.** Grants are re-evaluated against the live tool
   definition, cannot lift a `deny`, and cannot cover `destructive`.
 - **Approval swapping.** Approval takes an id and no payload, and replays the
-  stored validated arguments. Approving a benign request cannot be turned into
-  approving a different one. Arguments that no longer validate fail closed.
+  stored canonical arguments. Approving a benign request cannot be turned into
+  approving a different one. Risk, required definition revision, and canonical
+  payload hash must all match; legacy pending rows without them expire during
+  schema-v4 migration.
 - **Approval replay.** Claiming a pending row is a conditional `UPDATE ... WHERE
   status='pending_approval'`, so two concurrent approvals cannot both run it.
 - **Risk downgrade by tampering.** The decision reads risk from the registered
@@ -162,8 +167,12 @@ What this layer does buy against that:
   both the request and the approval are recorded, attributable, and visible.
 
 The real fix is OS-level isolation of agent children (a restricted user, or a
-container without loopback access). That is not implemented and is not claimed.
-Until it is, treat "an agent could reach the HTTP API" as true.
+container without loopback access). `AgentIsolationBackend.preflight()` is the
+explicit future backend contract, and `GET /api/tools/capabilities` reports its
+state. No backend is enabled today, and there is no environment flag that can
+pretend otherwise. Sensitive agent tools therefore remain denied. Until a
+backend can verify process identity, filesystem/credential boundaries, and
+control-plane network denial, treat "an agent could reach the HTTP API" as true.
 
 Two smaller residual notes:
 
@@ -179,6 +188,7 @@ Two smaller residual notes:
 ```ts
 registry.register({
   name: 'calendar.create_event',
+  revision: '1',
   description: 'Create an event in the connected calendar.',
   risk: 'sensitive',
   input: z.object({ title: z.string(), startsAt: z.string() }),

@@ -25,9 +25,29 @@ External Jarvis Supervisor
 
 ## Persistence and events
 
-SQLite also stores routing decisions, candidate-application transactions, self-upgrade transactions, and the tool execution/permission tables. `schema.sql` is the version-1 baseline re-executed on every open; every later table belongs to an ordered transactional migration in `db/index.ts`. Migrations preserve version-1 projects, jobs, and memories; unknown/newer versions and failed migrations stop startup.
+SQLite schema version 4 stores routing decisions, candidate-application transactions, self-upgrade transactions, tool execution integrity metadata, resumable job checkpoints, review HEAD identities, and scenario-based visual evidence. `schema.sql` remains the version-1 baseline; ordered transactional migrations preserve v1/v2/v3 records, expire unverifiable legacy pending approvals, and reject unknown/newer versions.
 
-The event log supports live UI updates and post-restart inspection. Startup marks in-flight work interrupted rather than guessing that an unknown worktree/process/tool call is safe to resume.
+The event log supports live UI updates and post-restart inspection. Startup marks agent runs interrupted and their running jobs paused. An explicit resume validates the existing worktree and checkpoint; it never creates a duplicate recovery job.
+
+## Resilient development pipeline
+
+```text
+implement -> verify -> independent code review
+                    | blockers (critical/high)
+                    v
+               code fixer --commit--> verify --fresh review (max 2)
+                    |
+                    v pass
+visual scenarios -> independent image review
+                    | blockers (high/medium)
+                    v
+              visual fixer --commit--> verify -> fresh code review -> recapture (max 2)
+                    |
+                    v pass
+               awaiting_user
+```
+
+Provider infrastructure failures reroute the same logical stage within a bounded attempt budget and never invoke a source fixer. Exhaustion and repair-budget exhaustion pause the job with exact evidence and the worktree intact. `failed` is reserved for non-recoverable setup/corruption.
 
 ## Tool execution
 

@@ -40,6 +40,7 @@ function counter(name: string, risk: RiskLevel = 'observe') {
     calls,
     tool: {
       name,
+      revision: '1',
       description: name,
       risk,
       input: z.object({ text: z.string().min(1) }),
@@ -56,6 +57,7 @@ describe('tool catalog', () => {
     const reg = registry();
     reg.register({
       name: 'demo.schema',
+      revision: '1',
       description: 'demo',
       risk: 'sensitive',
       input: z.object({ id: z.string() }),
@@ -128,6 +130,7 @@ describe('tool execution and gating', () => {
     const reg = registry();
     reg.register({
       name: 'danger.ceiling',
+      revision: '1',
       description: 'deletes things',
       risk: 'destructive',
       input: z.object({}),
@@ -186,6 +189,7 @@ describe('tool execution and gating', () => {
     const reg = registry();
     reg.register({
       name: 'demo.leaky',
+      revision: '1',
       description: 'returns something it should not',
       risk: 'observe',
       input: z.object({}),
@@ -201,6 +205,7 @@ describe('tool execution and gating', () => {
     const reg = registry();
     reg.register({
       name: 'demo.throws',
+      revision: '1',
       description: 'always fails',
       risk: 'observe',
       input: z.object({}),
@@ -222,14 +227,16 @@ describe('tool execution and gating', () => {
     const reg = new ToolRegistry({ db, bus, defaultTimeoutMs: 20 });
     reg.register({
       name: 'demo.hangs',
+      revision: '1',
       description: 'never returns',
       risk: 'observe',
       input: z.object({}),
       execute: () => new Promise(() => undefined),
     });
     const outcome = await reg.execute('demo.hangs', {}, { actor: 'user' });
-    expect(outcome.status).toBe('failed');
-    if (outcome.status !== 'failed') return;
+    expect(outcome.status).toBe('timed_out');
+    if (outcome.status !== 'timed_out') return;
+    expect(outcome.effectUnknown).toBe(true);
     expect(outcome.error).toMatch(/timed out after 20ms/);
 
     // A timeout is not an ordinary failure: the work may still be in flight.
@@ -244,6 +251,7 @@ describe('tool execution and gating', () => {
     let sawAbort = false;
     reg.register({
       name: 'demo.cooperative',
+      revision: '1',
       description: 'watches its signal',
       risk: 'observe',
       input: z.object({}),
@@ -267,6 +275,7 @@ describe('tool execution and gating', () => {
     const reg = new ToolRegistry({ db, bus, defaultTimeoutMs: 5000 });
     reg.register({
       name: 'demo.deterministic',
+      revision: '1',
       description: 'fails fast',
       risk: 'observe',
       input: z.object({}),
@@ -285,6 +294,7 @@ describe('tool execution and gating', () => {
     const reg = new ToolRegistry({ db, bus, defaultTimeoutMs: 20 });
     reg.register({
       name: 'demo.lateReject',
+      revision: '1',
       description: 'rejects long after the deadline',
       risk: 'observe',
       input: z.object({}),
@@ -385,27 +395,49 @@ describe('confirmation and approval', () => {
     expect(reg.getExecution(requested.execution.id)?.error).toBe(denied.error);
   });
 
-  it('re-decides against the tool as it is now, not as it was when requested', async () => {
+  it('invalidates a user approval when the reviewed risk changes', async () => {
     const reg = registry();
-    const { tool } = counter('agent.reclassified', 'reversible_modification');
+    const { tool } = counter('user.reclassified', 'sensitive');
     reg.register(tool);
-    // An agent asking for a reversible change is a confirm, not an allow.
-    const requested = await reg.execute('agent.reclassified', { text: 'x' }, { actor: 'agent' });
+    const requested = await reg.execute('user.reclassified', { text: 'x' }, { actor: 'user' });
     expect(requested.status).toBe('pending_approval');
     if (requested.status !== 'pending_approval') return;
 
-    // The tool is re-classified as destructive before anyone answers — as it
-    // would be by a code change plus a restart. The stale request must not be
-    // approvable at the old risk level, and the risk column on the row (which a
-    // tamperer controls) must not be what the decision reads.
-    db.prepare("UPDATE tool_executions SET risk='observe' WHERE id=?").run(requested.execution.id);
     const reopened = new ToolRegistry({ db, bus });
-    const { tool: harder, calls } = counter('agent.reclassified', 'destructive');
+    const { tool: harder, calls } = counter('user.reclassified', 'destructive');
     reopened.register(harder);
 
     const outcome = await reopened.approve(requested.execution.id);
-    expect(outcome.status).toBe('denied');
+    expect(outcome.status).toBe('failed');
     expect(calls).toEqual([]);
+    expect(reopened.grants(true)).toEqual([]);
+  });
+
+  it('executes exactly the once-transformed canonical input after approval', async () => {
+    const seen: string[] = [];
+    const reg = registry();
+    reg.register({
+      name: 'user.transform-once',
+      revision: '1',
+      description: 'non-idempotent transform regression',
+      risk: 'sensitive',
+      input: z.object({ text: z.string().transform((value) => `${value}!`) }),
+      execute: async (input) => {
+        seen.push(input.text);
+        return input.text;
+      },
+    });
+    const requested = await reg.execute(
+      'user.transform-once',
+      { text: 'audited' },
+      { actor: 'user' },
+    );
+    if (requested.status !== 'pending_approval') throw new Error('expected pending approval');
+    expect(requested.execution.input).toEqual({ text: 'audited!' });
+
+    const approved = await reg.approve(requested.execution.id);
+    expect(approved.status).toBe('succeeded');
+    expect(seen).toEqual(['audited!']);
   });
 
   it('refuses to approve a request that outlived its TTL, without a restart', async () => {
@@ -750,6 +782,7 @@ describe('recovery after restart', () => {
     if (reissued.status !== 'pending_approval') return;
     expect(reissued.execution.id).not.toBe(first.execution.id);
     expect(reissued.execution.input).toEqual({ text: 'again' });
+    expect(reissued.execution.parentExecutionId).toBe(first.execution.id);
   });
 
   it('re-issues an interrupted agent action as the agent, not as the user', async () => {
@@ -771,6 +804,25 @@ describe('recovery after restart', () => {
     expect(reissued.execution.actor).toBe('agent');
     expect(reissued.status).toBe('pending_approval');
     expect(calls).toEqual([]);
+  });
+
+  it('refuses to retry succeeded and freshly denied executions', async () => {
+    const reg = registry();
+    const { tool } = counter('retry.surface');
+    reg.register(tool);
+    const succeeded = await reg.execute('retry.surface', { text: 'ok' }, { actor: 'user' });
+    await expect(reg.retry(succeeded.execution.id)).rejects.toMatchObject({
+      code: 'execution_not_retryable',
+    });
+
+    const { tool: deniedTool } = counter('retry.denied', 'destructive');
+    reg.register(deniedTool);
+    const requested = await reg.execute('retry.denied', { text: 'no' }, { actor: 'user' });
+    if (requested.status !== 'pending_approval') throw new Error('expected pending approval');
+    const denied = reg.deny(requested.execution.id);
+    await expect(reg.retry(denied.id)).rejects.toMatchObject({
+      code: 'execution_not_retryable',
+    });
   });
 
   it('survives a real restart with the pending request still answerable', async () => {

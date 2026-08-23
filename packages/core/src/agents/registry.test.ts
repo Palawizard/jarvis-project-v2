@@ -90,6 +90,15 @@ describe('AgentRegistry v2', () => {
     expect(same.decision.reason).toContain('fresh');
   });
 
+  it('prefers a healthy independent reviewer over a same-provider preference', async () => {
+    const result = await registry([new FakeProvider('claude'), new FakeProvider('codex')]).route(
+      'reviewer',
+      { prefer: 'claude', avoid: 'claude' },
+    );
+
+    expect(result.provider?.id).toBe('codex');
+  });
+
   it('selects inspectable model profiles without an LLM classifier', async () => {
     const router = registry([new FakeProvider('claude')]);
     expect(

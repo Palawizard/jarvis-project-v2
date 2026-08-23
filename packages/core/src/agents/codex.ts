@@ -278,7 +278,8 @@ export class CodexProvider implements AgentProvider {
 }
 
 export function buildCodexArgs(options: AgentStartOptions, model?: string): string[] {
-  const writes = options.role === 'implementer' || options.role === 'fixer';
+  const writes =
+    options.role === 'implementer' || options.role === 'fixer' || options.role === 'visual_fixer';
   // Exec-level options must precede the `resume` subcommand. Codex 0.147 rejects
   // --sandbox and -C when they appear after it.
   const args = [

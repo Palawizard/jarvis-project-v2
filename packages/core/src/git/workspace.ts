@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,6 +30,37 @@ async function git(cwd: string, args: string[]): Promise<string> {
       (err.stderr || err.message || '').trim(),
     );
   }
+}
+
+async function gitRaw(cwd: string, args: string[]): Promise<string> {
+  try {
+    const { stdout } = await exec('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 });
+    return stdout;
+  } catch (error) {
+    const err = error as { stderr?: string; message?: string };
+    throw new GitError(`git ${args[0]} failed`, 'git_command_failed', err.stderr || err.message);
+  }
+}
+
+function gitWithInput(cwd: string, args: string[], input: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { cwd, stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true });
+    const errors: Buffer[] = [];
+    child.stderr.on('data', (chunk: Buffer) => errors.push(chunk));
+    child.once('error', reject);
+    child.once('close', (code) =>
+      code === 0
+        ? resolve()
+        : reject(
+            new GitError(
+              `git ${args[0]} failed`,
+              'git_command_failed',
+              Buffer.concat(errors).toString().trim(),
+            ),
+          ),
+    );
+    child.stdin.end(input);
+  });
 }
 
 export interface RepoStatus {
@@ -103,6 +134,7 @@ export class GitWorkspace {
     repoRoot: string;
     jobId: string;
     branchPrefix?: string;
+    baseRef?: string;
   }): Promise<Worktree & { warnings: string[] }> {
     const status = await repoStatus(opts.repoRoot);
     if (!status.isRepo || !status.root) {
@@ -115,6 +147,9 @@ export class GitWorkspace {
       );
     }
 
+    const baseRef = opts.baseRef
+      ? await this.resolveCommit(status.root, opts.baseRef)
+      : status.head;
     const warnings: string[] = [];
     if (status.dirty) {
       // Explicitly NOT an error: we branch from HEAD and leave their work alone.
@@ -129,12 +164,27 @@ export class GitWorkspace {
     const target = path.join(this.worktreesDir, opts.jobId);
 
     if (fs.existsSync(target)) {
+      const existing = await repoStatus(target);
+      const existingBranch = existing.isRepo
+        ? await git(target, ['branch', '--show-current']).catch(() => '')
+        : '';
+      if (
+        existing.root &&
+        existing.head &&
+        !existing.dirty &&
+        existingBranch === branch &&
+        (await repositoryIdentity(status.root)) === (await repositoryIdentity(target))
+      ) {
+        await requireAncestor(target, baseRef, existing.head, 'recovery_base_mismatch');
+        warnings.push(`Recovered the existing job worktree at ${target}.`);
+        return { path: target, branch, baseRef, warnings };
+      }
       throw new GitError(`worktree path already exists: ${target}`, 'worktree_exists');
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
 
     try {
-      await git(status.root, ['worktree', 'add', '-b', branch, target, status.head]);
+      await git(status.root, ['worktree', 'add', '-b', branch, target, baseRef]);
     } catch (error) {
       // Leave no half-created directory behind.
       fs.rmSync(target, { recursive: true, force: true });
@@ -147,8 +197,111 @@ export class GitWorkspace {
         : error;
     }
 
-    log.info('worktree created', { branch, target, base: status.head });
-    return { path: target, branch, baseRef: status.head, warnings };
+    log.info('worktree created', { branch, target, base: baseRef });
+    return { path: target, branch, baseRef, warnings };
+  }
+
+  async resolveCommit(repoRoot: string, ref: string): Promise<string> {
+    const status = await repoStatus(repoRoot);
+    if (!status.isRepo || !status.root || !samePath(status.root, repoRoot)) {
+      throw new GitError(
+        'repository identity does not match the registered project',
+        'repository_mismatch',
+      );
+    }
+    return git(status.root, ['rev-parse', '--verify', `${ref}^{commit}`]).catch(() => {
+      throw new GitError(
+        `commit does not exist in the registered repository: ${ref}`,
+        'commit_missing',
+      );
+    });
+  }
+
+  async validateCandidateSource(repoRoot: string, baseRef: string, sourceRef: string) {
+    const baseSha = await this.resolveCommit(repoRoot, baseRef);
+    const sourceSha = await this.resolveCommit(repoRoot, sourceRef);
+    await requireAncestor(repoRoot, baseSha, sourceSha, 'candidate_source_base_mismatch');
+    return { baseSha, sourceSha };
+  }
+
+  /** Materialize an immutable base->source delta without checking out or moving the source ref. */
+  async materializeCandidate(
+    worktreePath: string,
+    baseSha: string,
+    sourceSha: string,
+  ): Promise<string> {
+    const status = await repoStatus(worktreePath);
+    if (!status.isRepo || !status.root || status.head !== baseSha || status.dirty) {
+      throw new GitError(
+        'candidate import worktree is not a clean checkout of the requested base',
+        'candidate_import_state',
+      );
+    }
+    await requireAncestor(worktreePath, baseSha, sourceSha, 'candidate_source_base_mismatch');
+    const patch = await gitRaw(worktreePath, [
+      'diff',
+      '--binary',
+      '--full-index',
+      '--find-renames',
+      baseSha,
+      sourceSha,
+      '--',
+    ]);
+    if (patch) await gitWithInput(worktreePath, ['apply', '--index', '--binary', '-'], patch);
+    await this.commitPending(
+      worktreePath,
+      `jarvis: materialize candidate ${sourceSha.slice(0, 12)}`,
+    );
+    const head = await git(worktreePath, ['rev-parse', 'HEAD']);
+    const [candidateTree, sourceTree] = await Promise.all([
+      git(worktreePath, ['rev-parse', `${head}^{tree}`]),
+      git(worktreePath, ['rev-parse', `${sourceSha}^{tree}`]),
+    ]);
+    if (candidateTree !== sourceTree) {
+      throw new GitError(
+        'materialized candidate tree does not exactly match the pinned source',
+        'candidate_parity',
+      );
+    }
+    return head;
+  }
+
+  async validateRecoveryWorkspace(opts: {
+    repoRoot: string;
+    worktreePath: string;
+    baseRef: string;
+    expectedHead?: string | null;
+    allowDirty?: boolean;
+  }): Promise<RepoStatus> {
+    if (!fs.existsSync(opts.worktreePath)) {
+      throw new GitError('recovery worktree is missing', 'recovery_worktree_missing');
+    }
+    const status = await repoStatus(opts.worktreePath);
+    if (!status.isRepo || !status.root || !status.head) {
+      throw new GitError('recovery worktree is not a Git repository', 'recovery_not_a_repo');
+    }
+    if (
+      (await repositoryIdentity(opts.repoRoot)) !== (await repositoryIdentity(opts.worktreePath))
+    ) {
+      throw new GitError(
+        'recovery worktree belongs to another repository',
+        'recovery_repository_mismatch',
+      );
+    }
+    await requireAncestor(opts.worktreePath, opts.baseRef, status.head, 'recovery_base_mismatch');
+    if (opts.expectedHead && status.head !== opts.expectedHead) {
+      throw new GitError(
+        `recovery HEAD changed (${opts.expectedHead} -> ${status.head})`,
+        'recovery_head_mismatch',
+      );
+    }
+    if (status.dirty && !opts.allowDirty) {
+      throw new GitError(
+        `recovery worktree is dirty: ${status.dirtyFiles.join(', ')}`,
+        'recovery_dirty',
+      );
+    }
+    return status;
   }
 
   async removeWorktree(

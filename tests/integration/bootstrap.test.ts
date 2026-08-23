@@ -135,6 +135,7 @@ describe('bootstrap vertical slice without cloud quota', () => {
       route: async (role: string) => ({
         provider: role === 'reviewer' ? codex : claude,
         capabilities: await (role === 'reviewer' ? codex : claude).capabilities(),
+        decision: { model: null },
       }),
     } as unknown as AgentRegistry;
     const review = new ReviewEngine(db, registry, bus, base);

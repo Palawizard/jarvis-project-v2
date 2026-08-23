@@ -18,12 +18,13 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run --project unit",
-    "test:integration": "vitest run --project integration",
+    "test": "vitest run --configLoader runner --project unit",
+    "test:integration": "vitest run --configLoader runner --project integration",
     "test:live-agents": "vitest run --config vitest.live.config.ts",
-    "test:all": "vitest run",
-    "test:e2e": "playwright test",
-    "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:all && pnpm build"
+    "test:all": "vitest run --configLoader runner",
+    "test:e2e": "pnpm build && playwright test",
+    "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:all && pnpm build && playwright test",
+    "verify:full": "pnpm verify"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

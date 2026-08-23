@@ -92,6 +92,24 @@ export function JobDetailView({
             Start
           </button>
         )}
+        {job.stage === 'paused' && (
+          <button
+            className="btn sm primary"
+            onClick={() =>
+              void api
+                .resumeJob(job.id)
+                .then(() => {
+                  setActionError(null);
+                  detail.reload();
+                })
+                .catch((error: unknown) =>
+                  setActionError(error instanceof Error ? error.message : String(error)),
+                )
+            }
+          >
+            Resume
+          </button>
+        )}
         {job.stage === 'awaiting_user' &&
           detail.data.acceptanceEligible &&
           application?.status !== 'approved' &&
@@ -178,6 +196,18 @@ export function JobDetailView({
         </Card>
       )}
       {actionError && <div className="alert error">{actionError}</div>}
+      {job.stage === 'paused' && (
+        <div className="alert error" role="status">
+          Paused at {job.resumeStage ?? 'unknown stage'}: {job.pauseReason ?? job.error}
+        </div>
+      )}
+      <div className="small dim" style={{ marginBottom: 10 }}>
+        repair cycles — verification {job.fixCycles}, code review {job.reviewFixCycles}, visual{' '}
+        {job.visualFixCycles}
+        {job.validationOnly && job.candidateSourceSha
+          ? ` · validation-only source ${job.candidateSourceSha}`
+          : ''}
+      </div>
       {job.stage === 'awaiting_user' && detail.data.acceptanceError && (
         <div className="alert error">
           This stored candidate cannot be accepted: {detail.data.acceptanceError}
@@ -346,7 +376,10 @@ export function JobDetailView({
                         </Badge>
                       </td>
                       <td>
-                        <div className="mono tiny">{v.command}</div>
+                        <div className="mono tiny">
+                          {v.command} · {v.kind}
+                          {!v.required ? ' · advisory' : ''}
+                        </div>
                         {v.status !== 'passed' && v.output && (
                           <details>
                             <summary className="tiny dim" style={{ cursor: 'pointer' }}>
@@ -384,6 +417,7 @@ export function JobDetailView({
                     {review.verdict.replace('_', ' ')}
                   </Badge>
                   <span className="tiny dim">by {review.provider} (independent run)</span>
+                  <span className="tiny dim">head {review.headRef.slice(0, 12)}</span>
                 </div>
                 {review.summary && (
                   <div className="small" style={{ marginBottom: 10 }}>
@@ -407,6 +441,11 @@ export function JobDetailView({
                             }
                           >
                             {f.severity}
+                          </Badge>
+                          <Badge>
+                            {f.severity === 'critical' || f.severity === 'high'
+                              ? 'blocking'
+                              : 'advisory'}
                           </Badge>
                           <Badge>{f.category}</Badge>
                           {f.file && (
@@ -590,7 +629,7 @@ export function JobDetailView({
                     {s.screenshotPath ? (
                       <img
                         src={artifactUrl(s.screenshotPath, artifactsDir)}
-                        alt={`${s.route} ${s.viewport}`}
+                        alt={`${s.scenarioName} ${s.route} ${s.viewport}`}
                         loading="lazy"
                       />
                     ) : (
@@ -598,6 +637,7 @@ export function JobDetailView({
                     )}
                     <div className="shot-meta">
                       <div className="row">
+                        <Badge>{s.scenarioName}</Badge>
                         <code className="tiny">{s.route}</code>
                         <Badge>{s.viewport}</Badge>
                       </div>
@@ -623,12 +663,26 @@ export function JobDetailView({
                       )}
                       {s.reviewFindings
                         .filter(
-                          (finding) => finding.route === s.route && finding.viewport === s.viewport,
+                          (finding) =>
+                            finding.scenarioName === s.scenarioName &&
+                            finding.route === s.route &&
+                            finding.viewport === s.viewport,
                         )
                         .map((finding, index) => (
                           <div key={index} className="tiny" style={{ marginTop: 4 }}>
-                            <Badge tone={finding.severity === 'high' ? 'err' : 'warn'}>
+                            <Badge
+                              tone={
+                                finding.severity === 'high' || finding.severity === 'medium'
+                                  ? 'err'
+                                  : undefined
+                              }
+                            >
                               {finding.severity}
+                            </Badge>{' '}
+                            <Badge>
+                              {finding.severity === 'high' || finding.severity === 'medium'
+                                ? 'blocking'
+                                : 'advisory'}
                             </Badge>{' '}
                             {finding.description}
                             {finding.recommendation ? ` — ${finding.recommendation}` : ''}

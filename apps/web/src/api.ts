@@ -32,6 +32,7 @@ export type JobStage =
   | 'reviewing'
   | 'visual_qa'
   | 'fixing'
+  | 'paused'
   | 'awaiting_user'
   | 'completed'
   | 'failed'
@@ -52,6 +53,15 @@ export interface Job {
   baseRef: string | null;
   headRef: string | null;
   fixCycles: number;
+  reviewFixCycles: number;
+  visualFixCycles: number;
+  resumeStage: JobStage | null;
+  pauseReason: string | null;
+  reviewedHead: string | null;
+  visualHead: string | null;
+  candidateBaseSha: string | null;
+  candidateSourceSha: string | null;
+  validationOnly: boolean;
   episodeId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -113,6 +123,8 @@ export interface Verification {
   exitCode: number | null;
   output: string;
   durationMs: number;
+  kind: string;
+  required: boolean;
 }
 
 export interface ReviewFinding {
@@ -130,11 +142,14 @@ export interface Review {
   verdict: 'approve' | 'request_changes' | 'error';
   summary: string;
   findings: ReviewFinding[];
+  headRef: string;
+  blocking: boolean;
   createdAt: string;
 }
 
 export interface VisualShot {
   id: string;
+  scenarioName: string;
   route: string;
   viewport: string;
   screenshotPath: string | null;
@@ -146,6 +161,7 @@ export interface VisualShot {
   reviewVerdict: 'pass' | 'needs_fix' | null;
   reviewFindings: Array<{
     severity: 'high' | 'medium' | 'low' | 'info';
+    scenarioName: string;
     route: string;
     viewport: 'desktop' | 'mobile';
     category: string;
@@ -153,6 +169,8 @@ export interface VisualShot {
     recommendation: string;
   }>;
   createdAt: string;
+  headRef: string | null;
+  cycle: number;
 }
 
 export interface ContextSelection {
@@ -335,9 +353,19 @@ export interface ToolGrant {
   revokedAt: string | null;
 }
 
+export interface ToolCapabilities {
+  sensitiveAgentTools: {
+    active: boolean;
+    backend: string | null;
+    reason: string;
+    guarantees: string[];
+  };
+}
+
 export type ToolOutcome =
   | { status: 'succeeded'; execution: ToolExecution; result: unknown }
   | { status: 'failed'; execution: ToolExecution; error: string }
+  | { status: 'timed_out'; execution: ToolExecution; error: string; effectUnknown: true }
   | { status: 'denied'; execution: ToolExecution; error: string }
   | { status: 'pending_approval'; execution: ToolExecution };
 
@@ -417,15 +445,26 @@ export const api = {
   jobs: (projectId?: string) =>
     request<Job[]>(`/api/jobs${projectId ? `?projectId=${projectId}` : ''}`),
   job: (id: string) => request<JobDetail>(`/api/jobs/${id}`),
-  createJob: (projectId: string, req: string, acceptance: string[], autostart: boolean) =>
+  createJob: (
+    projectId: string,
+    req: string,
+    acceptance: string[],
+    autostart: boolean,
+    options?: {
+      validationOnly?: boolean;
+      candidateSource?: { baseSha: string; sourceSha: string };
+    },
+  ) =>
     request<Job>('/api/jobs', {
       method: 'POST',
-      body: JSON.stringify({ projectId, request: req, acceptance, autostart }),
+      body: JSON.stringify({ projectId, request: req, acceptance, autostart, ...options }),
     }),
   startJob: (id: string) =>
     request<{ started: boolean }>(`/api/jobs/${id}/start`, { method: 'POST' }),
   cancelJob: (id: string) =>
     request<{ cancelled: boolean }>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
+  resumeJob: (id: string) =>
+    request<{ resumed: boolean }>(`/api/jobs/${id}/resume`, { method: 'POST' }),
   approveJob: (id: string) =>
     request<CandidateApplication>(`/api/jobs/${id}/approve`, { method: 'POST' }),
   applyJob: (id: string) =>
@@ -471,15 +510,9 @@ export const api = {
     }),
 
   tools: () => request<ToolSummary[]>('/api/tools'),
-  runTool: (name: string, input: unknown, projectId: string | null) =>
-    request<ToolOutcome>(`/api/tools/${encodeURIComponent(name)}`, {
-      method: 'POST',
-      body: JSON.stringify({ input, projectId }),
-    }),
-  toolExecutions: (status?: string) =>
-    request<{ pending: ToolExecution[]; executions: ToolExecution[] }>(
-      `/api/tool-executions${status && status !== 'all' ? `?status=${status}` : ''}`,
-    ),
+  toolCapabilities: () => request<ToolCapabilities>('/api/tools/capabilities'),
+  toolExecutions: () =>
+    request<{ pending: ToolExecution[]; executions: ToolExecution[] }>('/api/tool-executions'),
   approveTool: (id: string, remember: boolean, projectId: string | null) =>
     request<ToolOutcome>(`/api/tool-executions/${id}/approve`, {
       method: 'POST',

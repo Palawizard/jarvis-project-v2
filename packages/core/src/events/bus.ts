@@ -33,6 +33,8 @@ export type JarvisEventType =
   | 'agent.failed'
   | 'agent.routing.decided'
   | 'agent.rate_limited'
+  | 'agent.provider_unhealthy'
+  | 'agent.stage.retry'
   | 'verification.started'
   | 'verification.step'
   | 'verification.completed'

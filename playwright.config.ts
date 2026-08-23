@@ -15,7 +15,7 @@ export default defineConfig({
     screenshot: 'only-on-failure',
   },
   webServer: {
-    command: 'pnpm build && pnpm --filter @jarvis/orchestrator start',
+    command: 'node apps/orchestrator/dist/index.js',
     url: 'http://127.0.0.1:4329/api/health',
     reuseExistingServer: false,
     timeout: 120_000,

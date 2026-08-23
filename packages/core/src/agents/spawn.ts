@@ -83,16 +83,29 @@ function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
 export async function killTree(child: ChildProcess): Promise<void> {
   if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
   if (process.platform === 'win32') {
-    const killed = await new Promise<boolean>((resolve) => {
-      const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
-        stdio: 'ignore',
-        windowsHide: true,
+    const tree = await new Promise<{ killed: boolean; code: number | null; error?: string }>(
+      (resolve) => {
+        const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        killer.once('error', (error) =>
+          resolve({ killed: false, code: null, error: error.message }),
+        );
+        killer.once('close', (code) => resolve({ killed: code === 0, code }));
+      },
+    );
+    if (!tree.killed) {
+      log.warn('taskkill tree termination failed; falling back to the direct child', {
+        pid: child.pid,
+        code: tree.code,
+        error: tree.error,
       });
-      killer.once('error', () => resolve(false));
-      killer.once('close', (code) => resolve(code === 0));
-    });
-    if (!killed) child.kill('SIGKILL');
-    await waitForExit(child, 1500);
+      child.kill('SIGKILL');
+    }
+    if (!(await waitForExit(child, 1500))) {
+      log.warn('child termination was not observed before cleanup deadline', { pid: child.pid });
+    }
     return;
   }
   try {
@@ -106,7 +119,9 @@ export async function killTree(child: ChildProcess): Promise<void> {
   } catch {
     child.kill('SIGKILL');
   }
-  await waitForExit(child, 500);
+  if (!(await waitForExit(child, 500))) {
+    log.warn('child termination was not observed after SIGKILL', { pid: child.pid });
+  }
 }
 
 /**
@@ -145,14 +160,26 @@ export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
       resolve(outcome);
     };
 
+    const terminate = () => {
+      void killTree(child).finally(() =>
+        finish({
+          code: child.exitCode,
+          timedOut,
+          cancelled,
+          stderr: stderrChunks.join('').trim().slice(-3000),
+          ...protocolFields(),
+        }),
+      );
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
-      void killTree(child);
+      terminate();
     }, spec.timeoutMs);
 
     const onAbort = () => {
       cancelled = true;
-      void killTree(child);
+      terminate();
     };
     if (spec.signal?.aborted) onAbort();
     else spec.signal?.addEventListener('abort', onAbort, { once: true });

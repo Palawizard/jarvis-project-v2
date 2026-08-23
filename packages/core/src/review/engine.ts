@@ -24,7 +24,27 @@ export interface Review {
   verdict: 'approve' | 'request_changes' | 'error';
   summary: string;
   findings: ReviewFinding[];
+  headRef: string;
+  blocking: boolean;
   createdAt: string;
+}
+
+export interface ReviewOptions {
+  jobId: string;
+  cwd: string;
+  request: string;
+  goal: string;
+  acceptance: string[];
+  diff: string;
+  files: { path: string; added: number; removed: number }[];
+  verification: VerificationReport;
+  contextPack: string;
+  contextPackId: string;
+  implementerProvider?: ProviderId;
+  implementerSummary: string;
+  headRef: string;
+  taskProfile?: TaskProfile;
+  signal?: AbortSignal;
 }
 
 const MAX_DIFF_CHARS = 120_000;
@@ -46,22 +66,24 @@ export class ReviewEngine {
     private readonly config: JarvisConfig = getConfig(),
   ) {}
 
-  async review(opts: {
-    jobId: string;
-    cwd: string;
-    request: string;
-    goal: string;
-    acceptance: string[];
-    diff: string;
-    files: { path: string; added: number; removed: number }[];
-    verification: VerificationReport;
-    contextPack: string;
-    contextPackId: string;
-    implementerProvider: ProviderId;
-    implementerSummary: string;
-    taskProfile?: TaskProfile;
-    signal?: AbortSignal;
-  }): Promise<Review> {
+  async review(opts: ReviewOptions): Promise<Review> {
+    let avoid = opts.implementerProvider;
+    let last: Review | undefined;
+    for (let attempt = 0; attempt <= this.config.pipeline.agentStageRetries; attempt++) {
+      last = await this.reviewOnce(opts, avoid);
+      if (last.verdict !== 'error' || opts.signal?.aborted) return last;
+      if (last.provider === 'none') return last;
+      if (last.provider === 'claude' || last.provider === 'codex') avoid = last.provider;
+      this.bus?.emit({
+        type: 'agent.stage.retry',
+        jobId: opts.jobId,
+        payload: { stage: 'reviewing', attempt: attempt + 1, provider: last.provider },
+      });
+    }
+    return last as Review;
+  }
+
+  private async reviewOnce(opts: ReviewOptions, avoidProvider?: ProviderId): Promise<Review> {
     this.bus?.emit({
       type: 'review.started',
       jobId: opts.jobId,
@@ -69,7 +91,7 @@ export class ReviewEngine {
     });
 
     const routed = await this.agents.route('reviewer', {
-      avoid: opts.implementerProvider,
+      avoid: avoidProvider,
       prefer: this.config.agents.reviewerProvider,
       jobId: opts.jobId,
       taskProfile: opts.taskProfile,
@@ -82,6 +104,8 @@ export class ReviewEngine {
         verdict: 'error',
         summary: `No reviewer available: ${routed.reason}`,
         findings: [],
+        headRef: opts.headRef,
+        blocking: true,
       });
       this.bus?.emit({
         type: 'review.completed',
@@ -148,7 +172,7 @@ export class ReviewEngine {
         `UPDATE agent_runs SET status=?, result=?, error=?, external_session_id=?, ended_at=? WHERE id=?`,
       )
       .run(
-        result.status === 'completed' ? 'completed' : 'failed',
+        result.status,
         result.result.slice(0, 20_000),
         result.error ?? null,
         result.sessionId ?? null,
@@ -165,6 +189,8 @@ export class ReviewEngine {
         verdict: 'error',
         summary: `Reviewer failed: ${result.error ?? 'unknown error'}`,
         findings: [],
+        headRef: opts.headRef,
+        blocking: true,
       });
       this.bus?.emit({
         type: 'review.completed',
@@ -176,13 +202,29 @@ export class ReviewEngine {
     }
 
     const parsed = parseReviewOutput(result.result);
+    if (parsed.verdict === 'error') {
+      const protocolError = parsed.summary || 'reviewer returned invalid structured output';
+      this.agents.recordResult?.(routed.provider.id, {
+        status: 'failed',
+        error: `protocol failure: ${protocolError}`,
+      });
+      this.db
+        .prepare(`UPDATE agent_runs SET status='failed', error=? WHERE id=?`)
+        .run(`protocol failure: ${protocolError}`, runId);
+    }
+    const blocking = parsed.findings.some((finding) =>
+      this.config.pipeline.codeReviewBlockingSeverities.includes(finding.severity),
+    );
+    const verdict = parsed.verdict === 'error' ? 'error' : blocking ? 'request_changes' : 'approve';
     const review = this.persist({
       jobId: opts.jobId,
       runId,
       provider: routed.provider.id,
-      verdict: parsed.verdict,
+      verdict,
       summary: parsed.summary,
       findings: parsed.findings,
+      headRef: opts.headRef,
+      blocking: verdict !== 'approve',
     });
     this.bus?.emit({
       type: 'review.completed',
@@ -201,7 +243,9 @@ export class ReviewEngine {
     const review: Review = { ...input, id: newId('rev'), createdAt: nowIso() };
     this.db
       .prepare(
-        'INSERT INTO reviews (id, job_id, run_id, provider, verdict, summary, findings, created_at) VALUES (?,?,?,?,?,?,?,?)',
+        `INSERT INTO reviews
+          (id, job_id, run_id, provider, verdict, summary, findings, head_ref, blocking, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         review.id,
@@ -211,6 +255,8 @@ export class ReviewEngine {
         review.verdict,
         review.summary,
         JSON.stringify(review.findings),
+        review.headRef,
+        review.blocking ? 1 : 0,
         review.createdAt,
       );
     return review;
@@ -218,7 +264,7 @@ export class ReviewEngine {
 
   list(jobId: string): Review[] {
     const rows = this.db
-      .prepare('SELECT * FROM reviews WHERE job_id = ? ORDER BY created_at ASC')
+      .prepare('SELECT * FROM reviews WHERE job_id = ? ORDER BY created_at ASC, rowid ASC')
       .all(jobId) as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       id: row.id as string,
@@ -228,21 +274,14 @@ export class ReviewEngine {
       verdict: row.verdict as Review['verdict'],
       summary: row.summary as string,
       findings: parseJson(row.findings as string, [] as ReviewFinding[]),
+      headRef: (row.head_ref as string) ?? '',
+      blocking: Number(row.blocking) === 1,
       createdAt: row.created_at as string,
     }));
   }
 }
 
-function buildReviewPrompt(opts: {
-  request: string;
-  goal: string;
-  acceptance: string[];
-  diff: string;
-  files: { path: string; added: number; removed: number }[];
-  verification: VerificationReport;
-  contextPack: string;
-  implementerSummary: string;
-}): string {
+function buildReviewPrompt(opts: ReviewOptions): string {
   const diff =
     opts.diff.length > MAX_DIFF_CHARS
       ? `${opts.diff.slice(0, MAX_DIFF_CHARS)}\n[diff truncated]`
@@ -255,6 +294,8 @@ function buildReviewPrompt(opts: {
 
 Review the diff below against the request. Be specific and evidence-based. Do not
 restate the diff. Do not approve work that fails its acceptance criteria.
+This stage reviews code, security, correctness, and tests. Visual QA runs later:
+do not reject because screenshots are not present, and do not claim visual validation.
 
 ## Original request
 ${opts.request}
@@ -330,10 +371,10 @@ export function parseReviewOutput(text: string): {
           })
         : [];
       const hasBlocking = findings.some((f) => f.severity === 'critical' || f.severity === 'high');
-      const claimed = parsed.verdict === 'approve' ? 'approve' : 'request_changes';
       return {
-        // Consistency guard: a reviewer cannot approve while reporting blockers.
-        verdict: hasBlocking ? 'request_changes' : claimed,
+        // Structured severity is authoritative in both directions: advisory
+        // findings cannot turn a candidate into a blocking request.
+        verdict: hasBlocking ? 'request_changes' : 'approve',
         summary: typeof parsed.summary === 'string' ? parsed.summary : '',
         findings,
       };

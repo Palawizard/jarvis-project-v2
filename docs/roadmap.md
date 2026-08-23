@@ -15,15 +15,17 @@
 - Deterministic EN/FR memory classification and fail-closed ambiguous forget.
 - Central risk-classified tool permission policy, persisted audit, user-only standing permissions, atomic approval expiry, cooperative timeout cancellation, and restart recovery.
 - Free deterministic GitHub Actions CI.
+- Bounded code/visual repair loops, provider stage rerouting, durable pause/resume, immutable validation-only candidate import, and job-scoped Visual QA scenarios.
+- Explicit ordered verification steps; Jarvis's full gate includes integration and Playwright E2E while live subscription tests remain opt-in.
 
 ## Partial
 
 - Procedures share the durable record lifecycle but learned structured procedure capture is not implemented.
 - Supervisor activation requires Jarvis to have been launched through `pnpm supervisor <config.json>`; existing unsupervised processes can prepare but not activate.
 - Runtime port reservation has an unavoidable narrow handoff race for arbitrary frameworks; Jarvis self-candidates close it with a per-launch nonce and commit check, while generic projects rely on their configured health contract.
-- Provider cooldowns are runtime-local; restarting Jarvis clears them, and a failed in-flight provider call is not automatically replayed through another subscription.
+- Provider cooldowns are runtime-local; restarting Jarvis clears them. Within a run, recoverable provider failures are recorded and rerouted with a bounded stage budget.
 - Route/interaction configuration is deterministic and deliberately small, not a browser agent.
-- Restart recovery preserves/marks unknown application state and reconciles supervisor evidence; supervisor crash recovery remains conservative.
+- Restart recovery pauses running development jobs with their worktree checkpoint and marks running agent calls interrupted. Candidate application/supervisor crash recovery remains separately conservative.
 - Tool Registry contains only tools needed for the bootstrap slice; the permission layer is built ahead of the modules that will need it, so `sensitive` and `destructive` are exercised by tests rather than by shipped tools.
 - Tool permission enforcement is in-process. The loopback API is unauthenticated, so a local process running as the same user can still act as the user; OS-level isolation of agent children is not implemented. See `docs/tool-permissions.md`.
 - A tool timeout aborts `ctx.signal` and records `timed_out` with `effectUnknown`, but cannot force uncooperative code to stop; a tool that ignores the signal may still complete its side effect.

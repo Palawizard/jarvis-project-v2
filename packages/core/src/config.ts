@@ -73,6 +73,11 @@ export interface JarvisConfig {
   pipeline: {
     /** Max automatic implement->verify->fix loops before handing back to the user. */
     maxFixCycles: number;
+    maxReviewFixCycles: number;
+    maxVisualFixCycles: number;
+    agentStageRetries: number;
+    codeReviewBlockingSeverities: string[];
+    visualBlockingSeverities: string[];
     /** Retention for raw history rows, in days. 0 = keep forever. */
     rawHistoryRetentionDays: number;
   };
@@ -115,6 +120,18 @@ function envBool(name: string, fallback: boolean): boolean {
 function envProvider(name: string): 'claude' | 'codex' | undefined {
   const value = process.env[name];
   return value === 'claude' || value === 'codex' ? value : undefined;
+}
+
+function envSeverities(name: string, fallback: string[], allowed: string[]): string[] {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const values = [...new Set(raw.split(',').map((value) => value.trim().toLowerCase()))].filter(
+    Boolean,
+  );
+  if (!values.length || values.some((value) => !allowed.includes(value))) {
+    throw new Error(`${name} contains an unsupported or empty severity`);
+  }
+  return values;
 }
 
 let cached: JarvisConfig | undefined;
@@ -164,7 +181,20 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
       },
     },
     pipeline: {
-      maxFixCycles: envInt('JARVIS_MAX_FIX_CYCLES', 1),
+      maxFixCycles: Math.max(0, envInt('JARVIS_MAX_FIX_CYCLES', 1)),
+      maxReviewFixCycles: Math.max(0, envInt('JARVIS_MAX_REVIEW_FIX_CYCLES', 2)),
+      maxVisualFixCycles: Math.max(0, envInt('JARVIS_MAX_VISUAL_FIX_CYCLES', 2)),
+      agentStageRetries: Math.max(0, envInt('JARVIS_AGENT_STAGE_RETRIES', 2)),
+      codeReviewBlockingSeverities: envSeverities(
+        'JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES',
+        ['critical', 'high'],
+        ['critical', 'high', 'medium', 'low', 'info'],
+      ),
+      visualBlockingSeverities: envSeverities(
+        'JARVIS_VISUAL_REVIEW_BLOCKING_SEVERITIES',
+        ['high', 'medium'],
+        ['high', 'medium', 'low', 'info'],
+      ),
       rawHistoryRetentionDays: envInt('JARVIS_RAW_HISTORY_RETENTION_DAYS', 90),
     },
     tools: {

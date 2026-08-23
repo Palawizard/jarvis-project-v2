@@ -6,12 +6,13 @@ import { newId, nowIso } from '../ids.js';
 import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
 import { killTree } from '../agents/spawn.js';
-import type { VisualInteraction } from '../projects/service.js';
+import type { VisualInteraction, VisualQaScenario } from '../projects/service.js';
 
 const log = createLogger('visual-qa');
 
 export interface VisualQaShot {
   id: string;
+  scenarioName: string;
   route: string;
   viewport: 'desktop' | 'mobile';
   screenshotPath: string | null;
@@ -24,10 +25,13 @@ export interface VisualQaShot {
   reviewVerdict: 'pass' | 'needs_fix' | null;
   reviewFindings: VisualReviewFinding[];
   createdAt: string;
+  headRef: string | null;
+  cycle: number;
 }
 
 export interface VisualReviewFinding {
   severity: 'high' | 'medium' | 'low' | 'info';
+  scenarioName: string;
   route: string;
   viewport: 'desktop' | 'mobile';
   category: string;
@@ -60,15 +64,21 @@ export class VisualQaEngine {
     projectId?: string | null;
     baseUrl: string;
     routes: string[];
+    scenarios?: VisualQaScenario[];
     viewports?: ('desktop' | 'mobile')[];
     interactions?: VisualInteraction[];
     signal?: AbortSignal;
+    headRef?: string | null;
+    cycle?: number;
   }): Promise<VisualQaShot[]> {
     const viewports = opts.viewports ?? ['desktop', 'mobile'];
+    const scenarios: VisualQaScenario[] = opts.scenarios?.length
+      ? opts.scenarios
+      : opts.routes.map((route) => ({ name: route, route, interactions: opts.interactions }));
     this.bus?.emit({
       type: 'visual_qa.started',
       ...(opts.jobId ? { jobId: opts.jobId } : {}),
-      payload: { baseUrl: opts.baseUrl, routes: opts.routes, viewports },
+      payload: { baseUrl: opts.baseUrl, scenarios: scenarios.map((scenario) => scenario.name) },
     });
 
     const outDir = path.join(
@@ -85,13 +95,13 @@ export class VisualQaEngine {
       const { chromium } = await import('playwright');
       browser = await chromium.launch({ headless: true });
 
-      for (const viewport of viewports) {
-        const context = await browser.newContext({ viewport: VIEWPORTS[viewport] });
-        for (const route of opts.routes) {
+      for (const scenario of scenarios) {
+        for (const viewport of scenario.viewports ?? viewports) {
+          const context = await browser.newContext({ viewport: VIEWPORTS[viewport] });
           if (opts.signal?.aborted) break;
-          shots.push(await this.captureRoute(context, opts, route, viewport, outDir));
+          shots.push(await this.captureRoute(context, opts, scenario, viewport, outDir));
+          await context.close();
         }
-        await context.close();
       }
     } catch (error) {
       // Playwright missing/broken is an explicit failed state, not a crash.
@@ -101,6 +111,7 @@ export class VisualQaEngine {
         jobId: opts.jobId ?? null,
         projectId: opts.projectId ?? null,
         route: '(browser launch)',
+        scenarioName: '(browser launch)',
         viewport: 'desktop',
         screenshotPath: null,
         consoleErrors: [],
@@ -108,6 +119,8 @@ export class VisualQaEngine {
         status: 'failed',
         error: `Playwright unavailable: ${message}. Run \`pnpm exec playwright install chromium\`.`,
         reviewedBy: null,
+        headRef: opts.headRef ?? null,
+        cycle: opts.cycle ?? 0,
       });
       shots.push(shot);
     } finally {
@@ -132,8 +145,10 @@ export class VisualQaEngine {
       projectId?: string | null;
       baseUrl: string;
       interactions?: VisualInteraction[];
+      headRef?: string | null;
+      cycle?: number;
     },
-    route: string,
+    scenario: VisualQaScenario,
     viewport: 'desktop' | 'mobile',
     outDir: string,
   ): Promise<VisualQaShot> {
@@ -158,13 +173,20 @@ export class VisualQaEngine {
         networkFailures.push(`${response.status()} ${response.url()}`.slice(0, 500));
     });
 
-    const url = new URL(route, opts.baseUrl).toString();
-    const safeName = `${route.replace(/[^a-z0-9]+/gi, '_') || 'root'}-${viewport}-${newId('shot')}.png`;
+    const route = scenario.route;
+    const url = confinedCandidateUrl(opts.baseUrl, route);
+    const safeName = `${scenario.name.replace(/[^a-z0-9]+/gi, '_') || 'scenario'}-${viewport}-${newId('shot')}.png`;
     const screenshotPath = path.join(outDir, safeName);
 
     try {
       await page.goto(url, { waitUntil: 'networkidle', timeout: 30_000 });
-      await runInteractions(page, opts.baseUrl, opts.interactions ?? [], outDir, viewport);
+      await runInteractions(
+        page,
+        opts.baseUrl,
+        scenario.interactions ?? opts.interactions ?? [],
+        outDir,
+        viewport,
+      );
       // Let entry animations settle so screenshots are comparable run to run.
       await page.waitForTimeout(400);
       await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -173,6 +195,7 @@ export class VisualQaEngine {
         jobId: opts.jobId ?? null,
         projectId: opts.projectId ?? null,
         route,
+        scenarioName: scenario.name,
         viewport,
         screenshotPath,
         consoleErrors,
@@ -180,12 +203,15 @@ export class VisualQaEngine {
         status: 'captured',
         error: null,
         reviewedBy: null,
+        headRef: opts.headRef ?? null,
+        cycle: opts.cycle ?? 0,
       });
       this.bus?.emit({
         type: 'visual_qa.captured',
         ...(opts.jobId ? { jobId: opts.jobId } : {}),
         payload: {
           route,
+          scenarioName: scenario.name,
           viewport,
           consoleErrors: consoleErrors.length,
           networkFailures: networkFailures.length,
@@ -198,6 +224,7 @@ export class VisualQaEngine {
         jobId: opts.jobId ?? null,
         projectId: opts.projectId ?? null,
         route,
+        scenarioName: scenario.name,
         viewport,
         screenshotPath: null,
         consoleErrors,
@@ -205,6 +232,8 @@ export class VisualQaEngine {
         status: 'failed',
         error: error instanceof Error ? error.message : String(error),
         reviewedBy: null,
+        headRef: opts.headRef ?? null,
+        cycle: opts.cycle ?? 0,
       });
     }
   }
@@ -217,12 +246,16 @@ export class VisualQaEngine {
     jobId?: string | null;
     projectId?: string | null;
     route: string;
+    scenarioName?: string;
     error: string;
+    headRef?: string | null;
+    cycle?: number;
   }): VisualQaShot {
     return this.persist({
       jobId: input.jobId ?? null,
       projectId: input.projectId ?? null,
       route: input.route,
+      scenarioName: input.scenarioName ?? input.route,
       viewport: 'desktop',
       screenshotPath: null,
       consoleErrors: [],
@@ -230,6 +263,8 @@ export class VisualQaEngine {
       status: 'failed',
       error: input.error,
       reviewedBy: null,
+      headRef: input.headRef ?? null,
+      cycle: input.cycle ?? 0,
     });
   }
 
@@ -241,6 +276,7 @@ export class VisualQaEngine {
   ): VisualQaShot {
     const shot: VisualQaShot = {
       id: newId('vqa'),
+      scenarioName: input.scenarioName,
       route: input.route,
       viewport: input.viewport,
       screenshotPath: input.screenshotPath,
@@ -252,16 +288,20 @@ export class VisualQaEngine {
       reviewVerdict: null,
       reviewFindings: [],
       createdAt: nowIso(),
+      headRef: input.headRef,
+      cycle: input.cycle,
     };
     this.db
       .prepare(
-        `INSERT INTO visual_qa (id, job_id, project_id, route, viewport, screenshot_path, console_errors,
-          network_failures, status, error, reviewed_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO visual_qa (id, job_id, project_id, scenario_name, route, viewport,
+          screenshot_path, console_errors, network_failures, status, error, reviewed_by, head_ref,
+          cycle, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         shot.id,
         input.jobId,
         input.projectId,
+        shot.scenarioName,
         shot.route,
         shot.viewport,
         shot.screenshotPath,
@@ -270,6 +310,8 @@ export class VisualQaEngine {
         shot.status,
         shot.error,
         shot.reviewedBy,
+        shot.headRef,
+        shot.cycle,
         shot.createdAt,
       );
     return shot;
@@ -281,6 +323,7 @@ export class VisualQaEngine {
       .all(jobId) as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       id: row.id as string,
+      scenarioName: (row.scenario_name as string) ?? 'default',
       route: row.route as string,
       viewport: row.viewport as 'desktop' | 'mobile',
       screenshotPath: (row.screenshot_path as string) ?? null,
@@ -292,6 +335,8 @@ export class VisualQaEngine {
       reviewVerdict: parseReview(row.review_findings as string | null).verdict,
       reviewFindings: parseReview(row.review_findings as string | null).findings,
       createdAt: row.created_at as string,
+      headRef: (row.head_ref as string) ?? null,
+      cycle: Number(row.cycle ?? 0),
     }));
   }
 }
@@ -327,7 +372,7 @@ async function runInteractions(
   for (const step of interactions) {
     switch (step.action) {
       case 'goto':
-        await page.goto(new URL(step.route, baseUrl).toString(), {
+        await page.goto(confinedCandidateUrl(baseUrl, step.route), {
           waitUntil: 'networkidle',
           timeout: 30_000,
         });
@@ -357,6 +402,16 @@ async function runInteractions(
       }
     }
   }
+}
+
+function confinedCandidateUrl(baseUrl: string, route: string): string {
+  if (!/^\/(?!\/)/.test(route) || route.includes('\\')) {
+    throw new Error(`visual QA route must be a same-origin absolute path: ${route}`);
+  }
+  const base = new URL(baseUrl);
+  const url = new URL(route, base);
+  if (url.origin !== base.origin) throw new Error('visual QA route escaped the candidate origin');
+  return url.toString();
 }
 
 /**

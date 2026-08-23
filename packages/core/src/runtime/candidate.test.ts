@@ -99,6 +99,10 @@ describe('candidate runtime isolation', () => {
       expect(health.supervised).toBeUndefined();
       expect(health.requestPath).toBeUndefined();
       expect(health.apiKey).toBeUndefined();
+      await started.stop();
+      await started.stop();
+      runtime = undefined;
+      await expect(fetch(started.baseUrl, { signal: AbortSignal.timeout(500) })).rejects.toThrow();
     } finally {
       await runtime?.stop();
       restoreEnv('JARVIS_SUPERVISED', original.supervised);
@@ -235,6 +239,47 @@ describe('candidate runtime isolation', () => {
       );
       return !reachable;
     });
+  });
+
+  it('rejects a completed 404 frontend and cleans both candidate ports', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
+    roots.push(root);
+    const portsFile = path.join(root, 'ports');
+    const candidate = project(root);
+    candidate.config.candidateRuntime = {
+      command: {
+        executable: process.execPath,
+        args: [
+          '-e',
+          `const fs=require('node:fs'),http=require('node:http');` +
+            `fs.writeFileSync(${JSON.stringify(portsFile)},process.env.TEST_API_PORT+','+process.env.TEST_PORT);` +
+            `http.createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok'}))}).listen(Number(process.env.TEST_API_PORT),'127.0.0.1');` +
+            `http.createServer((_,r)=>{r.writeHead(404);r.end('missing')}).listen(Number(process.env.TEST_PORT),'127.0.0.1');`,
+        ],
+      },
+      portEnvironment: 'TEST_PORT',
+      apiPortEnvironment: 'TEST_API_PORT',
+      healthPath: '/health',
+    };
+
+    await expect(
+      startCandidateRuntime({
+        project: candidate,
+        cwd: root,
+        jobId: 'job_web_404',
+        config: loadConfig({ home: path.join(root, 'home') }),
+        timeoutMs: 1_500,
+      }),
+    ).rejects.toThrow('candidate API is healthy but web frontend did not become ready at');
+
+    for (const port of fs.readFileSync(portsFile, 'utf8').split(',')) {
+      await until(() =>
+        fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(500) }).then(
+          () => false,
+          () => true,
+        ),
+      );
+    }
   });
 
   it('fails closed when startup is cancelled during the final web probe', async () => {

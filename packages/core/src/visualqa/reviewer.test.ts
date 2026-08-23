@@ -22,6 +22,7 @@ describe('visual reviewer', () => {
       findings: [
         {
           severity: 'high',
+          scenarioName: 'mobile home',
           route: '/',
           viewport: 'mobile',
           category: 'layout',
@@ -32,6 +33,26 @@ describe('visual reviewer', () => {
     });
     expect(review.verdict).toBe('needs_fix');
     expect(review.findings).toHaveLength(1);
+  });
+
+  it('keeps low and info visual findings advisory even when the reviewer claims needs_fix', () => {
+    const finding = {
+      scenarioName: 'tools',
+      route: '/',
+      viewport: 'desktop' as const,
+      category: 'polish',
+      description: 'Minor alignment preference',
+      recommendation: 'Consider aligning labels',
+    };
+    const review = parseVisualReview({
+      verdict: 'needs_fix',
+      findings: [
+        { ...finding, severity: 'low' },
+        { ...finding, severity: 'info' },
+      ],
+    });
+    expect(review.verdict).toBe('pass');
+    expect(review.findings).toHaveLength(2);
   });
 
   it('reports missing/unavailable review evidence without faking reviewedBy', async () => {
@@ -49,6 +70,7 @@ describe('visual reviewer', () => {
     );
     const shot: VisualQaShot = {
       id: 'shot_missing',
+      scenarioName: 'home',
       route: '/',
       viewport: 'desktop',
       screenshotPath: path.join(root, 'missing.png'),
@@ -59,6 +81,8 @@ describe('visual reviewer', () => {
       reviewedBy: null,
       reviewVerdict: null,
       reviewFindings: [],
+      headRef: 'abc123',
+      cycle: 0,
       createdAt: new Date().toISOString(),
     };
     const result = await reviewer.review({

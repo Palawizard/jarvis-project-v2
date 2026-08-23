@@ -132,6 +132,11 @@ export {
   type PolicyDecision,
 } from './tools/policy.js';
 export { registerBuiltinTools } from './tools/builtin.js';
+export {
+  agentIsolationPreflight,
+  type AgentIsolationBackend,
+  type AgentIsolationPreflight,
+} from './tools/isolation.js';
 
 export { createLogger } from './logger.js';
 export { newId, nowIso, sha256 } from './ids.js';

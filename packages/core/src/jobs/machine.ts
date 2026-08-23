@@ -13,13 +13,14 @@ export type JobStage =
   | 'reviewing'
   | 'visual_qa'
   | 'fixing'
+  | 'paused'
   | 'awaiting_user'
   | 'completed'
   | 'failed'
   | 'cancelled';
 
 export type JobStatus =
-  'pending' | 'running' | 'awaiting_user' | 'completed' | 'failed' | 'cancelled';
+  'pending' | 'running' | 'paused' | 'awaiting_user' | 'completed' | 'failed' | 'cancelled';
 
 export const TERMINAL_STAGES: readonly JobStage[] = [
   'completed',
@@ -39,13 +40,23 @@ export const PIPELINE_STAGES: readonly JobStage[] = [
 
 const TRANSITIONS: Record<JobStage, readonly JobStage[]> = {
   queued: ['planning', 'cancelled', 'failed'],
-  planning: ['implementing', 'failed', 'cancelled'],
-  implementing: ['verifying', 'failed', 'cancelled'],
+  planning: ['implementing', 'verifying', 'paused', 'failed', 'cancelled'],
+  implementing: ['verifying', 'paused', 'failed', 'cancelled'],
   // Verification can bounce straight to fixing when a check fails.
-  verifying: ['reviewing', 'fixing', 'failed', 'cancelled'],
-  reviewing: ['visual_qa', 'fixing', 'awaiting_user', 'failed', 'cancelled'],
-  visual_qa: ['awaiting_user', 'fixing', 'failed', 'cancelled'],
-  fixing: ['verifying', 'failed', 'cancelled', 'awaiting_user'],
+  verifying: ['reviewing', 'fixing', 'paused', 'failed', 'cancelled'],
+  reviewing: ['visual_qa', 'fixing', 'awaiting_user', 'paused', 'failed', 'cancelled'],
+  visual_qa: ['awaiting_user', 'fixing', 'paused', 'failed', 'cancelled'],
+  fixing: ['verifying', 'paused', 'failed', 'cancelled', 'awaiting_user'],
+  paused: [
+    'planning',
+    'implementing',
+    'fixing',
+    'verifying',
+    'reviewing',
+    'visual_qa',
+    'cancelled',
+    'failed',
+  ],
   // awaiting_user is terminal for the automatic pipeline but the user can act.
   awaiting_user: ['completed', 'cancelled', 'fixing'],
   completed: [],
@@ -83,6 +94,8 @@ export function statusForStage(stage: JobStage): JobStatus {
       return 'cancelled';
     case 'awaiting_user':
       return 'awaiting_user';
+    case 'paused':
+      return 'paused';
     default:
       return 'running';
   }

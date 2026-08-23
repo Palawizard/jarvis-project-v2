@@ -11,6 +11,7 @@ import type { AgentRegistry } from '../agents/registry.js';
 import type { VerificationEngine, VerificationReport } from '../verification/engine.js';
 import type { ReviewEngine, Review } from '../review/engine.js';
 import { VisualQaEngine } from '../visualqa/engine.js';
+import { VisualReviewer } from '../visualqa/reviewer.js';
 import { startCandidateRuntime } from '../runtime/candidate.js';
 import { GitWorkspace } from '../git/workspace.js';
 import { MEMORY_PROPOSAL_INSTRUCTIONS } from '../agents/proposals.js';
@@ -36,6 +37,8 @@ export interface PipelineDeps {
   agents: AgentRegistry;
   verification: VerificationEngine;
   review: ReviewEngine;
+  visualQa?: VisualQaEngine;
+  visualReviewer?: VisualReviewer;
 }
 
 /**
@@ -51,12 +54,17 @@ export class JobPipeline {
   private readonly config: JarvisConfig;
   private readonly git: GitWorkspace;
   private readonly visualQa: VisualQaEngine;
+  private readonly visualReviewer: VisualReviewer;
   private readonly running = new Map<string, AbortController>();
 
   constructor(private readonly deps: PipelineDeps) {
     this.config = deps.config ?? getConfig();
     this.git = new GitWorkspace(this.config.worktreesDir);
-    this.visualQa = new VisualQaEngine(deps.db, this.config.artifactsDir, deps.bus);
+    this.visualQa =
+      deps.visualQa ?? new VisualQaEngine(deps.db, this.config.artifactsDir, deps.bus);
+    this.visualReviewer =
+      deps.visualReviewer ??
+      new VisualReviewer(deps.db, deps.agents, deps.jobs, this.config.artifactsDir, deps.bus);
   }
 
   isRunning(jobId: string): boolean {
@@ -284,6 +292,8 @@ export class JobPipeline {
         worktree.path,
         signal,
         Boolean(visualConfig?.required),
+        providerId,
+        job,
       );
     }
     if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
@@ -325,6 +335,8 @@ export class JobPipeline {
     cwd: string,
     signal: AbortSignal,
     required: boolean,
+    implementerProvider: ProviderId,
+    job: Job,
   ): Promise<void> {
     const visual = project.config.visualQa;
     if (!visual) return;
@@ -351,6 +363,23 @@ export class JobPipeline {
       });
       if (required && shots.some((shot) => shot.status !== 'captured')) {
         throw new Error('required visual QA did not capture every configured route and viewport');
+      }
+      const review = await this.visualReviewer.review({
+        jobId,
+        cwd,
+        goal: job.goal,
+        acceptance: job.acceptance,
+        shots,
+        implementerProvider,
+        selfDevelopment: project.isSelf,
+        signal,
+      });
+      if (required && review.verdict !== 'pass') {
+        throw new Error(
+          review.verdict === 'error'
+            ? `required visual reviewer failed: ${review.error ?? 'unknown error'}`
+            : 'required visual review found blocking UI issues',
+        );
       }
     } catch (error) {
       if (signal.aborted) return;

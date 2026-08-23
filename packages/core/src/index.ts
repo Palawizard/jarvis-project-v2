@@ -92,7 +92,13 @@ export {
   type Review,
   type ReviewFinding,
 } from './review/engine.js';
-export { VisualQaEngine, startDevServer, type VisualQaShot } from './visualqa/engine.js';
+export {
+  VisualQaEngine,
+  startDevServer,
+  type VisualQaShot,
+  type VisualReviewFinding,
+} from './visualqa/engine.js';
+export { VisualReviewer, parseVisualReview, type VisualReview } from './visualqa/reviewer.js';
 export {
   startCandidateRuntime,
   CandidateRuntimeUnsupportedError,

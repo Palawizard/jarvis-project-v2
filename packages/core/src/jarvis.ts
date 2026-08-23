@@ -14,6 +14,7 @@ import { AgentRegistry } from './agents/registry.js';
 import { VerificationEngine } from './verification/engine.js';
 import { ReviewEngine } from './review/engine.js';
 import { VisualQaEngine } from './visualqa/engine.js';
+import { VisualReviewer } from './visualqa/reviewer.js';
 import { CandidateApplicationService } from './application/service.js';
 import { registerBuiltinTools } from './tools/builtin.js';
 import type { ToolRegistry } from './tools/registry.js';
@@ -40,6 +41,7 @@ export class Jarvis {
   readonly verification: VerificationEngine;
   readonly review: ReviewEngine;
   readonly visualQa: VisualQaEngine;
+  readonly visualReviewer: VisualReviewer;
   readonly pipeline: JobPipeline;
   readonly applications: CandidateApplicationService;
   readonly tools: ToolRegistry;
@@ -59,6 +61,13 @@ export class Jarvis {
     this.verification = new VerificationEngine(this.db, config.artifactsDir, this.bus);
     this.review = new ReviewEngine(this.db, this.agents, this.bus, this.config);
     this.visualQa = new VisualQaEngine(this.db, config.artifactsDir, this.bus);
+    this.visualReviewer = new VisualReviewer(
+      this.db,
+      this.agents,
+      this.jobs,
+      config.artifactsDir,
+      this.bus,
+    );
     this.applications = new CandidateApplicationService(
       this.db,
       this.bus,
@@ -85,6 +94,8 @@ export class Jarvis {
       agents: this.agents,
       verification: this.verification,
       review: this.review,
+      visualQa: this.visualQa,
+      visualReviewer: this.visualReviewer,
     });
   }
 

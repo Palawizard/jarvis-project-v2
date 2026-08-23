@@ -341,7 +341,38 @@ export class CandidateApplicationService {
         'candidate_missing',
       );
     }
-    await this.git.validateCandidate(job.worktreePath, job.baseRef, job.headRef);
+    const changes = await this.git.validateCandidate(job.worktreePath, job.baseRef, job.headRef);
+    const project = this.projects.get(job.projectId);
+    const uiChanged = changes.files.some((file) =>
+      /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i.test(file.path),
+    );
+    if (project?.config.visualQa?.required && uiChanged) {
+      const rows = this.db
+        .prepare(
+          `SELECT status, reviewed_by, review_findings FROM visual_qa WHERE job_id=? ORDER BY created_at`,
+        )
+        .all(jobId) as Array<{
+        status: string;
+        reviewed_by: string | null;
+        review_findings: string | null;
+      }>;
+      const passed =
+        rows.length > 0 &&
+        rows.every((row) => {
+          if (row.status !== 'captured' || !row.reviewed_by || !row.review_findings) return false;
+          try {
+            return (JSON.parse(row.review_findings) as { verdict?: string }).verdict === 'pass';
+          } catch {
+            return false;
+          }
+        });
+      if (!passed) {
+        throw new CandidateApplicationError(
+          'required visual review is missing, failed, or contains blocking findings',
+          'visual_review_rejected',
+        );
+      }
+    }
     const verificationCycle = report.results.reduce(
       (latest, result) => Math.max(latest, result.cycle),
       -1,

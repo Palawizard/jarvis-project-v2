@@ -21,7 +21,18 @@ export interface VisualQaShot {
   error: string | null;
   /** null means "evidence only" — no AI review happened. Never fake this. */
   reviewedBy: string | null;
+  reviewVerdict: 'pass' | 'needs_fix' | null;
+  reviewFindings: VisualReviewFinding[];
   createdAt: string;
+}
+
+export interface VisualReviewFinding {
+  severity: 'high' | 'medium' | 'low' | 'info';
+  route: string;
+  viewport: 'desktop' | 'mobile';
+  category: string;
+  description: string;
+  recommendation: string;
 }
 
 const VIEWPORTS = {
@@ -223,7 +234,7 @@ export class VisualQaEngine {
   }
 
   private persist(
-    input: Omit<VisualQaShot, 'id' | 'createdAt'> & {
+    input: Omit<VisualQaShot, 'id' | 'createdAt' | 'reviewVerdict' | 'reviewFindings'> & {
       jobId: string | null;
       projectId: string | null;
     },
@@ -238,6 +249,8 @@ export class VisualQaEngine {
       status: input.status,
       error: input.error,
       reviewedBy: input.reviewedBy,
+      reviewVerdict: null,
+      reviewFindings: [],
       createdAt: nowIso(),
     };
     this.db
@@ -276,8 +289,29 @@ export class VisualQaEngine {
       status: row.status as 'captured' | 'failed',
       error: (row.error as string) ?? null,
       reviewedBy: (row.reviewed_by as string) ?? null,
+      reviewVerdict: parseReview(row.review_findings as string | null).verdict,
+      reviewFindings: parseReview(row.review_findings as string | null).findings,
       createdAt: row.created_at as string,
     }));
+  }
+}
+
+function parseReview(raw: string | null): {
+  verdict: VisualQaShot['reviewVerdict'];
+  findings: VisualReviewFinding[];
+} {
+  if (!raw) return { verdict: null, findings: [] };
+  try {
+    const value = JSON.parse(raw) as {
+      verdict?: VisualQaShot['reviewVerdict'];
+      findings?: VisualReviewFinding[];
+    };
+    return {
+      verdict: value.verdict === 'pass' || value.verdict === 'needs_fix' ? value.verdict : null,
+      findings: Array.isArray(value.findings) ? value.findings : [],
+    };
+  } catch {
+    return { verdict: null, findings: [] };
   }
 }
 

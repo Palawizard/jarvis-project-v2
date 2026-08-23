@@ -7,12 +7,21 @@ const log = createLogger('agent-spawn');
 
 const API_KEY_ENV = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY'] as const;
 
+/**
+ * Jarvis's own control plane. An agent child has no business talking to the
+ * orchestrator API — its privileged path is the in-process tool boundary, where
+ * `actor: 'agent'` applies. Not handing it the address is defence in depth, not
+ * a boundary: the port is guessable and the API is unauthenticated, so an agent
+ * determined to reach it still can. See docs/tool-permissions.md.
+ */
+const CONTROL_PLANE_ENV = ['JARVIS_PORT', 'JARVIS_WEB_PORT', 'JARVIS_RUNTIME_NONCE'] as const;
+
 /** Provider runs must use the CLIs' subscription login, never inherited API billing. */
 export function subscriptionProviderEnv(
   source: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...source, FORCE_COLOR: '0', NO_COLOR: '1' };
-  for (const key of API_KEY_ENV) delete env[key];
+  for (const key of [...API_KEY_ENV, ...CONTROL_PLANE_ENV]) delete env[key];
   return env;
 }
 

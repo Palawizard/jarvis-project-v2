@@ -11,9 +11,12 @@ import {
   normaliseGoal,
   renderProjectSnapshot,
   PIPELINE_STAGES,
+  RISK_LEVELS,
   type Jarvis,
   type MemoryKind,
   type MemoryScope,
+  type RiskLevel,
+  type ToolExecutionStatus,
 } from '@jarvis/core';
 
 const MEMORY_SCOPES = new Set<MemoryScope>(['user', 'project', 'session', 'agent', 'procedure']);
@@ -619,18 +622,128 @@ export function createRoutes(jarvis: Jarvis): Hono {
   });
 
   // ------------------------------------------------------------------- tools --
-  app.get('/api/tools', (c) => c.json(jarvis.tools.list()));
+  // Everything below runs as actor `user`, hardcoded. The previous version read
+  // the risk ceiling out of the request body, which meant any caller could name
+  // its own privileges. A request may never influence the policy input: see
+  // docs/tool-permissions.md for the trust boundary this does and does not buy.
+  app.get('/api/tools', (c) => c.json(jarvis.tools.list('user')));
 
   app.post('/api/tools/:name', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { input?: unknown; maxRisk?: string };
+    const body = (await c.req.json().catch(() => ({}))) as {
+      input?: unknown;
+      sessionId?: string;
+      projectId?: string;
+      maxRisk?: string;
+    };
     try {
-      const result = await jarvis.tools.execute(c.req.param('name'), body.input ?? {}, {
-        maxRisk: (body.maxRisk as 'observe') ?? 'reversible_modification',
+      const outcome = await jarvis.tools.execute(c.req.param('name'), body.input ?? {}, {
+        actor: 'user',
+        sessionId: body.sessionId ?? null,
+        projectId: body.projectId ?? null,
+        // A caller may tighten its own ceiling; the policy ignores any attempt
+        // to widen it, so this is safe to accept from the body.
+        ...(RISK_LEVELS.includes(body.maxRisk as RiskLevel)
+          ? { maxRisk: body.maxRisk as RiskLevel }
+          : {}),
       });
-      return c.json({ ok: true, result });
+      // A refusal is a successful policy evaluation, not an HTTP error: the
+      // caller needs the recorded execution back to show why it was refused.
+      return c.json(outcome);
     } catch (error) {
       return fail(error instanceof Error ? error.message : String(error), 422);
     }
+  });
+
+  app.get('/api/tool-executions', (c) => {
+    const status = c.req.query('status');
+    const limit = Number(c.req.query('limit') ?? '100');
+    return c.json({
+      pending: jarvis.tools.pending(),
+      executions: jarvis.tools.executions({
+        ...(status && status !== 'all' ? { status: status as ToolExecutionStatus } : {}),
+        ...(c.req.query('toolName') ? { toolName: c.req.query('toolName') as string } : {}),
+        limit: Number.isFinite(limit) ? limit : 100,
+      }),
+    });
+  });
+
+  app.post('/api/tool-executions/:id/approve', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      remember?: boolean;
+      projectId?: string | null;
+      note?: string;
+    };
+    try {
+      const outcome = await jarvis.tools.approve(c.req.param('id'), {
+        ...(body.remember
+          ? {
+              remember: {
+                projectId: body.projectId ?? null,
+                note: body.note ?? 'approved from the tools view',
+              },
+            }
+          : {}),
+      });
+      // A refusal is a successful policy evaluation, not an HTTP error: the
+      // caller needs the recorded execution back to show why it was refused.
+      return c.json(outcome);
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
+    }
+  });
+
+  app.post('/api/tool-executions/:id/deny', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+    try {
+      return c.json(jarvis.tools.deny(c.req.param('id'), body.reason || 'declined by the user'));
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
+    }
+  });
+
+  app.post('/api/tool-executions/:id/retry', async (c) => {
+    try {
+      const outcome = await jarvis.tools.retry(c.req.param('id'), 'user');
+      // A refusal is a successful policy evaluation, not an HTTP error: the
+      // caller needs the recorded execution back to show why it was refused.
+      return c.json(outcome);
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
+    }
+  });
+
+  app.get('/api/tool-grants', (c) => c.json(jarvis.tools.grants()));
+
+  app.post('/api/tool-grants', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      toolName?: string;
+      projectId?: string | null;
+      note?: string;
+      expiresAt?: string | null;
+    };
+    if (!body.toolName) return fail('toolName is required');
+    if (!jarvis.tools.has(body.toolName)) return fail('unknown tool', 404);
+    try {
+      // Standing permissions are only ever granted to the user's own actions.
+      // Delegating one to an agent is a separate, deliberate decision Jarvis
+      // does not yet offer — see docs/tool-permissions.md.
+      return c.json(
+        jarvis.tools.grant({
+          toolName: body.toolName,
+          actor: 'user',
+          projectId: body.projectId ?? null,
+          note: body.note ?? null,
+          expiresAt: body.expiresAt ?? null,
+        }),
+      );
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 422);
+    }
+  });
+
+  app.delete('/api/tool-grants/:id', (c) => {
+    if (!jarvis.tools.revokeGrant(c.req.param('id'))) return fail('grant not found', 404);
+    return c.json({ revoked: true });
   });
 
   app.get('/api/goal-preview', (c) => c.json({ goal: normaliseGoal(c.req.query('text') ?? '') }));

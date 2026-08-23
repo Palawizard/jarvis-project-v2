@@ -108,12 +108,27 @@ export {
 
 export {
   ToolRegistry,
-  riskExceeds,
   ToolPermissionError,
-  type RiskLevel,
   type ToolDefinition,
   type ToolContext,
+  type ToolCallContext,
+  type ToolExecution,
+  type ToolExecutionOutcome,
+  type ToolExecutionStatus,
+  type ToolGrant,
+  type GrantInput as ToolGrantInput,
+  type ToolRegistryOptions,
 } from './tools/registry.js';
+export {
+  decide as decideToolPolicy,
+  previewDecision,
+  riskExceeds,
+  RISK_LEVELS,
+  MAX_GRANTABLE_RISK,
+  type RiskLevel,
+  type ToolActor,
+  type PolicyDecision,
+} from './tools/policy.js';
 export { registerBuiltinTools } from './tools/builtin.js';
 
 export { createLogger } from './logger.js';

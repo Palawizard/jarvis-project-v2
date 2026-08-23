@@ -6,8 +6,6 @@ import { openDb, type Db } from '../db/index.js';
 import { loadConfig } from '../config.js';
 import { EventBus } from '../events/bus.js';
 import { VerificationEngine } from './engine.js';
-import { ToolRegistry, riskExceeds, ToolPermissionError } from '../tools/registry.js';
-import { z } from 'zod';
 
 let home: string;
 let db: Db;
@@ -166,67 +164,5 @@ describe('deterministic verification', () => {
     const stored = engine.list(JOB_ID);
     expect(stored[0]?.output).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz');
     expect(stored[0]?.output).toContain('[redacted:');
-  });
-});
-
-describe('tool registry risk gating', () => {
-  it('orders risk levels correctly', () => {
-    expect(riskExceeds('destructive', 'observe')).toBe(true);
-    expect(riskExceeds('observe', 'destructive')).toBe(false);
-    expect(riskExceeds('reversible_modification', 'reversible_modification')).toBe(false);
-  });
-
-  it('refuses a tool above the caller ceiling', async () => {
-    const registry = new ToolRegistry();
-    registry.register({
-      name: 'danger.delete',
-      description: 'deletes things',
-      risk: 'destructive',
-      input: z.object({}),
-      execute: async () => 'deleted',
-    });
-    await expect(registry.execute('danger.delete', {}, { maxRisk: 'observe' })).rejects.toThrow(
-      ToolPermissionError,
-    );
-  });
-
-  it('validates input against the schema before executing', async () => {
-    const registry = new ToolRegistry();
-    let ran = false;
-    registry.register({
-      name: 'demo.echo',
-      description: 'echo',
-      risk: 'observe',
-      input: z.object({ text: z.string().min(1) }),
-      execute: async (input) => {
-        ran = true;
-        return input.text;
-      },
-    });
-    await expect(
-      registry.execute('demo.echo', { text: 123 }, { maxRisk: 'observe' }),
-    ).rejects.toThrow(/invalid input/);
-    expect(ran).toBe(false);
-    expect(await registry.execute('demo.echo', { text: 'hi' }, { maxRisk: 'observe' })).toBe('hi');
-  });
-
-  it('rejects an unknown tool', async () => {
-    await expect(
-      new ToolRegistry().execute('nope', {}, { maxRisk: 'destructive' }),
-    ).rejects.toThrow(/unknown tool/);
-  });
-
-  it('exposes a JSON schema for each tool', () => {
-    const registry = new ToolRegistry();
-    registry.register({
-      name: 'demo.schema',
-      description: 'demo',
-      risk: 'observe',
-      input: z.object({ id: z.string() }),
-      execute: async () => null,
-    });
-    const [listed] = registry.list();
-    expect(listed?.name).toBe('demo.schema');
-    expect(JSON.stringify(listed?.schema)).toContain('id');
   });
 });

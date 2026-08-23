@@ -273,6 +273,66 @@ export interface Health {
   context: { budgetTokens: number };
 }
 
+export type RiskLevel =
+  'observe' | 'safe_action' | 'reversible_modification' | 'sensitive' | 'destructive';
+
+export type ToolActor = 'user' | 'agent' | 'system';
+export type PolicyDecision = 'allow' | 'confirm' | 'deny';
+
+export interface ToolSummary {
+  name: string;
+  description: string;
+  risk: RiskLevel;
+  decision: PolicyDecision;
+  schema: unknown;
+}
+
+export type ToolExecutionStatus =
+  'pending_approval' | 'running' | 'succeeded' | 'failed' | 'denied' | 'expired' | 'interrupted';
+
+export interface ToolExecution {
+  id: string;
+  toolName: string;
+  risk: RiskLevel;
+  actor: ToolActor;
+  decision: PolicyDecision;
+  status: ToolExecutionStatus;
+  reason: string;
+  sessionId: string | null;
+  projectId: string | null;
+  jobId: string | null;
+  agentRunId: string | null;
+  input: unknown;
+  inputValidated: boolean;
+  result: unknown;
+  error: string | null;
+  grantId: string | null;
+  approvedBy: string | null;
+  requestedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  durationMs: number | null;
+  updatedAt: string;
+}
+
+export interface ToolGrant {
+  id: string;
+  toolName: string;
+  actor: ToolActor;
+  projectId: string | null;
+  sessionId: string | null;
+  note: string | null;
+  createdAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
+}
+
+export type ToolOutcome =
+  | { status: 'succeeded'; execution: ToolExecution; result: unknown }
+  | { status: 'failed'; execution: ToolExecution; error: string }
+  | { status: 'denied'; execution: ToolExecution; error: string }
+  | { status: 'pending_approval'; execution: ToolExecution };
+
 export interface Session {
   id: string;
   title: string | null;
@@ -400,7 +460,31 @@ export const api = {
       body: JSON.stringify({ baseUrl, routes, projectId }),
     }),
 
-  tools: () => request<Array<{ name: string; description: string; risk: string }>>('/api/tools'),
+  tools: () => request<ToolSummary[]>('/api/tools'),
+  runTool: (name: string, input: unknown, projectId: string | null) =>
+    request<ToolOutcome>(`/api/tools/${encodeURIComponent(name)}`, {
+      method: 'POST',
+      body: JSON.stringify({ input, projectId }),
+    }),
+  toolExecutions: (status?: string) =>
+    request<{ pending: ToolExecution[]; executions: ToolExecution[] }>(
+      `/api/tool-executions${status && status !== 'all' ? `?status=${status}` : ''}`,
+    ),
+  approveTool: (id: string, remember: boolean, projectId: string | null) =>
+    request<ToolOutcome>(`/api/tool-executions/${id}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({ remember, projectId }),
+    }),
+  denyTool: (id: string, reason?: string) =>
+    request<ToolExecution>(`/api/tool-executions/${id}/deny`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  retryTool: (id: string) =>
+    request<ToolOutcome>(`/api/tool-executions/${id}/retry`, { method: 'POST' }),
+  toolGrants: () => request<ToolGrant[]>('/api/tool-grants'),
+  revokeToolGrant: (id: string) =>
+    request<{ revoked: boolean }>(`/api/tool-grants/${id}`, { method: 'DELETE' }),
 };
 
 /** Screenshots are served from the artifacts root, addressed by relative path. */

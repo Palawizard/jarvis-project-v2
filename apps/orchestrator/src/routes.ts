@@ -6,6 +6,7 @@ import {
   detectExplicitCommand,
   candidateRejectionReason,
   GitWorkspace,
+  repoStatus,
   normaliseGoal,
   renderProjectSnapshot,
   PIPELINE_STAGES,
@@ -39,12 +40,30 @@ export function createRoutes(jarvis: Jarvis): Hono {
 
   const fail = (message: string, status = 400) => Response.json({ error: message }, { status });
 
+  const health = async () => {
+    let db: 'ok' | 'error' = 'ok';
+    try {
+      jarvis.db.prepare('SELECT 1').get();
+    } catch {
+      db = 'error';
+    }
+    const self = jarvis.projects.getSelf();
+    const commit = self ? (await repoStatus(self.rootPath)).head : null;
+    return {
+      status: db === 'ok' ? ('ok' as const) : ('error' as const),
+      version: '0.1.0',
+      commit: process.env.JARVIS_COMMIT ?? commit ?? 'unknown',
+      db,
+    };
+  };
+
   // ------------------------------------------------------------------ health --
+  app.get('/health', async (c) => c.json(await health()));
   app.get('/api/health', async (c) => {
     const capabilities = await jarvis.agents.capabilities();
     return c.json({
       ok: true,
-      version: '0.1.0',
+      ...(await health()),
       home: jarvis.config.home,
       artifactsDir: jarvis.config.artifactsDir,
       providers: capabilities,

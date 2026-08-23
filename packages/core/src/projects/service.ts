@@ -24,6 +24,30 @@ export interface ProjectStack {
   webRoutes?: string[];
 }
 
+export type VisualInteraction =
+  | { action: 'goto'; route: string }
+  | { action: 'click'; selector: string }
+  | { action: 'fill'; selector: string; value: string }
+  | { action: 'wait'; selector?: string; timeoutMs?: number }
+  | { action: 'screenshot'; name?: string };
+
+export interface CandidateRuntimeConfig {
+  /** Executable + argv are trusted project configuration; ports are supplied through env only. */
+  command: { executable: string; args: string[] };
+  portEnvironment: string;
+  apiPortEnvironment?: string;
+  healthPath?: string;
+}
+
+export interface ProjectConfig {
+  candidateRuntime?: CandidateRuntimeConfig;
+  visualQa?: {
+    required?: boolean;
+    routes?: string[];
+    interactions?: VisualInteraction[];
+  };
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -34,7 +58,7 @@ export interface Project {
   devUrl: string | null;
   summary: string | null;
   isSelf: boolean;
-  config: Record<string, unknown>;
+  config: ProjectConfig;
   createdAt: string;
   updatedAt: string;
 }
@@ -52,7 +76,7 @@ function rowToProject(row: Row): Project {
     devUrl: (row.dev_url as string) ?? null,
     summary: (row.summary as string) ?? null,
     isSelf: Number(row.is_self) === 1,
-    config: parseJson(row.config as string, {}),
+    config: parseJson(row.config as string, {} as ProjectConfig),
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
   };
@@ -150,6 +174,7 @@ export class ProjectService {
     devUrl?: string | null;
     commands?: ProjectCommands;
     summary?: string | null;
+    config?: ProjectConfig;
   }): Promise<Project> {
     const rootPath = path.resolve(input.rootPath);
     if (!fs.existsSync(rootPath)) throw new Error(`path does not exist: ${rootPath}`);
@@ -175,7 +200,7 @@ export class ProjectService {
       devUrl: input.devUrl ?? null,
       summary: input.summary ?? null,
       isSelf: input.isSelf ?? false,
-      config: {},
+      config: input.config ?? {},
       createdAt: now,
       updatedAt: now,
     };
@@ -230,7 +255,10 @@ export class ProjectService {
   update(
     id: string,
     patch: Partial<
-      Pick<Project, 'name' | 'summary' | 'devUrl' | 'commands' | 'defaultBranch' | 'stack'>
+      Pick<
+        Project,
+        'name' | 'summary' | 'devUrl' | 'commands' | 'defaultBranch' | 'stack' | 'config'
+      >
     >,
   ): Project | null {
     const current = this.get(id);
@@ -238,7 +266,7 @@ export class ProjectService {
     const next = { ...current, ...patch };
     this.db
       .prepare(
-        `UPDATE projects SET name=?, summary=?, dev_url=?, commands=?, default_branch=?, stack=?, updated_at=? WHERE id=?`,
+        `UPDATE projects SET name=?, summary=?, dev_url=?, commands=?, default_branch=?, stack=?, config=?, updated_at=? WHERE id=?`,
       )
       .run(
         next.name,
@@ -247,6 +275,7 @@ export class ProjectService {
         JSON.stringify(next.commands),
         next.defaultBranch,
         JSON.stringify(next.stack),
+        JSON.stringify(next.config),
         nowIso(),
         id,
       );

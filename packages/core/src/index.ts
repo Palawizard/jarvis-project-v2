@@ -35,6 +35,9 @@ export {
   type Project,
   type ProjectCommands,
   type ProjectStack,
+  type ProjectConfig,
+  type CandidateRuntimeConfig,
+  type VisualInteraction,
 } from './projects/service.js';
 export {
   SessionService,
@@ -82,6 +85,11 @@ export {
   type ReviewFinding,
 } from './review/engine.js';
 export { VisualQaEngine, startDevServer, type VisualQaShot } from './visualqa/engine.js';
+export {
+  startCandidateRuntime,
+  CandidateRuntimeUnsupportedError,
+  type CandidateRuntime,
+} from './runtime/candidate.js';
 
 export {
   ToolRegistry,

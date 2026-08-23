@@ -2,6 +2,34 @@ import type { MemoryInput, MemoryKind, MemoryScope } from '../memory/types.js';
 
 export type ProviderId = 'claude' | 'codex';
 
+export type ModelProfile = 'economy' | 'balanced' | 'quality';
+
+export interface TaskProfile {
+  modelProfile?: ModelProfile;
+  selfDevelopment?: boolean;
+  highRisk?: boolean;
+  mechanical?: boolean;
+}
+
+export interface RoutingDecision {
+  id: string;
+  jobId: string | null;
+  role: AgentRole;
+  provider: ProviderId | null;
+  model: string | null;
+  reason: string;
+  avoid: ProviderId | null;
+  explicitPreference: ProviderId | null;
+  availability: Array<{
+    provider: ProviderId;
+    available: boolean;
+    reason?: string;
+    cooldownUntil?: string;
+  }>;
+  taskProfile: TaskProfile;
+  createdAt: string;
+}
+
 export type AgentRole = 'implementer' | 'reviewer' | 'fixer' | 'visual_reviewer' | 'chat';
 
 export interface ProviderCapabilities {
@@ -16,6 +44,9 @@ export interface ProviderCapabilities {
   resumable: boolean;
   models: string[];
   structuredOutput: boolean;
+  cooldownUntil?: string;
+  lastFailureAt?: string;
+  lastSuccessAt?: string;
 }
 
 /** Normalized agent event. Provider-specific shapes never escape the adapter. */

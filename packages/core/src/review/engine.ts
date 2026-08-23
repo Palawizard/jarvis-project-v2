@@ -3,7 +3,7 @@ import { parseJson } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { AgentRegistry } from '../agents/registry.js';
-import type { AgentRunResult, ProviderId } from '../agents/types.js';
+import type { AgentRunResult, ProviderId, TaskProfile } from '../agents/types.js';
 import type { VerificationReport } from '../verification/engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 
@@ -59,6 +59,7 @@ export class ReviewEngine {
     contextPackId: string;
     implementerProvider: ProviderId;
     implementerSummary: string;
+    taskProfile?: TaskProfile;
     signal?: AbortSignal;
   }): Promise<Review> {
     this.bus?.emit({
@@ -70,6 +71,8 @@ export class ReviewEngine {
     const routed = await this.agents.route('reviewer', {
       avoid: opts.implementerProvider,
       prefer: this.config.agents.reviewerProvider,
+      jobId: opts.jobId,
+      taskProfile: opts.taskProfile,
     });
     if (!routed.provider) {
       const review = this.persist({
@@ -100,7 +103,7 @@ export class ReviewEngine {
         runId,
         opts.jobId,
         routed.provider.id,
-        null,
+        routed.decision.model,
         'reviewer',
         opts.cwd,
         'running',
@@ -115,6 +118,7 @@ export class ReviewEngine {
           cwd: opts.cwd,
           prompt,
           role: 'reviewer',
+          ...(routed.decision.model ? { model: routed.decision.model } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
         },
         (event) => {
@@ -136,6 +140,8 @@ export class ReviewEngine {
         memoryProposals: [],
       };
     }
+
+    this.agents.recordResult(routed.provider.id, result);
 
     this.db
       .prepare(

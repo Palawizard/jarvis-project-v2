@@ -53,7 +53,7 @@ export class Jarvis {
     this.projects = new ProjectService(this.db);
     this.sessions = new SessionService(this.db, this.bus);
     this.jobs = new JobService(this.db, this.bus);
-    this.agents = new AgentRegistry(config);
+    this.agents = new AgentRegistry(config, { db: this.db, bus: this.bus });
     this.verification = new VerificationEngine(this.db, config.artifactsDir, this.bus);
     this.review = new ReviewEngine(this.db, this.agents, this.bus, this.config);
     this.visualQa = new VisualQaEngine(this.db, config.artifactsDir, this.bus);
@@ -114,7 +114,19 @@ export class Jarvis {
     const repoRoot = findRepoRoot();
     if (!repoRoot) return null;
     const existing = this.projects.getSelf();
-    if (existing) return this.projects.refreshDetection(existing.id) ?? existing;
+    const config = {
+      candidateRuntime: {
+        command: { executable: 'pnpm', args: ['dev'] },
+        portEnvironment: 'JARVIS_WEB_PORT',
+        apiPortEnvironment: 'JARVIS_PORT',
+        healthPath: '/health',
+      },
+      visualQa: { required: true, routes: ['/'] },
+    };
+    if (existing) {
+      this.projects.update(existing.id, { config: { ...existing.config, ...config } });
+      return this.projects.refreshDetection(existing.id) ?? existing;
+    }
     return this.projects.register({
       name: 'jarvis',
       rootPath: repoRoot,
@@ -123,6 +135,7 @@ export class Jarvis {
       summary:
         'Jarvis itself: a local-first, memory-first AI assistant. TypeScript pnpm monorepo — ' +
         'apps/orchestrator (Hono API + SSE), apps/web (Vite React UI), packages/core (domain).',
+      config,
     });
   }
 

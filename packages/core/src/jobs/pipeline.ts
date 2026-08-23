@@ -139,6 +139,8 @@ export class JobPipeline {
     job = jobs.transition(jobId, 'implementing');
     const routed = await agents.route('implementer', {
       prefer: this.config.agents.implementerProvider,
+      jobId,
+      taskProfile: { selfDevelopment: project.isSelf },
     });
     if (!routed.provider) {
       jobs.transition(jobId, 'failed', { error: `No coding agent available: ${routed.reason}` });
@@ -152,6 +154,7 @@ export class JobPipeline {
       role: 'implementer',
       cwd: worktree.path,
       contextPackId: pack.id,
+      model: routed.decision.model ?? undefined,
       prompt: buildImplementerPrompt({ job, project, contextPack: pack.rendered }),
       signal,
     });
@@ -242,6 +245,7 @@ export class JobPipeline {
       contextPackId: reviewerPack.id,
       implementerProvider: providerId,
       implementerSummary: implResult.result,
+      taskProfile: { selfDevelopment: project.isSelf },
       signal,
     });
 
@@ -355,6 +359,7 @@ export class JobPipeline {
     cwd: string;
     prompt: string;
     contextPackId: string;
+    model?: string;
     signal: AbortSignal;
     resumeSessionId?: string | undefined;
   }): Promise<{
@@ -373,6 +378,7 @@ export class JobPipeline {
       role: opts.role,
       cwd: opts.cwd,
       contextPackId: opts.contextPackId,
+      model: opts.model ?? null,
     });
 
     const onEvent = (event: AgentEvent) => {
@@ -429,6 +435,7 @@ export class JobPipeline {
           cwd: opts.cwd,
           prompt: opts.prompt,
           role: opts.role,
+          ...(opts.model ? { model: opts.model } : {}),
           signal: opts.signal,
           ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
         },
@@ -442,6 +449,8 @@ export class JobPipeline {
         memoryProposals: [],
       };
     }
+
+    agents.recordResult(opts.provider, result);
 
     jobs.finishRun(run.id, {
       status: result.status === 'completed' ? 'completed' : result.status,

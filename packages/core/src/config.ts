@@ -25,6 +25,8 @@ export interface JarvisConfig {
     codexModel: string | undefined;
     /** Hard ceiling on a single agent run. */
     runTimeoutMs: number;
+    /** Temporary backoff after a provider reports a rate limit. */
+    cooldownMs: number;
   };
 
   memory: {
@@ -124,6 +126,7 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
         'acceptEdits',
       codexModel: process.env.JARVIS_CODEX_MODEL || undefined,
       runTimeoutMs: envInt('JARVIS_AGENT_TIMEOUT_MS', 30 * 60_000),
+      cooldownMs: envInt('JARVIS_PROVIDER_COOLDOWN_MS', 10 * 60_000),
     },
     memory: {
       minImportance: envFloat('JARVIS_MEMORY_MIN_IMPORTANCE', 0.35),

@@ -63,4 +63,8 @@ process.on('SIGTERM', () => shutdown(0));
 start('api', ['--filter', '@jarvis/orchestrator', 'dev'], '36');
 start('web', ['--filter', '@jarvis/web', 'dev'], '35');
 
-process.stdout.write('\n  Jarvis dev — UI http://localhost:5199   API http://127.0.0.1:4319\n\n');
+const webPort = process.env.JARVIS_WEB_PORT || '5199';
+const apiPort = process.env.JARVIS_PORT || '4319';
+process.stdout.write(
+  `\n  Jarvis dev — UI http://localhost:${webPort}   API http://127.0.0.1:${apiPort}\n\n`,
+);

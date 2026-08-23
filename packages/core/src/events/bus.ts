@@ -20,6 +20,8 @@ export type JarvisEventType =
   | 'agent.waiting'
   | 'agent.completed'
   | 'agent.failed'
+  | 'agent.routing.decided'
+  | 'agent.rate_limited'
   | 'verification.started'
   | 'verification.step'
   | 'verification.completed'

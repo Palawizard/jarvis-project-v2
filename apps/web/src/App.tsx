@@ -136,6 +136,7 @@ export function App() {
           onClick={() => setRoute({ name: 'tools' })}
           label="Tools"
           count={pendingTools.length || undefined}
+          testId="nav-tools"
         />
 
         <div className="sidebar-foot">
@@ -272,14 +273,16 @@ function NavItem({
   onClick,
   label,
   count,
+  testId,
 }: {
   active: boolean;
   onClick: () => void;
   label: string;
   count?: number;
+  testId?: string;
 }) {
   return (
-    <button className={`nav-item ${active ? 'active' : ''}`} onClick={onClick}>
+    <button className={`nav-item ${active ? 'active' : ''}`} onClick={onClick} data-testid={testId}>
       <span>{label}</span>
       {count !== undefined && count > 0 && <span className="nav-count">{count}</span>}
     </button>

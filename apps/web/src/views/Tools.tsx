@@ -115,7 +115,7 @@ export function ToolsView({
   );
 
   return (
-    <div className="page wide">
+    <div className="page wide" data-testid="tools-view">
       {loadErrors.length > 0 && (
         <div className="api-error" role="alert">
           {[...new Set(loadErrors)].join(' · ')}

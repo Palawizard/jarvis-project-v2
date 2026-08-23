@@ -65,7 +65,7 @@ test('command, projects, jobs and controllable memory work in the real UI', asyn
   await page.getByRole('button', { name: 'Close' }).last().click();
 
   // The permission layer must be inspectable from the UI, not just from the API.
-  await page.getByRole('button', { name: 'Tools' }).click();
+  await page.getByTestId('nav-tools').click();
   await expect(page.getByText('Waiting for you (0)')).toBeVisible();
   await expect(page.getByText('memory.purge')).toBeVisible();
   await expect(
@@ -86,19 +86,105 @@ test('command, projects, jobs and controllable memory work in the real UI', asyn
   await page.getByRole('button', { name: 'Refuse' }).click();
   await expect(page.getByText('Waiting for you (0)')).toBeVisible();
 
+  await expect(page.getByTestId('tools-view')).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('desktop-tools.png'), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
-  // The mobile sidebar scrolls on purpose; what must not regress is reaching
-  // the Tools view from it at phone width.
+
+  // The mobile nav is a horizontal scroller by design, so its content may be
+  // wider than the bar. What must hold is that the bar is sized by its own
+  // content: when it is left to absorb the grid row's spare height, the pills
+  // stretch to fill it, and the active one grows until its rounded top edge is
+  // flush against the viewport.
+  const measureNav = () =>
+    page.locator('.sidebar .nav-item.active').evaluate((node) => {
+      const bar = node.closest('.sidebar') as HTMLElement;
+      const item = node.getBoundingClientRect();
+      const rail = bar.getBoundingClientRect();
+      return {
+        label: node.textContent ?? '',
+        itemHeight: item.height,
+        top: item.top,
+        bottom: item.bottom,
+        railTop: rail.top,
+        railHeight: rail.height,
+        radius: parseFloat(getComputedStyle(node).borderTopLeftRadius),
+        viewport: window.innerHeight,
+      };
+    });
+
+  // Reload rather than navigate: on a fresh load the header carries only the
+  // title, the project selector and the theme toggle, which is the state the
+  // responsive layout has to read well in.
+  await page.reload();
+  await expect(page.getByLabel('Command input')).toBeVisible();
+  const shortPage = await measureNav();
+  expect(shortPage.label).toContain('Command');
+  expect(shortPage.radius).toBeGreaterThan(0);
+  // Fully inside the viewport, and strictly inset from the bar's top edge so
+  // the corner curve has room to render.
+  expect(shortPage.top).toBeGreaterThan(shortPage.railTop);
+  expect(shortPage.top).toBeGreaterThanOrEqual(0);
+  expect(shortPage.bottom).toBeLessThanOrEqual(shortPage.viewport);
+
+  // The header is a deliberate two-row layout at phone width: the title owns
+  // the first row, and the project selector and theme toggle share the second.
+  // An orphaned toggle on a row of its own is the regression this catches.
+  const header = await page.locator('.topbar').evaluate((bar) => {
+    // Spread the rect: a DOMRect's properties live on its prototype and would
+    // cross the page boundary as an empty object.
+    const box = (selector: string) => {
+      const { top, bottom, left, right } = (
+        bar.querySelector(selector) as HTMLElement
+      ).getBoundingClientRect();
+      return { top, bottom, left, right };
+    };
+    return {
+      title: box('h1'),
+      project: box('.topbar-project'),
+      toggle: box('.theme-toggle'),
+      viewport: window.innerWidth,
+    };
+  });
+  expect(header.title.bottom).toBeLessThanOrEqual(header.project.top);
+  // Same row: their vertical spans overlap rather than stacking.
+  expect(header.toggle.top).toBeLessThan(header.project.bottom);
+  expect(header.toggle.bottom).toBeGreaterThan(header.project.top);
+  expect(header.toggle.left).toBeGreaterThan(header.project.right);
+  expect(header.toggle.right).toBeLessThanOrEqual(header.viewport);
+
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
+    .toBe(true);
+
+  // Reaching Tools must not depend on the whole nav fitting at once.
   await page.getByRole('button', { name: 'Memory' }).click();
-  const mobileTools = page.getByRole('button', { name: 'Tools' });
+  const mobileTools = page.getByTestId('nav-tools');
   await mobileTools.scrollIntoViewIfNeeded();
   await mobileTools.click();
+  await expect(page.getByTestId('tools-view')).toBeVisible();
   await expect(page.getByText('Waiting for you (0)')).toBeVisible();
   await expect(page.getByRole('row', { name: /memory\.purge/ }).first()).toBeVisible();
+
+  // Tools is a long page and Command is a short one. If the nav bar is content
+  // sized, both look identical; if it absorbs the leftover height it balloons
+  // on whichever page is shorter.
+  const longPage = await measureNav();
+  expect(longPage.railHeight).toBeCloseTo(shortPage.railHeight, 0);
+  expect(longPage.itemHeight).toBeCloseTo(shortPage.itemHeight, 0);
+
+  // Wide tables scroll inside their own box; the page itself does not.
   await expect
     .poll(() => page.locator('main').evaluate((node) => node.scrollWidth <= node.clientWidth))
     .toBe(true);
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
+    .toBe(true);
+  const localScroll = await page
+    .locator('.table-scroll')
+    .first()
+    .evaluate((node) => node.scrollWidth > node.clientWidth);
+  expect(localScroll).toBe(true);
+
   await page.screenshot({ path: testInfo.outputPath('mobile-tools.png'), fullPage: true });
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.getByRole('button', { name: 'Memory' }).click();

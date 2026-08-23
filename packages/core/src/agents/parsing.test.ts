@@ -1,10 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { extractMemoryProposals } from './proposals.js';
 import { proposalToInput } from './types.js';
-import { buildClaudeArgs, handleClaudeEvent } from './claude.js';
+import { buildClaudeArgs, buildClaudePrompt, handleClaudeEvent } from './claude.js';
 import { buildCodexArgs } from './codex.js';
-import { jsonlProtocolError, killTree, runJsonlProcess } from './spawn.js';
+import { jsonlProtocolError, killTree, runJsonlProcess, subscriptionProviderEnv } from './spawn.js';
 import { parseReviewOutput } from '../review/engine.js';
 import { classifyExplicitMemory, detectExplicitCommand, scoreCandidate } from '../memory/policy.js';
 import type { AgentEvent } from './types.js';
@@ -48,6 +51,94 @@ describe('provider process protocol', () => {
     );
     expect(reviewer[reviewer.indexOf('--permission-mode') + 1]).toBe('plan');
     expect(implementer[implementer.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+  });
+
+  it('passes isolated image and structured-output options to both CLIs', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-provider-args-'));
+    const schema = path.join(dir, 'schema.json');
+    const image = path.join(dir, 'shot.png');
+    fs.writeFileSync(schema, '{"type":"object"}');
+    fs.writeFileSync(image, 'not decoded by this argument test');
+    try {
+      const options = {
+        cwd: dir,
+        prompt: 'inspect',
+        role: 'visual_reviewer' as const,
+        imagePaths: [image],
+        outputSchemaPath: schema,
+        safeMode: true,
+        ephemeral: true,
+      };
+      const claude = buildClaudeArgs(options, 'sonnet', 'acceptEdits');
+      expect(claude).toContain('--safe-mode');
+      expect(claude).toContain('--no-session-persistence');
+      expect(claude.slice(claude.indexOf('--tools'), claude.indexOf('--tools') + 2)).toEqual([
+        '--tools',
+        'Read',
+      ]);
+      expect(claude[claude.indexOf('--json-schema') + 1]).toBe('{"type":"object"}');
+      expect(buildClaudePrompt(options)).toContain(image);
+
+      const codex = buildCodexArgs(options, 'gpt-test');
+      expect(codex).toEqual(
+        expect.arrayContaining([
+          '--ignore-user-config',
+          '--ignore-rules',
+          '--ephemeral',
+          '--image',
+          image,
+          '--output-schema',
+          schema,
+        ]),
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('removes API billing keys only from provider child environments', () => {
+    const source = {
+      PATH: 'kept',
+      ANTHROPIC_API_KEY: 'secret',
+      OPENAI_API_KEY: 'secret',
+      CODEX_API_KEY: 'secret',
+    };
+    expect(subscriptionProviderEnv(source)).toMatchObject({ PATH: 'kept', NO_COLOR: '1' });
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(source).toHaveProperty('ANTHROPIC_API_KEY', 'secret');
+  });
+
+  it('does not expose API billing keys to a spawned provider process', async () => {
+    const names = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY'] as const;
+    const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    for (const name of names) process.env[name] = 'must-not-leak';
+    let leaked = true;
+    try {
+      await runJsonlProcess({
+        cli: {
+          command: process.execPath,
+          prefixArgs: [
+            '-e',
+            `console.log(JSON.stringify({type:'result', leaked:${JSON.stringify(names)}.some(k => process.env[k])}))`,
+          ],
+          source: 'test',
+        },
+        args: [],
+        cwd: process.cwd(),
+        stdin: '',
+        timeoutMs: 5_000,
+        scope: 'env-test',
+        onLine: (event) => {
+          leaked = event.leaked === true;
+        },
+      });
+      expect(leaked).toBe(false);
+    } finally {
+      for (const name of names) {
+        if (original[name] === undefined) delete process.env[name];
+        else process.env[name] = original[name];
+      }
+    }
   });
 
   it('records malformed JSONL and rejects a stream with no terminal event', async () => {
@@ -179,7 +270,12 @@ describe('proposal validation before persistence', () => {
 describe('claude stream-json translation', () => {
   const collect = (events: Record<string, unknown>[]) => {
     const out: AgentEvent[] = [];
-    const state = { result: '', usage: {} as Record<string, unknown>, failure: '' };
+    const state = {
+      result: '',
+      usage: {} as Record<string, unknown>,
+      failure: '',
+      structuredOutput: undefined as unknown,
+    };
     const text: string[] = [];
     for (const event of events) {
       handleClaudeEvent(event, {
@@ -187,6 +283,7 @@ describe('claude stream-json translation', () => {
         pushText: (t) => text.push(t),
         setResult: (r) => (state.result = r),
         setUsage: (u) => (state.usage = u),
+        setStructuredOutput: (value) => (state.structuredOutput = value),
         setFailure: (f) => (state.failure = f),
         model: 'sonnet',
       });
@@ -244,6 +341,19 @@ describe('claude stream-json translation', () => {
       { type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } },
     ]);
     expect(out[0]).toMatchObject({ kind: 'waiting' });
+  });
+
+  it('uses Claude validated structured output as the final result', () => {
+    const { state } = collect([
+      {
+        type: 'result',
+        subtype: 'success',
+        result: '',
+        structured_output: { verdict: 'pass', findings: [] },
+      },
+    ]);
+    expect(state.structuredOutput).toEqual({ verdict: 'pass', findings: [] });
+    expect(state.result).toBe('{"verdict":"pass","findings":[]}');
   });
 
   it('tolerates unknown event types', () => {

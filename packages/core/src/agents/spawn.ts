@@ -5,6 +5,17 @@ import type { ResolvedCli } from './resolve.js';
 
 const log = createLogger('agent-spawn');
 
+const API_KEY_ENV = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY'] as const;
+
+/** Provider runs must use the CLIs' subscription login, never inherited API billing. */
+export function subscriptionProviderEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...source, FORCE_COLOR: '0', NO_COLOR: '1' };
+  for (const key of API_KEY_ENV) delete env[key];
+  return env;
+}
+
 export interface JsonlRunSpec {
   cli: ResolvedCli;
   args: string[];
@@ -98,7 +109,7 @@ export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
     const child = spawn(spec.cli.command, [...spec.cli.prefixArgs, ...spec.args], {
       cwd: spec.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+      env: subscriptionProviderEnv(),
       shell: false,
       windowsHide: true,
       detached: process.platform !== 'win32',

@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
@@ -111,11 +113,19 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     const model = options.model ?? this.config.agents.claudeModel;
-    const args = buildClaudeArgs(options, model, this.config.agents.claudePermissionMode);
+    let args: string[];
+    try {
+      args = buildClaudeArgs(options, model, this.config.agents.claudePermissionMode);
+    } catch (error) {
+      const message = `invalid Claude input: ${error instanceof Error ? error.message : String(error)}`;
+      onEvent({ kind: 'failed', error: message });
+      return { status: 'failed', result: '', error: message, memoryProposals: [] };
+    }
 
     let sessionId: string | undefined;
     let finalResult = '';
     let usage: Record<string, unknown> | undefined;
+    let structuredOutput: unknown;
     let reportedError: string | undefined;
     let sawTerminalResult = false;
     const textChunks: string[] = [];
@@ -124,7 +134,7 @@ export class ClaudeProvider implements AgentProvider {
       cli,
       args,
       cwd: options.cwd,
-      stdin: options.prompt,
+      stdin: buildClaudePrompt(options),
       timeoutMs: options.timeoutMs ?? this.config.agents.runTimeoutMs,
       ...(options.signal ? { signal: options.signal } : {}),
       scope: 'claude',
@@ -140,6 +150,9 @@ export class ClaudeProvider implements AgentProvider {
           },
           setUsage: (u) => {
             usage = u;
+          },
+          setStructuredOutput: (value) => {
+            structuredOutput = value;
           },
           setFailure: (f) => {
             reportedError = f;
@@ -215,8 +228,14 @@ export class ClaudeProvider implements AgentProvider {
       memoryProposals: proposals,
       ...(sessionId ? { sessionId } : {}),
       ...(usage ? { usage } : {}),
+      ...(structuredOutput !== undefined ? { structuredOutput } : {}),
     };
   }
+}
+
+export function buildClaudePrompt(options: AgentStartOptions): string {
+  if (!options.imagePaths?.length) return options.prompt;
+  return `${options.prompt}\n\nInspect these local image files as image evidence:\n${options.imagePaths.map((file) => `- ${path.resolve(options.cwd, file)}`).join('\n')}`;
 }
 
 export function buildClaudeArgs(
@@ -237,6 +256,20 @@ export function buildClaudeArgs(
     readOnly ? 'plan' : configuredPermissionMode,
     '--no-chrome',
   ];
+  if (options.safeMode) args.push('--safe-mode');
+  if (options.ephemeral) args.push('--no-session-persistence');
+  if (options.role === 'visual_reviewer') args.push('--tools', 'Read');
+  for (const dir of new Set(
+    options.imagePaths?.map((file) => path.dirname(path.resolve(options.cwd, file))) ?? [],
+  )) {
+    args.push('--add-dir', dir);
+  }
+  if (options.outputSchemaPath) {
+    args.push(
+      '--json-schema',
+      fs.readFileSync(path.resolve(options.cwd, options.outputSchemaPath), 'utf8'),
+    );
+  }
   if (options.resumeSessionId) args.push('--resume', options.resumeSessionId);
   if (options.appendSystemPrompt) args.push('--append-system-prompt', options.appendSystemPrompt);
   return args;
@@ -247,6 +280,7 @@ interface Handlers {
   pushText: (text: string) => void;
   setResult: (result: string) => void;
   setUsage: (usage: Record<string, unknown>) => void;
+  setStructuredOutput: (value: unknown) => void;
   setFailure: (error: string) => void;
   model: string;
 }
@@ -304,6 +338,10 @@ export function handleClaudeEvent(event: Record<string, unknown>, h: Handlers): 
     }
     case 'result': {
       if (typeof event.result === 'string') h.setResult(event.result);
+      if (event.structured_output !== undefined) {
+        h.setStructuredOutput(event.structured_output);
+        h.setResult(JSON.stringify(event.structured_output));
+      }
       if (event.usage) h.setUsage(event.usage as Record<string, unknown>);
       if (event.is_error === true) {
         h.setFailure(

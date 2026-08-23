@@ -71,6 +71,14 @@ export interface AgentStartOptions {
   resumeSessionId?: string;
   /** Extra system instruction appended to the provider default. */
   appendSystemPrompt?: string;
+  /** Local images attached to the initial request. Paths must be absolute. */
+  imagePaths?: string[];
+  /** JSON Schema file constraining the provider's final response. */
+  outputSchemaPath?: string;
+  /** Disable project/user customizations while preserving subscription authentication. */
+  safeMode?: boolean;
+  /** Do not persist the external provider session. */
+  ephemeral?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -82,6 +90,7 @@ export interface AgentRunResult {
   sessionId?: string;
   error?: string;
   usage?: Record<string, unknown>;
+  structuredOutput?: unknown;
   memoryProposals: MemoryProposal[];
 }
 

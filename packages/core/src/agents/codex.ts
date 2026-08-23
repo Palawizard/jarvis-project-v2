@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
@@ -116,6 +117,7 @@ export class CodexProvider implements AgentProvider {
     let threadId: string | undefined;
     let lastMessage = '';
     let usage: Record<string, unknown> | undefined;
+    let structuredOutput: unknown;
     let reportedError: string | undefined;
     let sawTerminalTurn = false;
 
@@ -192,6 +194,14 @@ export class CodexProvider implements AgentProvider {
 
     const { proposals, cleanedText } = extractMemoryProposals(lastMessage);
 
+    if (options.outputSchemaPath && lastMessage) {
+      try {
+        structuredOutput = JSON.parse(lastMessage);
+      } catch {
+        reportedError = 'Codex returned non-JSON output for a schema-constrained request';
+      }
+    }
+
     if (outcome.cancelled) {
       return {
         status: 'cancelled',
@@ -258,6 +268,7 @@ export class CodexProvider implements AgentProvider {
       memoryProposals: proposals,
       ...(threadId ? { sessionId: threadId } : {}),
       ...(usage ? { usage } : {}),
+      ...(structuredOutput !== undefined ? { structuredOutput } : {}),
     };
   }
 }
@@ -276,6 +287,14 @@ export function buildCodexArgs(options: AgentStartOptions, model?: string): stri
     options.cwd,
   ];
   if (model) args.push('--model', model);
+  if (options.safeMode) args.push('--ignore-user-config', '--ignore-rules');
+  if (options.ephemeral) args.push('--ephemeral');
+  for (const imagePath of options.imagePaths ?? []) {
+    args.push('--image', path.resolve(options.cwd, imagePath));
+  }
+  if (options.outputSchemaPath) {
+    args.push('--output-schema', path.resolve(options.cwd, options.outputSchemaPath));
+  }
   if (options.resumeSessionId) args.push('resume', options.resumeSessionId);
   // '-' makes Codex read the prompt from stdin instead of argv.
   args.push('-');

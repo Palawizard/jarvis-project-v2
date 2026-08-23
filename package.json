@@ -19,6 +19,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run --project unit",
     "test:integration": "vitest run --project integration",
+    "test:live-agents": "vitest run --config vitest.live.config.ts",
     "test:all": "vitest run",
     "test:e2e": "playwright test",
     "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:all && pnpm build"

@@ -29,6 +29,7 @@ const STATUS_TONE: Record<ToolExecutionStatus, 'ok' | 'warn' | 'err' | 'run' | u
   denied: 'err',
   expired: undefined,
   interrupted: 'warn',
+  timed_out: 'warn',
 };
 
 const DECISION_LABEL: Record<PolicyDecision, string> = {
@@ -288,13 +289,19 @@ export function ToolsView({
                   </td>
                   <td>
                     {(execution.status === 'interrupted' ||
+                      execution.status === 'timed_out' ||
                       execution.status === 'expired' ||
                       execution.status === 'failed') &&
                       execution.inputValidated && (
                         <button
                           className="btn sm"
                           disabled={busy === execution.id}
-                          title="Re-issue this action. It goes through the policy again."
+                          title={
+                            execution.effectUnknown
+                              ? 'Jarvis cannot tell whether this action already took effect. ' +
+                                'Re-issuing it may do it twice.'
+                              : 'Re-issue this action. It goes through the policy again.'
+                          }
                           onClick={() =>
                             void act(
                               execution.id,
@@ -303,7 +310,7 @@ export function ToolsView({
                             )
                           }
                         >
-                          Re-issue
+                          {execution.effectUnknown ? 'Re-issue anyway' : 'Re-issue'}
                         </button>
                       )}
                   </td>

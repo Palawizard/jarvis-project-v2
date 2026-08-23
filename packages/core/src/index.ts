@@ -109,6 +109,7 @@ export {
 export {
   ToolRegistry,
   ToolPermissionError,
+  EFFECT_UNKNOWN_STATUSES,
   type ToolDefinition,
   type ToolContext,
   type ToolCallContext,
@@ -123,6 +124,7 @@ export {
   decide as decideToolPolicy,
   previewDecision,
   riskExceeds,
+  isGrantableActor,
   RISK_LEVELS,
   MAX_GRANTABLE_RISK,
   type RiskLevel,

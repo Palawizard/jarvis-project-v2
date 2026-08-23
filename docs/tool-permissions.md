@@ -59,8 +59,15 @@ invalidates every existing grant for it without any migration.
 Revocation keeps the row, so a past execution can still point at the permission
 that authorised it.
 
-Jarvis only grants permissions to the user's own actions. Delegating a standing
-permission to an agent is deliberately not offered.
+Standing permissions are only ever granted to the user's own actions.
+`ToolRegistry.grant()` rejects any other actor, so this holds for every caller,
+not just the HTTP route — and `#matchingGrant` additionally refuses to match a
+grant row belonging to a non-user actor, so a row written directly into the
+database (or left by an older build) authorises nothing.
+
+Approving a single agent invocation stays possible; remembering it does not.
+Delegated autonomy for agents is gated behind the OS-isolation milestone in
+`docs/roadmap.md`.
 
 ## Audit
 
@@ -85,9 +92,18 @@ so redaction there is lossless.
 ## Long actions and recovery
 
 - Every invocation has a timeout (`JARVIS_TOOL_TIMEOUT_MS`, default 60s, or the
-  tool's own `timeoutMs`). A timeout is recorded as a failure. It does not
-  cancel the underlying work — Node has no generic cancellation — so a tool that
-  owns a child process or socket should honour its own abort.
+  tool's own `timeoutMs`). When it fires, Jarvis aborts `ctx.signal` and stops
+  waiting.
+
+  Aborting a signal does not stop arbitrary code. A tool that watches the signal
+  can cancel its own work; a tool that ignores it keeps running and may still
+  produce its side effect long after Jarvis gave up. So a timeout is recorded as
+  `timed_out`, distinct from an ordinary `failed`, and carries
+  `effectUnknown: true` — the same marker `interrupted` gets. Both mean "Jarvis
+  cannot say whether this happened", and the UI offers them as *Re-issue anyway*
+  rather than *Re-issue*, because a re-issue may duplicate a real-world action.
+- A deterministic rejection is `failed` with `effectUnknown: false`: the tool
+  reported that nothing happened.
 - On boot, `recoverInterrupted()` marks every `running` row `interrupted`. Its
   effect on the outside world is unknown, so it is surfaced and **never**
   replayed automatically. Re-issuing is an explicit user action that goes back
@@ -128,7 +144,10 @@ so redaction there is lossless.
 
 **Any local process running as this user can act as the user.** The orchestrator
 binds to `127.0.0.1` with no authentication, which is the pre-existing trust
-model for the whole API. An agent child process launched by Jarvis inherits the
+model for the whole API. Stripping `JARVIS_PORT` from agent child environments
+raises the cost of finding it and does not close this — the default port is
+guessable. Closing it is a blocking milestone in `docs/roadmap.md`, required
+before any `sensitive` tool is enabled for the agent actor. An agent child process launched by Jarvis inherits the
 environment and could, in principle, reach the loopback port and approve its own
 request. No token scheme fixes this: a token readable by the UI is readable by
 any process with the same uid.
@@ -148,8 +167,10 @@ Two smaller residual notes:
 
 - Secret detection is pattern-based (`memory/secrets.ts`). It is deliberately
   conservative, but it is not a proof.
-- A timeout records a failure without stopping the work, so a hung tool can
-  still complete its side effect after Jarvis has given up on it.
+- `ctx.signal` is cooperative. Generic code cannot be forcibly cancelled, so a
+  tool that ignores the signal can still complete its side effect after Jarvis
+  has given up. This is recorded (`timed_out`, `effectUnknown`) rather than
+  papered over, and it is a reason to prefer tools that honour the signal.
 
 ## Adding a tool
 

@@ -215,7 +215,7 @@ describe('tool execution and gating', () => {
     expect(reg.getExecution(outcome.execution.id)?.status).toBe('failed');
   });
 
-  it('gives up on a tool that never settles', async () => {
+  it('gives up on a tool that never settles, and says the effect is unknown', async () => {
     const reg = new ToolRegistry({ db, bus, defaultTimeoutMs: 20 });
     reg.register({
       name: 'demo.hangs',
@@ -228,6 +228,91 @@ describe('tool execution and gating', () => {
     expect(outcome.status).toBe('failed');
     if (outcome.status !== 'failed') return;
     expect(outcome.error).toMatch(/timed out after 20ms/);
+
+    // A timeout is not an ordinary failure: the work may still be in flight.
+    const stored = reg.getExecution(outcome.execution.id);
+    expect(stored?.status).toBe('timed_out');
+    expect(stored?.effectUnknown).toBe(true);
+    expect(stored?.error).toMatch(/effect on the outside world is unknown/);
+  });
+
+  it('aborts the signal on timeout so a cooperative tool can stop', async () => {
+    const reg = new ToolRegistry({ db, bus, defaultTimeoutMs: 20 });
+    let sawAbort = false;
+    reg.register({
+      name: 'demo.cooperative',
+      description: 'watches its signal',
+      risk: 'observe',
+      input: z.object({}),
+      execute: (_input, ctx) =>
+        new Promise((_resolve, reject) => {
+          expect(ctx.signal.aborted).toBe(false);
+          ctx.signal.addEventListener('abort', () => {
+            sawAbort = true;
+            reject(new Error('aborted by the caller'));
+          });
+        }),
+    });
+
+    const outcome = await reg.execute('demo.cooperative', {}, { actor: 'user' });
+    expect(sawAbort).toBe(true);
+    // Cancelling because of the deadline is still the deadline's outcome.
+    expect(reg.getExecution(outcome.execution.id)?.status).toBe('timed_out');
+  });
+
+  it('separates a deterministic failure from a timeout', async () => {
+    const reg = new ToolRegistry({ db, bus, defaultTimeoutMs: 5000 });
+    reg.register({
+      name: 'demo.deterministic',
+      description: 'fails fast',
+      risk: 'observe',
+      input: z.object({}),
+      execute: async () => {
+        throw new Error('nothing happened at all');
+      },
+    });
+    const outcome = await reg.execute('demo.deterministic', {}, { actor: 'user' });
+    const stored = reg.getExecution(outcome.execution.id);
+    expect(stored?.status).toBe('failed');
+    expect(stored?.effectUnknown).toBe(false);
+    expect(stored?.error).toBe('nothing happened at all');
+  });
+
+  it('does not blow up when a timed-out tool rejects afterwards', async () => {
+    const reg = new ToolRegistry({ db, bus, defaultTimeoutMs: 20 });
+    reg.register({
+      name: 'demo.lateReject',
+      description: 'rejects long after the deadline',
+      risk: 'observe',
+      input: z.object({}),
+      execute: () =>
+        new Promise((_resolve, reject) => setTimeout(() => reject(new Error('too late')), 80)),
+    });
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on('unhandledRejection', onRejection);
+    try {
+      const outcome = await reg.execute('demo.lateReject', {}, { actor: 'user' });
+      expect(reg.getExecution(outcome.execution.id)?.status).toBe('timed_out');
+      // Give the losing branch time to reject on its own.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+
+  it('clamps an audit limit instead of letting SQLite treat it as unbounded', async () => {
+    const reg = registry();
+    const { tool } = counter('demo.limit');
+    reg.register(tool);
+    for (const text of ['a', 'b', 'c']) {
+      await reg.execute('demo.limit', { text }, { actor: 'user' });
+    }
+    // A negative LIMIT means "no limit" in SQLite; NaN is a runtime error.
+    expect(reg.executions({ limit: -1 })).toHaveLength(1);
+    expect(reg.executions({ limit: Number.NaN })).toHaveLength(3);
+    expect(reg.executions({ limit: 10000 }).length).toBeLessThanOrEqual(500);
   });
 });
 
@@ -299,6 +384,47 @@ describe('confirmation and approval', () => {
     expect(calls).toEqual([]);
   });
 
+  it('refuses to approve a request that outlived its TTL, without a restart', async () => {
+    const reg = registry({ approvalTtlMs: 30 });
+    const { tool, calls } = counter('mail.slowUser', 'sensitive');
+    reg.register(tool);
+    const requested = await reg.execute('mail.slowUser', { text: 'a' }, { actor: 'user' });
+    if (requested.status !== 'pending_approval') throw new Error('expected a pending request');
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await expect(reg.approve(requested.execution.id)).rejects.toThrow(/expired/);
+    expect(calls).toEqual([]);
+    expect(reg.getExecution(requested.execution.id)?.status).toBe('expired');
+  });
+
+  it('hides an aged-out request from the pending list on a running instance', async () => {
+    const reg = registry({ approvalTtlMs: 30 });
+    const { tool } = counter('mail.sweep', 'sensitive');
+    reg.register(tool);
+    await reg.execute('mail.sweep', { text: 'a' }, { actor: 'user' });
+    expect(reg.pending()).toHaveLength(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(reg.pending()).toEqual([]);
+    expect(reg.executions({ status: 'expired' })).toHaveLength(1);
+  });
+
+  it('lets exactly one of two concurrent approvals run the tool', async () => {
+    const reg = registry();
+    const { tool, calls } = counter('mail.race', 'sensitive');
+    reg.register(tool);
+    const requested = await reg.execute('mail.race', { text: 'once' }, { actor: 'user' });
+    if (requested.status !== 'pending_approval') throw new Error('expected a pending request');
+
+    const results = await Promise.allSettled([
+      reg.approve(requested.execution.id),
+      reg.approve(requested.execution.id),
+    ]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+  });
+
   it('refuses to approve a request whose stored arguments no longer validate', async () => {
     const reg = registry();
     const { tool, calls } = counter('mail.tampered', 'sensitive');
@@ -346,7 +472,17 @@ describe('standing permissions', () => {
     const reg = registry();
     const { tool, calls } = counter('calendar.agent', 'sensitive');
     reg.register(tool);
-    reg.grant({ toolName: 'calendar.agent', actor: 'agent' });
+    // grant() refuses this outright, so the row is forced in to prove the
+    // policy denies even when such a permission somehow exists.
+    expect(() => reg.grant({ toolName: 'calendar.agent', actor: 'agent' })).toThrow(
+      /only for the user's own actions/,
+    );
+    db.prepare('INSERT INTO tool_grants (id, tool_name, actor, created_at) VALUES (?,?,?,?)').run(
+      'grn_forced',
+      'calendar.agent',
+      'agent',
+      new Date().toISOString(),
+    );
 
     const outcome = await reg.execute('calendar.agent', { text: 'a' }, { actor: 'agent' });
     expect(outcome.status).toBe('denied');
@@ -404,14 +540,109 @@ describe('standing permissions', () => {
     );
     expect(reg.grants()).toEqual([]);
 
-    reg.grant({
-      toolName: 'calendar.revoke',
-      actor: 'user',
-      expiresAt: new Date(Date.now() - 1000).toISOString(),
-    });
+    // A grant that has since aged out. It cannot be created through grant()
+    // any more, so the row is written directly the way time would leave it.
+    db.prepare(
+      `INSERT INTO tool_grants (id, tool_name, actor, created_at, expires_at)
+       VALUES (?,?,?,?,?)`,
+    ).run(
+      'grn_stale',
+      'calendar.revoke',
+      'user',
+      new Date(Date.now() - 10_000).toISOString(),
+      new Date(Date.now() - 1000).toISOString(),
+    );
     expect((await reg.execute('calendar.revoke', { text: 'c' }, { actor: 'user' })).status).toBe(
       'pending_approval',
     );
+  });
+
+  it('refuses a standing permission for anyone but the user', async () => {
+    const reg = registry();
+    const { tool, calls } = counter('agent.repeatable', 'reversible_modification');
+    reg.register(tool);
+
+    for (const actor of ['agent', 'system'] as const) {
+      expect(() => reg.grant({ toolName: 'agent.repeatable', actor })).toThrow(
+        /only for the user's own actions/,
+      );
+    }
+    expect(reg.grants()).toEqual([]);
+
+    // An agent's reversible action still needs confirming every single time.
+    const first = await reg.execute('agent.repeatable', { text: 'a' }, { actor: 'agent' });
+    expect(first.status).toBe('pending_approval');
+    if (first.status !== 'pending_approval') return;
+    expect(calls).toEqual([]);
+  });
+
+  it('lets an agent invocation be approved once, but never remembered', async () => {
+    const reg = registry();
+    const { tool, calls } = counter('agent.once', 'reversible_modification');
+    reg.register(tool);
+    const requested = await reg.execute('agent.once', { text: 'a' }, { actor: 'agent' });
+    if (requested.status !== 'pending_approval') throw new Error('expected a pending request');
+
+    await expect(reg.approve(requested.execution.id, { remember: {} })).rejects.toThrow(
+      /only for the user's own actions/,
+    );
+    // The refused "remember" must not have stranded the request: it is still
+    // answerable, and nothing ran.
+    expect(reg.getExecution(requested.execution.id)?.status).toBe('pending_approval');
+    expect(calls).toEqual([]);
+
+    const approved = await reg.approve(requested.execution.id);
+    expect(approved.status).toBe('succeeded');
+    expect(calls).toEqual([{ text: 'a' }]);
+    expect(reg.grants()).toEqual([]);
+
+    // ...and the next one asks again, because nothing was remembered.
+    const second = await reg.execute('agent.once', { text: 'b' }, { actor: 'agent' });
+    expect(second.status).toBe('pending_approval');
+  });
+
+  it('ignores a grant row that was written for a non-user actor', async () => {
+    const reg = registry();
+    const { tool, calls } = counter('agent.legacy', 'reversible_modification');
+    reg.register(tool);
+    // Straight into the database, as a build predating the rule would have left it.
+    db.prepare('INSERT INTO tool_grants (id, tool_name, actor, created_at) VALUES (?,?,?,?)').run(
+      'grn_legacy',
+      'agent.legacy',
+      'agent',
+      new Date().toISOString(),
+    );
+
+    const outcome = await reg.execute('agent.legacy', { text: 'a' }, { actor: 'agent' });
+    expect(outcome.status).toBe('pending_approval');
+    expect(calls).toEqual([]);
+  });
+
+  it('rejects a malformed or already-past expiry instead of storing it', () => {
+    const reg = registry();
+    const { tool } = counter('calendar.expiry', 'sensitive');
+    reg.register(tool);
+    for (const expiresAt of ['tomorrow', '2026-13-99', '']) {
+      expect(() => reg.grant({ toolName: 'calendar.expiry', actor: 'user', expiresAt })).toThrow(
+        /not a valid date/,
+      );
+    }
+    expect(() =>
+      reg.grant({
+        toolName: 'calendar.expiry',
+        actor: 'user',
+        expiresAt: new Date(Date.now() - 1000).toISOString(),
+      }),
+    ).toThrow(/must be in the future/);
+    expect(reg.grants()).toEqual([]);
+
+    // A valid one is normalised, so the lexical comparison in SQL is sound.
+    const grant = reg.grant({
+      toolName: 'calendar.expiry',
+      actor: 'user',
+      expiresAt: '2999-01-02T03:04:05.000+02:00',
+    });
+    expect(grant.expiresAt).toBe('2999-01-02T01:04:05.000Z');
   });
 
   it('refuses a grant for a tool that does not exist', () => {

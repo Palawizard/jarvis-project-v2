@@ -7,6 +7,7 @@ import { createLogger } from '../logger.js';
 import {
   MAX_GRANTABLE_RISK,
   decide,
+  isGrantableActor,
   previewDecision,
   riskExceeds,
   type PolicyDecision,
@@ -35,6 +36,16 @@ export interface ToolContext {
   agentRunId?: string | null;
   /** Id of the audit row for this invocation. */
   executionId: string;
+  /**
+   * Aborted when this invocation's timeout fires.
+   *
+   * Honouring it is how a tool turns "Jarvis stopped waiting" into "the work
+   * actually stopped". Nothing forces it to: an uncooperative tool keeps running
+   * and may still produce its side effect long after Jarvis recorded a timeout.
+   * That is precisely why a timeout is recorded as `timed_out` and not as an
+   * ordinary failure. Pass it to fetch, to spawn, or to your own cleanup.
+   */
+  signal: AbortSignal;
 }
 
 /**
@@ -52,7 +63,22 @@ export interface ToolCallContext {
 }
 
 export type ToolExecutionStatus =
-  'pending_approval' | 'running' | 'succeeded' | 'failed' | 'denied' | 'expired' | 'interrupted';
+  | 'pending_approval'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'denied'
+  | 'expired'
+  | 'interrupted'
+  | 'timed_out';
+
+/**
+ * Outcomes after which Jarvis cannot say whether the tool's external effect
+ * happened: the process died mid-call, or the call outlived its timeout and may
+ * still be running. Re-issuing one of these can duplicate a real-world action,
+ * so they are never replayed automatically and are labelled as such in the UI.
+ */
+export const EFFECT_UNKNOWN_STATUSES: readonly ToolExecutionStatus[] = ['interrupted', 'timed_out'];
 
 export interface ToolExecution {
   id: string;
@@ -73,6 +99,11 @@ export interface ToolExecution {
    * — redacted, and never eligible to be replayed.
    */
   inputValidated: boolean;
+  /**
+   * True when Jarvis cannot say whether the tool's external effect happened.
+   * A re-issue may therefore duplicate it. See EFFECT_UNKNOWN_STATUSES.
+   */
+  effectUnknown: boolean;
   result: unknown;
   error: string | null;
   grantId: string | null;
@@ -361,8 +392,17 @@ export class ToolRegistry {
       return { status: 'failed', execution: failed, error: message };
     }
 
-    // Refuse an impossible "always allow" before claiming the row: throwing
-    // after the claim would strand the execution in `running` forever.
+    // Refuse an impossible "always allow" *before* claiming the row: throwing
+    // after the claim would strand the execution in `running` forever. Both
+    // rules are re-stated here rather than left to grant(), so that approving
+    // the single invocation stays possible even when remembering it does not.
+    if (options.remember && !isGrantableActor(pending.actor)) {
+      throw new ToolPermissionError(
+        `standing permissions are only for the user's own actions, not for ${pending.actor}; ` +
+          'approve this one invocation without remembering it',
+        'grant_actor_not_permitted',
+      );
+    }
     if (options.remember && riskExceeds(tool.risk, MAX_GRANTABLE_RISK)) {
       throw new ToolPermissionError(
         `${tool.risk} actions always need a human; they cannot be remembered as always-allow`,
@@ -370,14 +410,28 @@ export class ToolRegistry {
       );
     }
 
-    // Conditional claim: two concurrent approvals cannot both start the tool.
+    // Conditional claim. One statement decides three things at once, which is
+    // what makes it safe under concurrency: the row is still pending, it has not
+    // outlived its TTL, and this caller is the one that gets to run it. A
+    // separate "is it expired?" read before the update would be a TOCTOU gap.
+    const cutoff = this.#approvalCutoff();
     const claimed = this.#db
       .prepare(
         `UPDATE tool_executions SET status='running', approved_by='user', started_at=?, updated_at=?
-         WHERE id=? AND status='pending_approval'`,
+         WHERE id=? AND status='pending_approval' AND requested_at >= ?`,
       )
-      .run(nowIso(), nowIso(), executionId);
+      .run(nowIso(), nowIso(), executionId, cutoff);
     if (Number(claimed.changes) !== 1) {
+      // Losing the claim means either somebody else answered first, or the
+      // request aged out. Only the second case leaves a row to clean up.
+      const expired = this.#expireStale(cutoff);
+      const current = this.getExecution(executionId);
+      if (expired > 0 && current?.status === 'expired') {
+        throw new ToolPermissionError(
+          'the approval request expired before it was answered',
+          'execution_expired',
+        );
+      }
       throw new ToolPermissionError('execution was already answered', 'execution_not_pending');
     }
 
@@ -452,6 +506,15 @@ export class ToolRegistry {
     });
   }
 
+  /**
+   * Run the tool under a timeout.
+   *
+   * The timeout aborts `ctx.signal` and stops waiting. It cannot *make* the work
+   * stop: only a tool that watches the signal actually cancels, and Node offers
+   * no way to force the rest. So the two cases are recorded differently — a
+   * plain rejection is a deterministic `failed`, while a timeout is `timed_out`,
+   * meaning the external effect may still land afterwards.
+   */
   async #run(
     tool: ToolDefinition<never, unknown>,
     execution: ToolExecution,
@@ -459,29 +522,39 @@ export class ToolRegistry {
   ): Promise<ToolExecutionOutcome> {
     const startedAt = Date.now();
     const timeoutMs = tool.timeoutMs ?? this.#defaultTimeoutMs;
-    let timer: NodeJS.Timeout | undefined;
+    const controller = new AbortController();
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new Error(`tool timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    // Start the work before racing so the losing branch can be neutralised: once
+    // the race settles on the timeout, a later rejection from the tool would
+    // otherwise surface as an unhandled rejection and take the process down.
+    const work = (async () =>
+      tool.execute(input as never, {
+        actor: execution.actor,
+        sessionId: execution.sessionId,
+        projectId: execution.projectId,
+        jobId: execution.jobId,
+        agentRunId: execution.agentRunId,
+        executionId: execution.id,
+        signal: controller.signal,
+      }))();
+    work.catch(() => undefined);
+
+    const abortion = new Promise<never>((_, reject) => {
+      controller.signal.addEventListener(
+        'abort',
+        () => reject(new Error(`tool timed out after ${timeoutMs}ms`)),
+        { once: true },
+      );
+    });
 
     try {
-      const result = await Promise.race([
-        tool.execute(input as never, {
-          actor: execution.actor,
-          sessionId: execution.sessionId,
-          projectId: execution.projectId,
-          jobId: execution.jobId,
-          agentRunId: execution.agentRunId,
-          executionId: execution.id,
-        }),
-        // ponytail: a timeout records the failure but cannot cancel the
-        // underlying work — Node has no generic cancellation. Tools that own a
-        // child process or socket should honour their own abort; wire an
-        // AbortSignal through ToolContext if that ever becomes common.
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(
-            () => reject(new Error(`tool timed out after ${timeoutMs}ms`)),
-            timeoutMs,
-          );
-        }),
-      ]);
+      const result = await Promise.race([work, abortion]);
       const finished = this.#finish(execution.id, 'succeeded', {
         result,
         durationMs: Date.now() - startedAt,
@@ -490,22 +563,41 @@ export class ToolRegistry {
       return { status: 'succeeded', execution: finished, result };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const finished = this.#finish(execution.id, 'failed', {
-        error: message,
+      // A cooperative tool rejects *because* it saw the abort. Either way the
+      // deadline is what ended this, so both land on the same honest status.
+      const status: ToolExecutionStatus = timedOut ? 'timed_out' : 'failed';
+      const detail = timedOut
+        ? `${message}. The tool was asked to stop, but Jarvis cannot confirm it did: ` +
+          'its effect on the outside world is unknown.'
+        : message;
+      const finished = this.#finish(execution.id, status, {
+        error: detail,
         durationMs: Date.now() - startedAt,
       });
       this.#emit('tool.execution.failed', finished);
-      return { status: 'failed', execution: finished, error: message };
+      return { status: 'failed', execution: finished, error: detail };
     } finally {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
     }
   }
 
   // ------------------------------------------------------------------- grants
 
+  /**
+   * Create a standing permission. This is the boundary that enforces who may
+   * hold one — deliberately here and not only on the HTTP route, because the
+   * route is one caller among several and an in-process caller must not be able
+   * to mint a permission the product does not offer.
+   */
   grant(input: GrantInput): ToolGrant {
     const tool = this.#tools.get(input.toolName);
     if (!tool) throw new Error(`unknown tool: ${input.toolName}`);
+    if (!isGrantableActor(input.actor)) {
+      throw new ToolPermissionError(
+        `standing permissions are only for the user's own actions, not for ${input.actor}`,
+        'grant_actor_not_permitted',
+      );
+    }
     // The policy would ignore such a grant anyway; refusing to create it is the
     // difference between an honest error and a permission the user believes in.
     if (riskExceeds(tool.risk, MAX_GRANTABLE_RISK)) {
@@ -514,6 +606,7 @@ export class ToolRegistry {
         'grant_not_permitted',
       );
     }
+    const expiresAt = normaliseExpiry(input.expiresAt ?? null);
     const id = newId('grn');
     const createdAt = nowIso();
     this.#db
@@ -530,7 +623,7 @@ export class ToolRegistry {
         input.sessionId ?? null,
         input.note ?? null,
         createdAt,
-        input.expiresAt ?? null,
+        expiresAt,
       );
     const grant = this.getGrant(id);
     if (!grant) throw new Error('grant insert failed');
@@ -576,6 +669,9 @@ export class ToolRegistry {
    * exactly, so a project-scoped permission never leaks to another project.
    */
   #matchingGrant(toolName: string, ctx: ToolCallContext): ToolGrant | null {
+    // Fail closed for anyone who may not hold a grant, so a row written before
+    // that rule existed (or straight into the database) still grants nothing.
+    if (!isGrantableActor(ctx.actor)) return null;
     const row = this.#db
       .prepare(
         `SELECT * FROM tool_grants
@@ -619,7 +715,9 @@ export class ToolRegistry {
         params.push(value);
       }
     }
-    params.push(Math.min(filter.limit ?? 100, 500));
+    // A negative LIMIT means "no limit" in SQLite, and NaN is a runtime error,
+    // so the bound has to be clamped rather than merely capped.
+    params.push(clampLimit(filter.limit));
     const rows = this.#db
       .prepare(
         `SELECT * FROM tool_executions ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
@@ -629,7 +727,12 @@ export class ToolRegistry {
     return rows.map(rowToExecution);
   }
 
+  /**
+   * Requests still awaiting an answer. Sweeps first, so a long-running Jarvis
+   * never shows a request the user can no longer act on.
+   */
   pending(): ToolExecution[] {
+    this.#expireStale(this.#approvalCutoff());
     return this.executions({ status: 'pending_approval', limit: 200 });
   }
 
@@ -662,30 +765,48 @@ export class ToolRegistry {
       if (execution) this.#emit('tool.execution.interrupted', execution);
     }
 
-    const cutoff = new Date(now - this.#approvalTtlMs).toISOString();
+    const expired = this.#expireStale(this.#approvalCutoff(now));
+
+    if (running.length || expired) {
+      log.warn('reconciled tool executions after restart', {
+        interrupted: running.length,
+        expired,
+      });
+    }
+    return { interrupted: running.length, expired };
+  }
+
+  /** ISO timestamp before which a pending approval request is too old to answer. */
+  #approvalCutoff(now = Date.now()): string {
+    return new Date(now - this.#approvalTtlMs).toISOString();
+  }
+
+  /**
+   * Expire pending requests older than the cutoff. Each transition is its own
+   * conditional UPDATE, so a request being approved concurrently is either
+   * claimed or expired, never both.
+   */
+  #expireStale(cutoff: string): number {
     const stale = this.#db
       .prepare(
         "SELECT id FROM tool_executions WHERE status='pending_approval' AND requested_at < ?",
       )
       .all(cutoff) as Array<{ id: string }>;
+    let count = 0;
     for (const row of stale) {
-      this.#db
+      const timestamp = nowIso();
+      const changed = this.#db
         .prepare(
           `UPDATE tool_executions SET status='expired', error=?, finished_at=?, updated_at=?
            WHERE id=? AND status='pending_approval'`,
         )
         .run('the approval request expired before it was answered', timestamp, timestamp, row.id);
+      if (Number(changed.changes) !== 1) continue;
+      count += 1;
       const execution = this.getExecution(row.id);
       if (execution) this.#emit('tool.execution.expired', execution);
     }
-
-    if (running.length || stale.length) {
-      log.warn('reconciled tool executions after restart', {
-        interrupted: running.length,
-        expired: stale.length,
-      });
-    }
-    return { interrupted: running.length, expired: stale.length };
+    return count;
   }
 
   /** Drop audit rows older than the retention window. 0 keeps them forever. */
@@ -818,6 +939,33 @@ export class ToolRegistry {
   }
 }
 
+/** SQLite treats a negative LIMIT as unbounded, so clamp into a real range. */
+function clampLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return 100;
+  return Math.min(Math.max(Math.trunc(limit), 1), 500);
+}
+
+/**
+ * Canonical ISO-8601, or a thrown error.
+ *
+ * Expiry is compared lexically in SQL, which is only sound when every stored
+ * value has the same shape. Accepting "tomorrow" or "2026-13-99" would store a
+ * string that silently sorts wrong — a permission that never expires, or one
+ * that expires immediately. An expiry already in the past is refused too: it
+ * would create a grant that is dead on arrival and looks live in the UI.
+ */
+function normaliseExpiry(value: string | null): string | null {
+  if (value === null) return null;
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    throw new ToolPermissionError(`expiresAt is not a valid date: ${value}`, 'invalid_expiry');
+  }
+  if (parsed <= Date.now()) {
+    throw new ToolPermissionError('expiresAt must be in the future', 'invalid_expiry');
+  }
+  return new Date(parsed).toISOString();
+}
+
 /** JSON or nothing. `null` means the value cannot be persisted faithfully. */
 function safeJson(value: unknown): string | null {
   try {
@@ -851,6 +999,7 @@ function rowToExecution(row: Row): ToolExecution {
     agentRunId: (row.agent_run_id as string) ?? null,
     input: parseRecord(row.input),
     inputValidated: row.decision !== 'deny' && row.reason !== 'invalid_input',
+    effectUnknown: EFFECT_UNKNOWN_STATUSES.includes(row.status as ToolExecutionStatus),
     result: parseRecord(row.result),
     error: (row.error as string) ?? null,
     grantId: (row.grant_id as string) ?? null,

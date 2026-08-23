@@ -288,7 +288,14 @@ export interface ToolSummary {
 }
 
 export type ToolExecutionStatus =
-  'pending_approval' | 'running' | 'succeeded' | 'failed' | 'denied' | 'expired' | 'interrupted';
+  | 'pending_approval'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'denied'
+  | 'expired'
+  | 'interrupted'
+  | 'timed_out';
 
 export interface ToolExecution {
   id: string;
@@ -304,6 +311,7 @@ export interface ToolExecution {
   agentRunId: string | null;
   input: unknown;
   inputValidated: boolean;
+  effectUnknown: boolean;
   result: unknown;
   error: string | null;
   grantId: string | null;

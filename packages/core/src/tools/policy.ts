@@ -79,6 +79,19 @@ const BASE: Record<ToolActor, Record<RiskLevel, PolicyDecision>> = {
  */
 export const MAX_GRANTABLE_RISK: RiskLevel = 'sensitive';
 
+/**
+ * Standing permissions only ever cover the user's own actions.
+ *
+ * "Always allow" means "do this unattended next time". Handing that to an agent
+ * is delegated autonomy — a separate product decision with its own blocking
+ * prerequisite (OS-level isolation of agent children, see docs/roadmap.md), not
+ * something that should fall out of a checkbox on an approval dialog. Approving
+ * a single agent invocation stays possible; remembering it does not.
+ */
+export function isGrantableActor(actor: ToolActor): boolean {
+  return actor === 'user';
+}
+
 export interface PolicyInput {
   risk: RiskLevel;
   actor: ToolActor;

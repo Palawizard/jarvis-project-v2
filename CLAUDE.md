@@ -16,7 +16,7 @@ Critical invariants:
 - Database migrations preserve existing memories/jobs/projects and reject unknown versions.
 - Provider and visual-review availability must be reported honestly; `reviewedBy` is never faked.
 - Provider children use official subscription auth and never inherit paid API keys.
-- Every tool runs through the permission boundary in `packages/core/src/tools/`; privilege comes from the call site's actor, never from a request payload, and agents never reach sensitive/destructive.
+- Every tool runs through the permission boundary in `packages/core/src/tools/`; privilege comes from the call site's actor, never from a request payload, and agents never reach sensitive/destructive. Standing permissions are user-only; approval expiry and claiming are one atomic conditional update.
 
 Commands: `pnpm dev`, `pnpm supervisor <config.json>`, `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm test:integration`, `pnpm build`, `pnpm test:e2e`. Live agents require explicit `JARVIS_LIVE_AGENT_TESTS=1`.
 

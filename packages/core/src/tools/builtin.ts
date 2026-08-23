@@ -124,6 +124,21 @@ export function registerBuiltinTools(
   });
 
   registry.register({
+    name: 'memory.purge_project',
+    description: 'Permanently erase every Jarvis memory belonging to one existing project.',
+    risk: 'destructive',
+    input: z.object({
+      projectId: z
+        .string()
+        .min(1)
+        .refine((id) => deps.projects.get(id) !== null, 'project not found'),
+    }),
+    async execute(input) {
+      return { purged: deps.memory.purgeScope('project', input.projectId) };
+    },
+  });
+
+  registry.register({
     name: 'memory.update',
     description: 'Correct a memory: stores the new value and supersedes the old one.',
     risk: 'reversible_modification',

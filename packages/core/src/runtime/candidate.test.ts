@@ -275,6 +275,42 @@ describe('candidate runtime isolation', () => {
     }
   });
 
+  it('fails closed when the candidate exits before the final web body completes', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
+    roots.push(root);
+    const webHit = path.join(root, 'web-headers-sent');
+    const terminate = path.join(root, 'terminate');
+    const candidate = splitPortProject(root, path.join(root, 'start-web'), path.join(root, 'api'));
+    if (!candidate.config.candidateRuntime) throw new Error('fixture runtime missing');
+    candidate.config.candidateRuntime.command.args = [
+      '-e',
+      `const fs=require('node:fs'),http=require('node:http');` +
+        `http.createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok'}))}).listen(Number(process.env.TEST_API_PORT),'127.0.0.1');` +
+        `http.createServer((_,r)=>{r.writeHead(200,{'content-type':'text/html','content-length':'5'});r.write('x');fs.writeFileSync(${JSON.stringify(webHit)},process.env.TEST_API_PORT+','+process.env.TEST_PORT);const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(terminate)})){clearInterval(t);process.kill(process.pid,'SIGTERM')}},10)}).listen(Number(process.env.TEST_PORT),'127.0.0.1');`,
+    ];
+
+    const starting = startCandidateRuntime({
+      project: candidate,
+      cwd: root,
+      jobId: 'job_exit_during_web_body',
+      config: loadConfig({ home: path.join(root, 'home') }),
+      timeoutMs: 10_000,
+    });
+    starting.catch(() => undefined);
+
+    await until(() => fs.existsSync(webHit));
+    fs.writeFileSync(terminate, 'go');
+    await expect(starting).rejects.toThrow(/candidate runtime exited \((?:SIGTERM|1)\)/);
+    for (const port of fs.readFileSync(webHit, 'utf8').split(',')) {
+      await until(() =>
+        fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(1000) }).then(
+          () => false,
+          () => true,
+        ),
+      );
+    }
+  });
+
   it('reports a candidate terminated by a signal instead of waiting for timeout', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
     roots.push(root);

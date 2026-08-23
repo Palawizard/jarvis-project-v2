@@ -67,10 +67,11 @@ test('command, projects, jobs and controllable memory work in the real UI', asyn
   // The permission layer must be inspectable from the UI, not just from the API.
   await page.getByTestId('nav-tools').click();
   await expect(page.getByText('Waiting for you (0)')).toBeVisible();
-  await expect(page.getByText('memory.purge')).toBeVisible();
-  await expect(
-    page.getByRole('row', { name: /memory\.purge/ }).getByText('asks you first'),
-  ).toBeVisible();
+  const purgeRow = page
+    .getByRole('row')
+    .filter({ has: page.getByText('memory.purge', { exact: true }) });
+  await expect(purgeRow.getByText('memory.purge', { exact: true })).toBeVisible();
+  await expect(purgeRow.getByText('asks you first')).toBeVisible();
   await expect(
     page.getByRole('row', { name: /memory\.search/ }).getByText('runs immediately'),
   ).toBeVisible();

@@ -95,6 +95,9 @@ export async function startCandidateRuntime(opts: {
   child.stdout?.on('data', capture);
   child.stderr?.on('data', capture);
   const stop = () => killTree(child);
+  const terminated = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolve) => child.once('exit', (code, signal) => resolve({ code, signal })),
+  );
 
   // One budget covers the whole startup: health identity first, then the web
   // listener Visual QA actually opens. The API can be healthy minutes before
@@ -117,6 +120,7 @@ export async function startCandidateRuntime(opts: {
         child.exitCode !== null || child.signalCode !== null
           ? { code: child.exitCode, signal: child.signalCode }
           : null,
+      terminated,
       ...(opts.signal ? { signal: opts.signal } : {}),
     };
     await waitUntilReady({
@@ -174,27 +178,51 @@ async function waitUntilReady(opts: {
   logs: string[];
   deadline: number;
   exited: () => { code: number | null; signal: NodeJS.Signals | null } | null;
+  terminated: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   signal?: AbortSignal;
 }): Promise<void> {
   const tail = () => opts.logs.join('').slice(-2000);
+  const exited = (exit: { code: number | null; signal: NodeJS.Signals | null }) =>
+    new Error(`candidate runtime exited (${exit.code ?? exit.signal}):\n${tail()}`);
   const assertActive = () => {
     if (opts.signal?.aborted) throw new Error('candidate runtime start cancelled');
     const exit = opts.exited();
-    if (exit) {
-      throw new Error(`candidate runtime exited (${exit.code ?? exit.signal}):\n${tail()}`);
-    }
+    if (exit) throw exited(exit);
   };
-  while (Date.now() < opts.deadline) {
-    assertActive();
-    if (await opts.probe()) {
+  let onAbort: (() => void) | undefined;
+  const cancelled = new Promise<'cancelled'>((resolve) => {
+    if (!opts.signal) return;
+    onAbort = () => resolve('cancelled');
+    opts.signal.addEventListener('abort', onAbort, { once: true });
+  });
+  const termination = opts.terminated.then((exit) => ({ type: 'exit' as const, exit }));
+  const interruptible = async <T>(work: Promise<T>): Promise<T> => {
+    const result = await Promise.race([
+      termination,
+      cancelled.then(() => ({ type: 'cancelled' as const })),
+      work.then((value) => ({ type: 'value' as const, value })),
+    ]);
+    if (result.type === 'exit') throw exited(result.exit);
+    if (result.type === 'cancelled') throw new Error('candidate runtime start cancelled');
+    return result.value;
+  };
+  try {
+    while (Date.now() < opts.deadline) {
       assertActive();
-      if (Date.now() < opts.deadline) return;
-      break;
+      if (await interruptible(opts.probe())) {
+        // Let pending child-process events run before the final active check.
+        await interruptible(new Promise<void>((resolve) => setImmediate(resolve)));
+        assertActive();
+        if (Date.now() < opts.deadline) return;
+        break;
+      }
+      await interruptible(new Promise((resolve) => setTimeout(resolve, 250)));
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    assertActive();
+    throw new Error(`${opts.failure}:\n${tail()}`);
+  } finally {
+    if (onAbort) opts.signal?.removeEventListener('abort', onAbort);
   }
-  assertActive();
-  throw new Error(`${opts.failure}:\n${tail()}`);
 }
 
 async function probeHealth(
@@ -224,7 +252,7 @@ async function probeHealth(
 async function probeWeb(baseUrl: string): Promise<boolean> {
   try {
     const response = await fetch(baseUrl, { signal: AbortSignal.timeout(2000) });
-    await response.body?.cancel();
+    await response.arrayBuffer();
     return response.status < 500;
   } catch {
     return false; // Still starting.

@@ -171,9 +171,16 @@ export function createRoutes(jarvis: Jarvis): Hono {
   });
 
   /** Delete an entire project's Jarvis memory. Deliberately explicit and separate. */
-  app.delete('/api/projects/:id/memory', (c) => {
-    const removed = jarvis.memory.purgeScope('project', c.req.param('id'));
-    return c.json({ removed });
+  app.delete('/api/projects/:id/memory', async (c) => {
+    const projectId = c.req.param('id');
+    if (!jarvis.projects.get(projectId)) return fail('project not found', 404);
+    return c.json(
+      await jarvis.tools.execute(
+        'memory.purge_project',
+        { projectId },
+        { actor: 'user', projectId },
+      ),
+    );
   });
 
   // ---------------------------------------------------------------- sessions --
@@ -564,13 +571,15 @@ export function createRoutes(jarvis: Jarvis): Hono {
     return c.json(jarvis.memory.get(id));
   });
 
-  app.delete('/api/memory/:id', (c) => {
+  app.delete('/api/memory/:id', async (c) => {
     const hard = c.req.query('hard') === 'true';
-    const ok = hard
-      ? jarvis.memory.purge(c.req.param('id'))
-      : jarvis.memory.forget(c.req.param('id'));
-    if (!ok) return fail('memory not found', 404);
-    return c.json({ deleted: true, mode: hard ? 'hard' : 'soft' });
+    const id = c.req.param('id');
+    if (hard) {
+      if (!jarvis.memory.get(id)) return fail('memory not found', 404);
+      return c.json(await jarvis.tools.execute('memory.purge', { id }, { actor: 'user' }));
+    }
+    if (!jarvis.memory.forget(id)) return fail('memory not found', 404);
+    return c.json({ deleted: true, mode: 'soft' });
   });
 
   app.get('/api/context-packs/:id', (c) => {

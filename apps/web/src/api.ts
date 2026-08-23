@@ -398,7 +398,7 @@ export const api = {
   refreshProject: (id: string) =>
     request<Project>(`/api/projects/${id}/refresh`, { method: 'POST' }),
   purgeProjectMemory: (id: string) =>
-    request<{ removed: number }>(`/api/projects/${id}/memory`, { method: 'DELETE' }),
+    request<ToolOutcome>(`/api/projects/${id}/memory`, { method: 'DELETE' }),
 
   session: () =>
     request<{ session: Session; rendered: string; messages: Message[] }>('/api/session'),
@@ -458,7 +458,9 @@ export const api = {
       body: JSON.stringify({ content }),
     }),
   deleteMemory: (id: string, hard = false) =>
-    request<{ deleted: boolean }>(`/api/memory/${id}?hard=${hard}`, { method: 'DELETE' }),
+    request<{ deleted: boolean; mode: 'soft' } | ToolOutcome>(`/api/memory/${id}?hard=${hard}`, {
+      method: 'DELETE',
+    }),
 
   contextPack: (id: string) => request<ContextPack>(`/api/context-packs/${id}`),
 

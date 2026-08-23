@@ -11,7 +11,9 @@ export function createLogger(scope: string) {
   const emit = (level: Level, msg: string, data?: unknown) => {
     if (LEVELS[level] < threshold) return;
     const line = data === undefined ? '' : ` ${safeJson(data)}`;
-    process.stderr.write(`${new Date().toISOString()} ${level.toUpperCase()} [${scope}] ${msg}${line}\n`);
+    process.stderr.write(
+      `${new Date().toISOString()} ${level.toUpperCase()} [${scope}] ${msg}${line}\n`,
+    );
   };
   return {
     debug: (m: string, d?: unknown) => emit('debug', m, d),

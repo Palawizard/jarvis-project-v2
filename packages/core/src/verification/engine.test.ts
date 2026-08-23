@@ -49,7 +49,11 @@ describe('deterministic verification', () => {
   });
 
   it('reports a real failure and captures the output', async () => {
-    const report = await engine.run({ jobId: JOB_ID, cwd: home, commands: { lint: OK, test: FAIL } });
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { lint: OK, test: FAIL },
+    });
     expect(report.passed).toBe(false);
     const failed = report.results.find((r) => r.name === 'test');
     expect(failed?.status).toBe('failed');
@@ -70,7 +74,6 @@ describe('deterministic verification', () => {
   it('skips silently when a project has no verification commands', async () => {
     const report = await engine.run({ jobId: JOB_ID, cwd: home, commands: {} });
     expect(report.ran).toBe(0);
-    // `passed` is vacuously true, but `ran: 0` is what tells the caller nothing was proven.
     expect(report.failureSummary).toBe('');
   });
 
@@ -78,8 +81,10 @@ describe('deterministic verification', () => {
     await engine.run({ jobId: JOB_ID, cwd: home, commands: { test: OK } });
     const stored = engine.list(JOB_ID);
     expect(stored).toHaveLength(1);
-    expect(stored[0]?.outputPath).toBeTruthy();
-    expect(fs.existsSync(stored[0]!.outputPath!)).toBe(true);
+    const outputPath = stored[0]?.outputPath;
+    expect(outputPath).toBeTruthy();
+    if (!outputPath) throw new Error('verification log path missing');
+    expect(fs.existsSync(outputPath)).toBe(true);
   });
 
   it('emits step and completion events', async () => {
@@ -88,6 +93,50 @@ describe('deterministic verification', () => {
     expect(types).toContain('verification.started');
     expect(types).toContain('verification.step');
     expect(types).toContain('verification.completed');
+  });
+
+  it('installs dependencies first when a worktree has none', async () => {
+    // A fresh git worktree has no node_modules, so without this every check
+    // would fail with "module not found" and look like a broken change.
+    fs.writeFileSync(path.join(home, 'package.json'), '{"name":"x"}');
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install: OK, test: OK },
+    });
+    expect(report.results.map((r) => r.name)).toEqual(['install', 'test']);
+    // install is setup, not evidence: it must not inflate the check count.
+    expect(report.ran).toBe(1);
+    expect(report.passed).toBe(true);
+  });
+
+  it('skips the install when dependencies are already present', async () => {
+    fs.writeFileSync(path.join(home, 'package.json'), '{"name":"x"}');
+    fs.mkdirSync(path.join(home, 'node_modules'), { recursive: true });
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install: OK, test: OK },
+    });
+    expect(report.results.map((r) => r.name)).toEqual(['test']);
+  });
+
+  it('stops after a failed install instead of cascading bogus failures', async () => {
+    fs.writeFileSync(path.join(home, 'package.json'), '{"name":"x"}');
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install: FAIL, lint: OK, test: OK },
+    });
+    expect(report.results.map((r) => r.name)).toEqual(['install']);
+    expect(report.passed).toBe(false);
+    expect(report.failureSummary).toContain('install');
+  });
+
+  it('does not report a change as verified when nothing was actually checked', async () => {
+    const report = await engine.run({ jobId: JOB_ID, cwd: home, commands: {} });
+    expect(report.passed).toBe(false);
+    expect(report.ran).toBe(0);
   });
 
   it('marks a command that cannot start as an error, not a pass', async () => {
@@ -127,7 +176,9 @@ describe('tool registry risk gating', () => {
       input: z.object({}),
       execute: async () => 'deleted',
     });
-    await expect(registry.execute('danger.delete', {}, { maxRisk: 'observe' })).rejects.toThrow(ToolPermissionError);
+    await expect(registry.execute('danger.delete', {}, { maxRisk: 'observe' })).rejects.toThrow(
+      ToolPermissionError,
+    );
   });
 
   it('validates input against the schema before executing', async () => {
@@ -143,13 +194,17 @@ describe('tool registry risk gating', () => {
         return input.text;
       },
     });
-    await expect(registry.execute('demo.echo', { text: 123 }, { maxRisk: 'observe' })).rejects.toThrow(/invalid input/);
+    await expect(
+      registry.execute('demo.echo', { text: 123 }, { maxRisk: 'observe' }),
+    ).rejects.toThrow(/invalid input/);
     expect(ran).toBe(false);
     expect(await registry.execute('demo.echo', { text: 'hi' }, { maxRisk: 'observe' })).toBe('hi');
   });
 
   it('rejects an unknown tool', async () => {
-    await expect(new ToolRegistry().execute('nope', {}, { maxRisk: 'destructive' })).rejects.toThrow(/unknown tool/);
+    await expect(
+      new ToolRegistry().execute('nope', {}, { maxRisk: 'destructive' }),
+    ).rejects.toThrow(/unknown tool/);
   });
 
   it('exposes a JSON schema for each tool', () => {

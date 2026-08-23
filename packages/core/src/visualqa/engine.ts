@@ -5,6 +5,7 @@ import type { Db } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
+import { killTree } from '../agents/spawn.js';
 
 const log = createLogger('visual-qa');
 
@@ -57,7 +58,11 @@ export class VisualQaEngine {
       payload: { baseUrl: opts.baseUrl, routes: opts.routes, viewports },
     });
 
-    const outDir = path.join(this.artifactsDir, opts.jobId ?? opts.projectId ?? 'adhoc', 'visual-qa');
+    const outDir = path.join(
+      this.artifactsDir,
+      opts.jobId ?? opts.projectId ?? 'adhoc',
+      'visual-qa',
+    );
     fs.mkdirSync(outDir, { recursive: true });
 
     const shots: VisualQaShot[] = [];
@@ -123,14 +128,20 @@ export class VisualQaEngine {
     });
     page.on('pageerror', (error) => consoleErrors.push(`uncaught: ${error.message}`.slice(0, 500)));
     page.on('requestfailed', (request) => {
-      networkFailures.push(`${request.method()} ${request.url()} — ${request.failure()?.errorText ?? 'failed'}`.slice(0, 500));
+      networkFailures.push(
+        `${request.method()} ${request.url()} — ${request.failure()?.errorText ?? 'failed'}`.slice(
+          0,
+          500,
+        ),
+      );
     });
     page.on('response', (response) => {
-      if (response.status() >= 400) networkFailures.push(`${response.status()} ${response.url()}`.slice(0, 500));
+      if (response.status() >= 400)
+        networkFailures.push(`${response.status()} ${response.url()}`.slice(0, 500));
     });
 
     const url = new URL(route, opts.baseUrl).toString();
-    const safeName = `${route.replace(/[^a-z0-9]+/gi, '_') || 'root'}-${viewport}.png`;
+    const safeName = `${route.replace(/[^a-z0-9]+/gi, '_') || 'root'}-${viewport}-${newId('shot')}.png`;
     const screenshotPath = path.join(outDir, safeName);
 
     try {
@@ -154,7 +165,12 @@ export class VisualQaEngine {
       this.bus?.emit({
         type: 'visual_qa.captured',
         ...(opts.jobId ? { jobId: opts.jobId } : {}),
-        payload: { route, viewport, consoleErrors: consoleErrors.length, networkFailures: networkFailures.length },
+        payload: {
+          route,
+          viewport,
+          consoleErrors: consoleErrors.length,
+          networkFailures: networkFailures.length,
+        },
       });
       return shot;
     } catch (error) {
@@ -174,7 +190,36 @@ export class VisualQaEngine {
     }
   }
 
-  private persist(input: Omit<VisualQaShot, 'id' | 'createdAt'> & { jobId: string | null; projectId: string | null }): VisualQaShot {
+  /**
+   * Record that visual QA could not run. An empty screenshot list with no
+   * explanation reads as "nothing was wrong"; this makes the failure explicit.
+   */
+  recordFailure(input: {
+    jobId?: string | null;
+    projectId?: string | null;
+    route: string;
+    error: string;
+  }): VisualQaShot {
+    return this.persist({
+      jobId: input.jobId ?? null,
+      projectId: input.projectId ?? null,
+      route: input.route,
+      viewport: 'desktop',
+      screenshotPath: null,
+      consoleErrors: [],
+      networkFailures: [],
+      status: 'failed',
+      error: input.error,
+      reviewedBy: null,
+    });
+  }
+
+  private persist(
+    input: Omit<VisualQaShot, 'id' | 'createdAt'> & {
+      jobId: string | null;
+      projectId: string | null;
+    },
+  ): VisualQaShot {
     const shot: VisualQaShot = {
       id: newId('vqa'),
       route: input.route,
@@ -239,7 +284,19 @@ export async function startDevServer(opts: {
   cwd: string;
   url: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<{ stop: () => Promise<void>; url: string; logs: string[] }> {
+  if (opts.signal?.aborted) throw new Error('dev server start cancelled');
+  try {
+    await fetch(opts.url, { signal: AbortSignal.timeout(1000) });
+    throw new Error(
+      `dev URL ${opts.url} was already reachable before candidate startup; refusing to capture the wrong application`,
+    );
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('already reachable')) throw error;
+    // Expected: the candidate URL must be free before its process starts.
+  }
+
   const logs: string[] = [];
   const child: ChildProcess = spawn(opts.command, {
     cwd: opts.cwd,
@@ -247,6 +304,7 @@ export async function startDevServer(opts: {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, FORCE_COLOR: '0', BROWSER: 'none' },
     windowsHide: true,
+    detached: process.platform !== 'win32',
   });
   const capture = (chunk: Buffer) => {
     logs.push(chunk.toString());
@@ -256,12 +314,7 @@ export async function startDevServer(opts: {
   child.stderr?.on('data', capture);
 
   const stop = async () => {
-    if (child.pid && process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
-    } else {
-      child.kill('SIGTERM');
-    }
-    await new Promise((r) => setTimeout(r, 300));
+    await killTree(child);
   };
 
   const deadline = Date.now() + (opts.timeoutMs ?? 90_000);
@@ -271,8 +324,14 @@ export async function startDevServer(opts: {
   });
 
   while (Date.now() < deadline) {
+    if (opts.signal?.aborted) {
+      await stop();
+      throw new Error('dev server start cancelled');
+    }
     if (exited) {
-      throw new Error(`dev server exited before becoming reachable:\n${logs.join('').slice(-2000)}`);
+      throw new Error(
+        `dev server exited before becoming reachable:\n${logs.join('').slice(-2000)}`,
+      );
     }
     try {
       const response = await fetch(opts.url, { signal: AbortSignal.timeout(3000) });
@@ -283,5 +342,7 @@ export async function startDevServer(opts: {
     await new Promise((r) => setTimeout(r, 500));
   }
   await stop();
-  throw new Error(`dev server did not become reachable at ${opts.url}:\n${logs.join('').slice(-2000)}`);
+  throw new Error(
+    `dev server did not become reachable at ${opts.url}:\n${logs.join('').slice(-2000)}`,
+  );
 }

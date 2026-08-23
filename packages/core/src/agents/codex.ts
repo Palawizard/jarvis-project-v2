@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
 import { resolveCli, type ResolvedCli } from './resolve.js';
-import { runJsonlProcess } from './spawn.js';
+import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
 import type {
   AgentEvent,
   AgentProvider,
@@ -36,7 +36,11 @@ export class CodexProvider implements AgentProvider {
 
   private resolve(): ResolvedCli | null {
     if (this.cli === undefined) {
-      this.cli = resolveCli({ binName: 'codex', packageName: '@openai/codex', envOverride: 'JARVIS_CODEX_BIN' });
+      this.cli = resolveCli({
+        binName: 'codex',
+        packageName: '@openai/codex',
+        envOverride: 'JARVIS_CODEX_BIN',
+      });
     }
     return this.cli;
   }
@@ -55,18 +59,28 @@ export class CodexProvider implements AgentProvider {
 
     const cli = this.resolve();
     if (!cli) {
-      this.cached = { ...base, reason: 'Codex CLI not found. Install it with `npm i -g @openai/codex`.' };
+      this.cached = {
+        ...base,
+        reason: 'Codex CLI not found. Install it with `npm i -g @openai/codex`.',
+      };
       return this.cached;
     }
     try {
-      const { stdout } = await exec(cli.command, [...cli.prefixArgs, '--version'], { timeout: 30_000 });
+      const { stdout } = await exec(cli.command, [...cli.prefixArgs, '--version'], {
+        timeout: 30_000,
+      });
       base.version = stdout.trim();
     } catch (error) {
-      this.cached = { ...base, reason: `Codex CLI could not be executed: ${(error as Error).message}` };
+      this.cached = {
+        ...base,
+        reason: `Codex CLI could not be executed: ${(error as Error).message}`,
+      };
       return this.cached;
     }
     try {
-      const { stdout, stderr } = await exec(cli.command, [...cli.prefixArgs, 'login', 'status'], { timeout: 45_000 });
+      const { stdout, stderr } = await exec(cli.command, [...cli.prefixArgs, 'login', 'status'], {
+        timeout: 45_000,
+      });
       // 0.147 prints a human-readable line and sends it to stderr, not stdout.
       // There is no JSON form, so both streams are inspected.
       const text = `${stdout}\n${stderr}`.trim();
@@ -74,7 +88,8 @@ export class CodexProvider implements AgentProvider {
       const method = (/logged in using\s*(.+)/i.exec(text)?.[1] ?? '').trim();
       if (method) base.authMethod = method;
       base.available = base.authenticated;
-      if (!base.authenticated) base.reason = 'Codex CLI is installed but not logged in. Run `codex login`.';
+      if (!base.authenticated)
+        base.reason = 'Codex CLI is installed but not logged in. Run `codex login`.';
     } catch (error) {
       base.reason = `could not read Codex login status: ${(error as Error).message}`;
     }
@@ -82,7 +97,10 @@ export class CodexProvider implements AgentProvider {
     return base;
   }
 
-  async run(options: AgentStartOptions, onEvent: (event: AgentEvent) => void): Promise<AgentRunResult> {
+  async run(
+    options: AgentStartOptions,
+    onEvent: (event: AgentEvent) => void,
+  ): Promise<AgentRunResult> {
     const caps = await this.capabilities();
     const cli = this.resolve();
     if (!caps.available || !cli) {
@@ -93,21 +111,13 @@ export class CodexProvider implements AgentProvider {
     }
 
     const model = options.model ?? this.config.agents.codexModel;
-    const args = ['exec'];
-    if (options.resumeSessionId) args.push('resume', options.resumeSessionId);
-    args.push('--json', '--skip-git-repo-check');
-    if (model) args.push('--model', model);
-    // Reviewers only read; implementers need to write inside their worktree.
-    const writes = options.role === 'implementer' || options.role === 'fixer';
-    args.push('--sandbox', writes ? 'workspace-write' : 'read-only');
-    args.push('-C', options.cwd);
-    // '-' makes codex read the prompt from stdin instead of argv.
-    args.push('-');
+    const args = buildCodexArgs(options, model);
 
     let threadId: string | undefined;
     let lastMessage = '';
     let usage: Record<string, unknown> | undefined;
     let reportedError: string | undefined;
+    let sawTerminalTurn = false;
 
     const outcome = await runJsonlProcess({
       cli,
@@ -150,7 +160,11 @@ export class CodexProvider implements AgentProvider {
                 });
                 break;
               case 'file_change':
-                onEvent({ kind: 'tool_completed', tool: 'edit', preview: JSON.stringify(item.changes ?? {}).slice(0, 400) });
+                onEvent({
+                  kind: 'tool_completed',
+                  tool: 'edit',
+                  preview: JSON.stringify(item.changes ?? {}).slice(0, 400),
+                });
                 break;
               case 'error':
                 reportedError = String(item.message ?? 'codex reported an error');
@@ -161,9 +175,11 @@ export class CodexProvider implements AgentProvider {
             break;
           }
           case 'turn.completed':
+            sawTerminalTurn = true;
             if (event.usage) usage = event.usage as Record<string, unknown>;
             break;
           case 'turn.failed': {
+            sawTerminalTurn = true;
             const err = event.error as { message?: string } | undefined;
             reportedError = err?.message ?? 'codex turn failed';
             break;
@@ -177,20 +193,49 @@ export class CodexProvider implements AgentProvider {
     const { proposals, cleanedText } = extractMemoryProposals(lastMessage);
 
     if (outcome.cancelled) {
-      return { status: 'cancelled', result: cleanedText, error: 'cancelled by user', memoryProposals: proposals, ...(threadId ? { sessionId: threadId } : {}) };
+      return {
+        status: 'cancelled',
+        result: cleanedText,
+        error: 'cancelled by user',
+        memoryProposals: proposals,
+        ...(threadId ? { sessionId: threadId } : {}),
+      };
     }
     if (outcome.timedOut) {
       const error = `agent exceeded ${options.timeoutMs ?? this.config.agents.runTimeoutMs}ms`;
       onEvent({ kind: 'failed', error });
-      return { status: 'timeout', result: cleanedText, error, memoryProposals: proposals, ...(threadId ? { sessionId: threadId } : {}) };
+      return {
+        status: 'timeout',
+        result: cleanedText,
+        error,
+        memoryProposals: proposals,
+        ...(threadId ? { sessionId: threadId } : {}),
+      };
     }
     if (outcome.startError) {
       const error = `could not start Codex: ${outcome.startError}`;
       onEvent({ kind: 'failed', error });
       return { status: 'failed', result: '', error, memoryProposals: [] };
     }
+    const protocolError = jsonlProtocolError('Codex', outcome, sawTerminalTurn);
+    if (protocolError) {
+      onEvent({
+        kind: 'failed',
+        error: protocolError,
+        ...(threadId ? { sessionId: threadId } : {}),
+      });
+      return {
+        status: 'failed',
+        result: cleanedText,
+        error: protocolError,
+        memoryProposals: proposals,
+        ...(threadId ? { sessionId: threadId } : {}),
+      };
+    }
     if (reportedError || outcome.code !== 0) {
-      const error = reportedError ?? `codex exited with code ${outcome.code}${outcome.stderr ? `: ${outcome.stderr}` : ''}`;
+      const error =
+        reportedError ??
+        `codex exited with code ${outcome.code}${outcome.stderr ? `: ${outcome.stderr}` : ''}`;
       onEvent({ kind: 'failed', error, ...(threadId ? { sessionId: threadId } : {}) });
       return {
         status: 'failed',
@@ -201,7 +246,12 @@ export class CodexProvider implements AgentProvider {
       };
     }
 
-    onEvent({ kind: 'completed', result: cleanedText, ...(threadId ? { sessionId: threadId } : {}), ...(usage ? { usage } : {}) });
+    onEvent({
+      kind: 'completed',
+      result: cleanedText,
+      ...(threadId ? { sessionId: threadId } : {}),
+      ...(usage ? { usage } : {}),
+    });
     return {
       status: 'completed',
       result: cleanedText,
@@ -210,4 +260,24 @@ export class CodexProvider implements AgentProvider {
       ...(usage ? { usage } : {}),
     };
   }
+}
+
+export function buildCodexArgs(options: AgentStartOptions, model?: string): string[] {
+  const writes = options.role === 'implementer' || options.role === 'fixer';
+  // Exec-level options must precede the `resume` subcommand. Codex 0.147 rejects
+  // --sandbox and -C when they appear after it.
+  const args = [
+    'exec',
+    '--json',
+    '--skip-git-repo-check',
+    '--sandbox',
+    writes ? 'workspace-write' : 'read-only',
+    '-C',
+    options.cwd,
+  ];
+  if (model) args.push('--model', model);
+  if (options.resumeSessionId) args.push('resume', options.resumeSessionId);
+  // '-' makes Codex read the prompt from stdin instead of argv.
+  args.push('-');
+  return args;
 }

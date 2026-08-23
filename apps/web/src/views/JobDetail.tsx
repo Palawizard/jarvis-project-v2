@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, artifactUrl, type ContextPack, type JarvisEvent } from '../api.ts';
 import { useAsync } from '../hooks.ts';
-import { Badge, Card, Empty, MemoryCard, Pipeline, StageBadge } from '../components.tsx';
+import { Badge, Card, Diff, Empty, MemoryCard, Pipeline, StageBadge } from '../components.tsx';
 
 /**
  * Full job result view.
@@ -30,33 +30,69 @@ export function JobDetailView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent, jobId]);
 
-  if (detail.error) return <div className="page"><Card title="Error">{detail.error}</Card></div>;
-  if (!detail.data) return <div className="page"><Empty>Loading…</Empty></div>;
+  if (detail.error)
+    return (
+      <div className="page">
+        <Card title="Error">{detail.error}</Card>
+      </div>
+    );
+  if (!detail.data)
+    return (
+      <div className="page">
+        <Empty>Loading…</Empty>
+      </div>
+    );
 
-  const { job, runs, verifications, reviews, visualQa, events, episode, contextPacks, running, project } = detail.data;
+  const {
+    job,
+    runs,
+    candidate,
+    verifications,
+    reviews,
+    visualQa,
+    events,
+    episode,
+    contextPacks,
+    running,
+    project,
+  } = detail.data;
   const review = reviews[reviews.length - 1];
+  const implementationRun = runs.findLast(
+    (run) => (run.role === 'implementer' || run.role === 'fixer') && !!run.result,
+  );
   const skipped = project?.commands.dev && project.devUrl ? [] : (['visual_qa'] as const);
 
   return (
     <div className="page wide">
       <div className="row wrap" style={{ marginBottom: 14 }}>
-        <button className="btn sm" onClick={onBack}>← Jobs</button>
+        <button className="btn sm" onClick={onBack}>
+          ← Jobs
+        </button>
         <h2 style={{ margin: 0, fontSize: 18 }}>{job.goal}</h2>
         <StageBadge stage={job.stage} />
         {running && <Badge tone="run">worker live</Badge>}
         <span style={{ flex: 1 }} />
         {running && (
-          <button className="btn sm danger" onClick={() => void api.cancelJob(job.id).then(detail.reload)}>
+          <button
+            className="btn sm danger"
+            onClick={() => void api.cancelJob(job.id).then(detail.reload)}
+          >
             Cancel
           </button>
         )}
         {job.stage === 'queued' && (
-          <button className="btn sm primary" onClick={() => void api.startJob(job.id).then(detail.reload)}>
+          <button
+            className="btn sm primary"
+            onClick={() => void api.startJob(job.id).then(detail.reload)}
+          >
             Start
           </button>
         )}
         {job.stage === 'awaiting_user' && (
-          <button className="btn sm primary" onClick={() => void api.acceptJob(job.id).then(detail.reload)}>
+          <button
+            className="btn sm primary"
+            onClick={() => void api.acceptJob(job.id).then(detail.reload)}
+          >
             Accept candidate
           </button>
         )}
@@ -71,9 +107,18 @@ export function JobDetailView({
       <div className="grid cols-2" style={{ alignItems: 'start' }}>
         <div>
           <Card title="Pipeline">
-            <Pipeline stage={job.stage} status={job.status} skipped={[...skipped]} />
+            <Pipeline
+              stage={job.stage}
+              status={job.status}
+              skipped={[...skipped]}
+              events={events}
+            />
             <div className="mem-meta" style={{ marginTop: 12 }}>
-              {job.branch && <span>branch <code>{job.branch}</code></span>}
+              {job.branch && (
+                <span>
+                  branch <code>{job.branch}</code>
+                </span>
+              )}
               {job.baseRef && <span>base {job.baseRef.slice(0, 8)}</span>}
               {job.headRef && <span>head {job.headRef.slice(0, 8)}</span>}
               {job.fixCycles > 0 && <span>{job.fixCycles} fix cycle(s)</span>}
@@ -89,8 +134,58 @@ export function JobDetailView({
             <div style={{ whiteSpace: 'pre-wrap' }}>{job.request}</div>
             {job.acceptance.length > 0 && (
               <ul className="small dim" style={{ marginBottom: 0 }}>
-                {job.acceptance.map((a, i) => <li key={i}>{a}</li>)}
+                {job.acceptance.map((a, i) => (
+                  <li key={i}>{a}</li>
+                ))}
               </ul>
+            )}
+          </Card>
+
+          <Card title="Implementation summary">
+            {implementationRun?.result ? (
+              <div style={{ whiteSpace: 'pre-wrap' }}>{implementationRun.result}</div>
+            ) : (
+              <Empty>No implementation summary recorded.</Empty>
+            )}
+          </Card>
+
+          <Card title={`Candidate changes (${candidate?.files.length ?? 0} files)`}>
+            {!candidate ? (
+              <Empty>
+                Candidate diff is unavailable while the worker is running or its worktree is
+                missing.
+              </Empty>
+            ) : candidate.files.length === 0 ? (
+              <Empty>No changed files.</Empty>
+            ) : (
+              <>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>File</th>
+                      <th style={{ width: 70 }}>Added</th>
+                      <th style={{ width: 70 }}>Removed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {candidate.files.map((file) => (
+                      <tr key={file.path}>
+                        <td className="mono tiny">{file.path}</td>
+                        <td className="tiny diff-add">+{file.added}</td>
+                        <td className="tiny diff-del">−{file.removed}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <details style={{ marginTop: 10 }}>
+                  <summary className="small dim" style={{ cursor: 'pointer' }}>
+                    Git diff{candidate.diffTruncated ? ' (truncated)' : ''}
+                  </summary>
+                  <div style={{ marginTop: 8 }}>
+                    <Diff text={candidate.diff || '(empty diff)'} />
+                  </div>
+                </details>
+              </>
             )}
           </Card>
 
@@ -103,7 +198,11 @@ export function JobDetailView({
                   {verifications.map((v) => (
                     <tr key={v.id}>
                       <td style={{ width: 90 }}>
-                        <Badge tone={v.status === 'passed' ? 'ok' : v.status === 'failed' ? 'err' : 'warn'}>
+                        <Badge
+                          tone={
+                            v.status === 'passed' ? 'ok' : v.status === 'failed' ? 'err' : 'warn'
+                          }
+                        >
                           {v.status}
                         </Badge>
                       </td>
@@ -111,7 +210,9 @@ export function JobDetailView({
                         <div className="mono tiny">{v.command}</div>
                         {v.status !== 'passed' && v.output && (
                           <details>
-                            <summary className="tiny dim" style={{ cursor: 'pointer' }}>output</summary>
+                            <summary className="tiny dim" style={{ cursor: 'pointer' }}>
+                              output
+                            </summary>
                             <pre style={{ maxHeight: 240 }}>{v.output}</pre>
                           </details>
                         )}
@@ -132,12 +233,24 @@ export function JobDetailView({
             ) : (
               <>
                 <div className="row" style={{ marginBottom: 10 }}>
-                  <Badge tone={review.verdict === 'approve' ? 'ok' : review.verdict === 'error' ? 'err' : 'warn'}>
+                  <Badge
+                    tone={
+                      review.verdict === 'approve'
+                        ? 'ok'
+                        : review.verdict === 'error'
+                          ? 'err'
+                          : 'warn'
+                    }
+                  >
                     {review.verdict.replace('_', ' ')}
                   </Badge>
                   <span className="tiny dim">by {review.provider} (independent run)</span>
                 </div>
-                {review.summary && <div className="small" style={{ marginBottom: 10 }}>{review.summary}</div>}
+                {review.summary && (
+                  <div className="small" style={{ marginBottom: 10 }}>
+                    {review.summary}
+                  </div>
+                )}
                 {review.findings.length === 0 ? (
                   <div className="small faint">No findings.</div>
                 ) : (
@@ -145,15 +258,30 @@ export function JobDetailView({
                     {review.findings.map((f, i) => (
                       <div key={i} className="mem-item">
                         <div className="mem-head">
-                          <Badge tone={f.severity === 'critical' || f.severity === 'high' ? 'err' : f.severity === 'medium' ? 'warn' : undefined}>
+                          <Badge
+                            tone={
+                              f.severity === 'critical' || f.severity === 'high'
+                                ? 'err'
+                                : f.severity === 'medium'
+                                  ? 'warn'
+                                  : undefined
+                            }
+                          >
                             {f.severity}
                           </Badge>
                           <Badge>{f.category}</Badge>
-                          {f.file && <code className="tiny dim">{f.file}{f.line ? `:${f.line}` : ''}</code>}
+                          {f.file && (
+                            <code className="tiny dim">
+                              {f.file}
+                              {f.line ? `:${f.line}` : ''}
+                            </code>
+                          )}
                         </div>
                         <div className="small">{f.description}</div>
                         {f.recommendation && (
-                          <div className="small dim" style={{ marginTop: 4 }}>→ {f.recommendation}</div>
+                          <div className="small dim" style={{ marginTop: 4 }}>
+                            → {f.recommendation}
+                          </div>
                         )}
                       </div>
                     ))}
@@ -174,25 +302,40 @@ export function JobDetailView({
                   {runs.map((r) => (
                     <tr key={r.id}>
                       <td style={{ width: 100 }}>
-                        <div><Badge tone="accent">{r.provider}</Badge></div>
+                        <div>
+                          <Badge tone="accent">{r.provider}</Badge>
+                        </div>
                         <div className="tiny faint">{r.role}</div>
                       </td>
                       <td>
-                        <Badge tone={r.status === 'completed' ? 'ok' : r.status === 'running' ? 'run' : 'err'}>
+                        <Badge
+                          tone={
+                            r.status === 'completed' ? 'ok' : r.status === 'running' ? 'run' : 'err'
+                          }
+                        >
                           {r.status}
                         </Badge>
                         {r.externalSessionId && (
-                          <div className="tiny faint mono" title="provider session id — the run is resumable">
+                          <div
+                            className="tiny faint mono"
+                            title="provider session id — the run is resumable"
+                          >
                             {r.externalSessionId.slice(0, 18)}…
                           </div>
                         )}
-                        {r.error && <div className="tiny" style={{ color: 'var(--err)' }}>{r.error}</div>}
+                        {r.error && (
+                          <div className="tiny" style={{ color: 'var(--err)' }}>
+                            {r.error}
+                          </div>
+                        )}
                       </td>
                       <td style={{ width: 90 }}>
                         {r.contextPackId && (
                           <button
                             className="btn sm"
-                            onClick={() => void api.contextPack(r.contextPackId!).then(setPack)}
+                            onClick={() =>
+                              r.contextPackId && void api.contextPack(r.contextPackId).then(setPack)
+                            }
                           >
                             Context
                           </button>
@@ -208,7 +351,11 @@ export function JobDetailView({
           {pack && (
             <Card
               title={`Context pack — ${pack.usedTokens}/${pack.budgetTokens} tokens`}
-              actions={<button className="btn sm" onClick={() => setPack(null)}>Close</button>}
+              actions={
+                <button className="btn sm" onClick={() => setPack(null)}>
+                  Close
+                </button>
+              }
             >
               <div className="small dim" style={{ marginBottom: 10 }}>
                 Exactly what was injected, and why each memory was selected.
@@ -218,14 +365,21 @@ export function JobDetailView({
               ) : (
                 <table>
                   <thead>
-                    <tr><th>Section</th><th>Memory</th><th style={{ width: 60 }}>Score</th><th style={{ width: 50 }}>Tok</th></tr>
+                    <tr>
+                      <th>Section</th>
+                      <th>Memory</th>
+                      <th style={{ width: 60 }}>Score</th>
+                      <th style={{ width: 50 }}>Tok</th>
+                    </tr>
                   </thead>
                   <tbody>
                     {pack.selections.map((s) => (
                       <tr key={s.memoryId}>
                         <td className="tiny dim">{s.section}</td>
                         <td>
-                          <div className="small">{s.memory?.content.slice(0, 160) ?? s.memoryId}</div>
+                          <div className="small">
+                            {s.memory?.content.slice(0, 160) ?? s.memoryId}
+                          </div>
                           <div className="tiny faint">{s.reason}</div>
                         </td>
                         <td className="tiny mono">{s.score.toFixed(3)}</td>
@@ -236,7 +390,9 @@ export function JobDetailView({
                 </table>
               )}
               <details style={{ marginTop: 10 }}>
-                <summary className="tiny dim" style={{ cursor: 'pointer' }}>rendered prompt section</summary>
+                <summary className="tiny dim" style={{ cursor: 'pointer' }}>
+                  rendered prompt section
+                </summary>
                 <pre>{pack.rendered || '(empty)'}</pre>
               </details>
             </Card>
@@ -247,8 +403,15 @@ export function JobDetailView({
               {contextPacks.map((p) => (
                 <div key={p.id} className="spread small" style={{ padding: '4px 0' }}>
                   <span className="dim">{p.role}</span>
-                  <span className="mono tiny">{p.usedTokens}/{p.budgetTokens} tokens · {p.selections.length} memories</span>
-                  <button className="btn sm" onClick={() => void api.contextPack(p.id).then(setPack)}>Inspect</button>
+                  <span className="mono tiny">
+                    {p.usedTokens}/{p.budgetTokens} tokens · {p.selections.length} memories
+                  </span>
+                  <button
+                    className="btn sm"
+                    onClick={() => void api.contextPack(p.id).then(setPack)}
+                  >
+                    Inspect
+                  </button>
                 </div>
               ))}
             </Card>
@@ -266,7 +429,11 @@ export function JobDetailView({
                 {visualQa.map((s) => (
                   <div key={s.id} className="shot">
                     {s.screenshotPath ? (
-                      <img src={artifactUrl(s.screenshotPath, artifactsDir)} alt={`${s.route} ${s.viewport}`} loading="lazy" />
+                      <img
+                        src={artifactUrl(s.screenshotPath, artifactsDir)}
+                        alt={`${s.route} ${s.viewport}`}
+                        loading="lazy"
+                      />
                     ) : (
                       <div className="empty small">{s.error ?? 'capture failed'}</div>
                     )}
@@ -276,13 +443,19 @@ export function JobDetailView({
                         <Badge>{s.viewport}</Badge>
                       </div>
                       {s.consoleErrors.length > 0 && (
-                        <div className="tiny" style={{ color: 'var(--err)' }}>{s.consoleErrors.length} console error(s)</div>
+                        <div className="tiny" style={{ color: 'var(--err)' }}>
+                          {s.consoleErrors.length} console error(s)
+                        </div>
                       )}
                       {s.networkFailures.length > 0 && (
-                        <div className="tiny" style={{ color: 'var(--warn)' }}>{s.networkFailures.length} network issue(s)</div>
+                        <div className="tiny" style={{ color: 'var(--warn)' }}>
+                          {s.networkFailures.length} network issue(s)
+                        </div>
                       )}
                       <div className="tiny faint">
-                        {s.reviewedBy ? `reviewed by ${s.reviewedBy}` : 'evidence only — not AI-reviewed'}
+                        {s.reviewedBy
+                          ? `reviewed by ${s.reviewedBy}`
+                          : 'evidence only — not AI-reviewed'}
                       </div>
                     </div>
                   </div>
@@ -292,18 +465,27 @@ export function JobDetailView({
           </Card>
 
           <Card title="Episode written to memory">
-            {episode ? <MemoryCard memory={episode} /> : <Empty>No episode yet — written at job completion.</Empty>}
+            {episode ? (
+              <MemoryCard memory={episode} />
+            ) : (
+              <Empty>No episode yet — written at job completion.</Empty>
+            )}
           </Card>
 
           <Card title={`Events (${events.length})`}>
             <div className="events">
-              {events.slice(-200).reverse().map((e) => (
-                <div key={e.id} className="event">
-                  <span className="event-time">{e.createdAt ? new Date(e.createdAt).toLocaleTimeString() : ''}</span>
-                  <span className="event-type">{e.type}</span>
-                  <span className="event-body">{summarise(e)}</span>
-                </div>
-              ))}
+              {events
+                .slice(-200)
+                .reverse()
+                .map((e) => (
+                  <div key={e.id} className="event">
+                    <span className="event-time">
+                      {e.createdAt ? new Date(e.createdAt).toLocaleTimeString() : ''}
+                    </span>
+                    <span className="event-type">{e.type}</span>
+                    <span className="event-body">{summarise(e)}</span>
+                  </div>
+                ))}
             </div>
           </Card>
         </div>

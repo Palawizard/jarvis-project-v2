@@ -93,7 +93,15 @@ export class SessionService {
       .prepare(
         'INSERT INTO sessions (id, title, project_id, state, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)',
       )
-      .run(session.id, session.title, session.projectId, JSON.stringify(session.state), session.status, now, now);
+      .run(
+        session.id,
+        session.title,
+        session.projectId,
+        JSON.stringify(session.state),
+        session.status,
+        now,
+        now,
+      );
     return session;
   }
 
@@ -103,7 +111,9 @@ export class SessionService {
   }
 
   list(limit = 30): Session[] {
-    const rows = this.db.prepare('SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?').all(limit) as Row[];
+    const rows = this.db
+      .prepare('SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?')
+      .all(limit) as Row[];
     return rows.map(rowToSession);
   }
 
@@ -116,7 +126,9 @@ export class SessionService {
   }
 
   setProject(id: string, projectId: string | null): Session | null {
-    this.db.prepare('UPDATE sessions SET project_id = ?, updated_at = ? WHERE id = ?').run(projectId, nowIso(), id);
+    this.db
+      .prepare('UPDATE sessions SET project_id = ?, updated_at = ? WHERE id = ?')
+      .run(projectId, nowIso(), id);
     return this.get(id);
   }
 
@@ -173,7 +185,9 @@ export class SessionService {
       ...session.state,
       unresolved: session.state.unresolved.filter((u) => u !== item),
     };
-    this.db.prepare('UPDATE sessions SET state = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(next), nowIso(), id);
+    this.db
+      .prepare('UPDATE sessions SET state = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(next), nowIso(), id);
   }
 
   /** Compact rendering handed to the Context Pack Builder. */
@@ -203,9 +217,13 @@ export class SessionService {
       createdAt: nowIso(),
     };
     this.db
-      .prepare('INSERT INTO messages (id, session_id, role, content, truncated, created_at) VALUES (?,?,?,?,?,?)')
+      .prepare(
+        'INSERT INTO messages (id, session_id, role, content, truncated, created_at) VALUES (?,?,?,?,?,?)',
+      )
       .run(message.id, sessionId, role, message.content, truncated ? 1 : 0, message.createdAt);
-    this.db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(message.createdAt, sessionId);
+    this.db
+      .prepare('UPDATE sessions SET updated_at = ? WHERE id = ?')
+      .run(message.createdAt, sessionId);
     return message;
   }
 
@@ -226,7 +244,9 @@ export class SessionService {
   markConsolidated(id: string): void {
     const now = nowIso();
     this.db
-      .prepare(`UPDATE sessions SET status='consolidated', consolidated_at=?, updated_at=? WHERE id=?`)
+      .prepare(
+        `UPDATE sessions SET status='consolidated', consolidated_at=?, updated_at=? WHERE id=?`,
+      )
       .run(now, now, id);
   }
 

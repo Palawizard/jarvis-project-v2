@@ -87,7 +87,10 @@ const KIND_BASE_IMPORTANCE: Record<MemoryKind, number> = {
  * kind priors, and structural markers. `explicit` short-circuits to accept
  * because a direct user instruction outranks any heuristic.
  */
-export function scoreCandidate(input: MemoryInput, opts: { minImportance: number }): ScoredCandidate {
+export function scoreCandidate(
+  input: MemoryInput,
+  opts: { minImportance: number },
+): ScoredCandidate {
   const content = input.content.trim();
 
   if (input.explicit || input.sourceType === 'user_explicit') {
@@ -108,9 +111,10 @@ export function scoreCandidate(input: MemoryInput, opts: { minImportance: number
   let importance = input.importance ?? KIND_BASE_IMPORTANCE[input.kind];
 
   // Specificity: concrete nouns/identifiers are more reusable than vague prose.
-  const hasIdentifier = /[A-Za-z0-9_.-]+\.(?:ts|tsx|js|json|py|sql|md)\b|`[^`]+`|\b[A-Z][a-zA-Z]{2,}[A-Z]\w*/.test(
-    content,
-  );
+  const hasIdentifier =
+    /[A-Za-z0-9_.-]+\.(?:ts|tsx|js|json|py|sql|md)\b|`[^`]+`|\b[A-Z][a-zA-Z]{2,}[A-Z]\w*/.test(
+      content,
+    );
   if (hasIdentifier) importance += 0.06;
 
   // Hedged statements age badly.
@@ -163,5 +167,7 @@ export function jaccard(a: string, b: string): number {
 
 /** Normalised form used for exact-duplicate hashing. */
 export function normaliseForHash(text: string): string {
-  return foldAccents(text).replace(/[^a-z0-9]+/g, ' ').trim();
+  return foldAccents(text)
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
 }

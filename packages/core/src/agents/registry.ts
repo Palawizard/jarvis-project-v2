@@ -35,10 +35,16 @@ export class AgentRegistry {
    * provider that wrote the code when an alternative exists, so an implementation
    * is never its own final authority.
    */
-  async route(role: AgentRole, opts: { avoid?: ProviderId; prefer?: ProviderId } = {}): Promise<{
-    provider: AgentProvider;
-    capabilities: ProviderCapabilities;
-  } | { provider: null; reason: string }> {
+  async route(
+    role: AgentRole,
+    opts: { avoid?: ProviderId; prefer?: ProviderId } = {},
+  ): Promise<
+    | {
+        provider: AgentProvider;
+        capabilities: ProviderCapabilities;
+      }
+    | { provider: null; reason: string }
+  > {
     const caps = await this.capabilities();
     const usable = caps.filter((c) => c.available);
     if (usable.length === 0) {

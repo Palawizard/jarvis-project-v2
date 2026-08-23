@@ -27,9 +27,10 @@ export function resolveCli(opts: {
 }): ResolvedCli | null {
   const override = opts.envOverride ? process.env[opts.envOverride] : undefined;
   if (override && fs.existsSync(override)) {
+    const source = opts.envOverride ?? 'environment override';
     return override.endsWith('.js')
-      ? { command: process.execPath, prefixArgs: [override], source: opts.envOverride! }
-      : { command: override, prefixArgs: [], source: opts.envOverride! };
+      ? { command: process.execPath, prefixArgs: [override], source }
+      : { command: override, prefixArgs: [], source };
   }
 
   for (const root of packageRoots()) {
@@ -43,7 +44,11 @@ export function resolveCli(opts: {
       continue;
     }
     const relative =
-      typeof bin === 'string' ? bin : typeof bin === 'object' && bin ? (bin as Record<string, string>)[opts.binName] : undefined;
+      typeof bin === 'string'
+        ? bin
+        : typeof bin === 'object' && bin
+          ? (bin as Record<string, string>)[opts.binName]
+          : undefined;
     if (!relative) continue;
     const target = path.join(pkgDir, relative);
     if (!fs.existsSync(target)) continue;
@@ -75,12 +80,24 @@ function packageRoots(): string[] {
   };
   if (process.platform === 'win32') {
     push(process.env.APPDATA ? path.join(process.env.APPDATA, 'npm', 'node_modules') : undefined);
-    push(process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'pnpm', 'global', '5', 'node_modules') : undefined);
+    push(
+      process.env.LOCALAPPDATA
+        ? path.join(process.env.LOCALAPPDATA, 'pnpm', 'global', '5', 'node_modules')
+        : undefined,
+    );
   } else {
     push('/usr/local/lib/node_modules');
     push('/usr/lib/node_modules');
-    push(process.env.HOME ? path.join(process.env.HOME, '.npm-global', 'lib', 'node_modules') : undefined);
+    push(
+      process.env.HOME
+        ? path.join(process.env.HOME, '.npm-global', 'lib', 'node_modules')
+        : undefined,
+    );
   }
-  push(process.env.npm_config_prefix ? path.join(process.env.npm_config_prefix, 'lib', 'node_modules') : undefined);
+  push(
+    process.env.npm_config_prefix
+      ? path.join(process.env.npm_config_prefix, 'lib', 'node_modules')
+      : undefined,
+  );
   return roots;
 }

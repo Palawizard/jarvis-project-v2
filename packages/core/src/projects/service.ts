@@ -95,7 +95,9 @@ export function detectStack(rootPath: string): { stack: ProjectStack; commands: 
       if (deps[dep]) stack.frameworks.push(name);
     }
 
-    const pm = pkg.packageManager?.split('@')[0] ?? (has('pnpm-lock.yaml') ? 'pnpm' : has('yarn.lock') ? 'yarn' : 'npm');
+    const pm =
+      pkg.packageManager?.split('@')[0] ??
+      (has('pnpm-lock.yaml') ? 'pnpm' : has('yarn.lock') ? 'yarn' : 'npm');
     stack.packageManager = pm;
     const run = (script: string) => `${pm} run ${script}`;
     const scripts = pkg.scripts ?? {};
@@ -106,7 +108,18 @@ export function detectStack(rootPath: string): { stack: ProjectStack; commands: 
     else if (scripts['type-check']) commands.typecheck = run('type-check');
     if (scripts['format:check']) commands.format = run('format:check');
     if (scripts.dev) commands.dev = run('dev');
-    commands.install = pm === 'npm' ? 'npm install' : `${pm} install`;
+    commands.install =
+      pm === 'npm'
+        ? has('package-lock.json')
+          ? 'npm ci'
+          : 'npm install'
+        : pm === 'pnpm'
+          ? has('pnpm-lock.yaml')
+            ? 'pnpm install --frozen-lockfile'
+            : 'pnpm install'
+          : has('.yarnrc.yml')
+            ? 'yarn install --immutable'
+            : 'yarn install --frozen-lockfile';
     stack.hasTests = Boolean(scripts.test);
   }
 
@@ -145,7 +158,8 @@ export class ProjectService {
     if (!status.isRepo) throw new Error(`${rootPath} is not a git repository`);
     const root = status.root ?? rootPath;
 
-    const existing = this.db.prepare('SELECT * FROM projects WHERE root_path = ?').get(root) as Row | undefined;
+    const existing = this.db.prepare('SELECT * FROM projects WHERE root_path = ?').get(root) as
+      Row | undefined;
     if (existing) return rowToProject(existing);
 
     const detected = detectStack(root);
@@ -194,23 +208,31 @@ export class ProjectService {
   }
 
   getByPath(rootPath: string): Project | null {
-    const row = this.db.prepare('SELECT * FROM projects WHERE root_path = ?').get(path.resolve(rootPath)) as
-      | Row
-      | undefined;
+    const row = this.db
+      .prepare('SELECT * FROM projects WHERE root_path = ?')
+      .get(path.resolve(rootPath)) as Row | undefined;
     return row ? rowToProject(row) : null;
   }
 
   getSelf(): Project | null {
-    const row = this.db.prepare('SELECT * FROM projects WHERE is_self = 1 LIMIT 1').get() as Row | undefined;
+    const row = this.db.prepare('SELECT * FROM projects WHERE is_self = 1 LIMIT 1').get() as
+      Row | undefined;
     return row ? rowToProject(row) : null;
   }
 
   list(): Project[] {
-    const rows = this.db.prepare('SELECT * FROM projects ORDER BY is_self DESC, name ASC').all() as Row[];
+    const rows = this.db
+      .prepare('SELECT * FROM projects ORDER BY is_self DESC, name ASC')
+      .all() as Row[];
     return rows.map(rowToProject);
   }
 
-  update(id: string, patch: Partial<Pick<Project, 'name' | 'summary' | 'devUrl' | 'commands' | 'defaultBranch' | 'stack'>>): Project | null {
+  update(
+    id: string,
+    patch: Partial<
+      Pick<Project, 'name' | 'summary' | 'devUrl' | 'commands' | 'defaultBranch' | 'stack'>
+    >,
+  ): Project | null {
     const current = this.get(id);
     if (!current) return null;
     const next = { ...current, ...patch };

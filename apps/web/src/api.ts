@@ -5,7 +5,13 @@ export interface Project {
   name: string;
   rootPath: string;
   defaultBranch: string;
-  stack: { languages: string[]; frameworks: string[]; packageManager?: string; hasTests: boolean; webRoutes?: string[] };
+  stack: {
+    languages: string[];
+    frameworks: string[];
+    packageManager?: string;
+    hasTests: boolean;
+    webRoutes?: string[];
+  };
   commands: Record<string, string | undefined>;
   devUrl: string | null;
   summary: string | null;
@@ -15,8 +21,17 @@ export interface Project {
 }
 
 export type JobStage =
-  | 'queued' | 'planning' | 'implementing' | 'verifying' | 'reviewing'
-  | 'visual_qa' | 'fixing' | 'awaiting_user' | 'completed' | 'failed' | 'cancelled';
+  | 'queued'
+  | 'planning'
+  | 'implementing'
+  | 'verifying'
+  | 'reviewing'
+  | 'visual_qa'
+  | 'fixing'
+  | 'awaiting_user'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
 
 export interface Job {
   id: string;
@@ -87,36 +102,74 @@ export interface AgentRun {
 }
 
 export interface Verification {
-  id: string; name: string; command: string; status: string;
-  exitCode: number | null; output: string; durationMs: number;
+  id: string;
+  name: string;
+  command: string;
+  status: string;
+  exitCode: number | null;
+  output: string;
+  durationMs: number;
 }
 
 export interface ReviewFinding {
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
-  category: string; file?: string; line?: number;
-  description: string; recommendation: string;
+  category: string;
+  file?: string;
+  line?: number;
+  description: string;
+  recommendation: string;
 }
 
 export interface Review {
-  id: string; provider: string; verdict: 'approve' | 'request_changes' | 'error';
-  summary: string; findings: ReviewFinding[]; createdAt: string;
+  id: string;
+  provider: string;
+  verdict: 'approve' | 'request_changes' | 'error';
+  summary: string;
+  findings: ReviewFinding[];
+  createdAt: string;
 }
 
 export interface VisualShot {
-  id: string; route: string; viewport: string; screenshotPath: string | null;
-  consoleErrors: string[]; networkFailures: string[];
-  status: string; error: string | null; reviewedBy: string | null; createdAt: string;
+  id: string;
+  route: string;
+  viewport: string;
+  screenshotPath: string | null;
+  consoleErrors: string[];
+  networkFailures: string[];
+  status: string;
+  error: string | null;
+  reviewedBy: string | null;
+  createdAt: string;
 }
 
 export interface ContextSelection {
-  memoryId: string; scope: string; kind: string; score: number;
-  reason: string; tokens: number; section: string; memory?: Memory | null;
+  memoryId: string;
+  scope: string;
+  kind: string;
+  score: number;
+  reason: string;
+  tokens: number;
+  section: string;
+  memory?: Memory | null;
 }
 
 export interface ContextPack {
-  id: string; role: string; rendered: string;
-  usedTokens: number; budgetTokens: number;
-  selections: ContextSelection[]; createdAt?: string;
+  id: string;
+  role: string;
+  rendered: string;
+  usedTokens: number;
+  budgetTokens: number;
+  selections: ContextSelection[];
+  createdAt?: string;
+}
+
+export interface CandidateChanges {
+  head: string;
+  commits: Array<{ sha: string; subject: string }>;
+  files: Array<{ path: string; added: number; removed: number }>;
+  diff: string;
+  diffTruncated: boolean;
+  uncommitted: string[];
 }
 
 export interface JobDetail {
@@ -124,6 +177,7 @@ export interface JobDetail {
   stages: JobStage[];
   running: boolean;
   runs: AgentRun[];
+  candidate: CandidateChanges | null;
   verifications: Verification[];
   reviews: Review[];
   visualQa: VisualShot[];
@@ -134,8 +188,13 @@ export interface JobDetail {
 }
 
 export interface ProviderCapability {
-  id: string; available: boolean; reason?: string; version?: string;
-  authenticated: boolean; authMethod?: string; models: string[];
+  id: string;
+  available: boolean;
+  reason?: string;
+  version?: string;
+  authenticated: boolean;
+  authMethod?: string;
+  models: string[];
 }
 
 export interface Health {
@@ -144,8 +203,19 @@ export interface Health {
   artifactsDir: string;
   providers: ProviderCapability[];
   memory: {
-    active: number; superseded: number; deleted: number; expired: number; embedded: number;
-    embeddings: { enabled: boolean; ready: boolean; model: string; dim: number; error?: string; disabledForProcess: boolean };
+    active: number;
+    superseded: number;
+    deleted: number;
+    expired: number;
+    embedded: number;
+    embeddings: {
+      enabled: boolean;
+      ready: boolean;
+      model: string;
+      dim: number;
+      error?: string;
+      disabledForProcess: boolean;
+    };
   };
   context: { budgetTokens: number };
 }
@@ -155,14 +225,22 @@ export interface Session {
   title: string | null;
   projectId: string | null;
   state: {
-    goal?: string; constraints: string[]; decisions: string[];
-    unresolved: string[]; entities: string[]; activeJobIds: string[]; artifacts: string[];
+    goal?: string;
+    constraints: string[];
+    decisions: string[];
+    unresolved: string[];
+    entities: string[];
+    activeJobIds: string[];
+    artifacts: string[];
   };
   status: string;
 }
 
 export interface Message {
-  id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: string;
+  id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  createdAt: string;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -173,7 +251,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const text = await response.text();
   const body = text ? (JSON.parse(text) as unknown) : null;
   if (!response.ok) {
-    const message = (body as { error?: string } | null)?.error ?? `${response.status} ${response.statusText}`;
+    const message =
+      (body as { error?: string } | null)?.error ?? `${response.status} ${response.statusText}`;
     throw new Error(message);
   }
   return body as T;
@@ -184,17 +263,29 @@ export const api = {
 
   projects: () => request<Project[]>('/api/projects'),
   project: (id: string) =>
-    request<{ project: Project; snapshot: string; jobs: Job[]; memory: { items: Memory[]; total: number } }>(
-      `/api/projects/${id}`,
-    ),
+    request<{
+      project: Project;
+      snapshot: string;
+      jobs: Job[];
+      memory: { items: Memory[]; total: number };
+    }>(`/api/projects/${id}`),
   addProject: (rootPath: string, name?: string, devUrl?: string) =>
-    request<Project>('/api/projects', { method: 'POST', body: JSON.stringify({ rootPath, name, devUrl }) }),
-  refreshProject: (id: string) => request<Project>(`/api/projects/${id}/refresh`, { method: 'POST' }),
-  purgeProjectMemory: (id: string) => request<{ removed: number }>(`/api/projects/${id}/memory`, { method: 'DELETE' }),
+    request<Project>('/api/projects', {
+      method: 'POST',
+      body: JSON.stringify({ rootPath, name, devUrl }),
+    }),
+  refreshProject: (id: string) =>
+    request<Project>(`/api/projects/${id}/refresh`, { method: 'POST' }),
+  purgeProjectMemory: (id: string) =>
+    request<{ removed: number }>(`/api/projects/${id}/memory`, { method: 'DELETE' }),
 
-  session: () => request<{ session: Session; rendered: string; messages: Message[] }>('/api/session'),
+  session: () =>
+    request<{ session: Session; rendered: string; messages: Message[] }>('/api/session'),
   setSessionProject: (id: string, projectId: string | null) =>
-    request<Session>(`/api/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ projectId }) }),
+    request<Session>(`/api/sessions/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ projectId }),
+    }),
 
   command: (text: string, sessionId: string, projectId: string | null) =>
     request<{ kind: string; reply: string; job?: Job }>('/api/command', {
@@ -202,26 +293,30 @@ export const api = {
       body: JSON.stringify({ text, sessionId, projectId }),
     }),
 
-  jobs: (projectId?: string) => request<Job[]>(`/api/jobs${projectId ? `?projectId=${projectId}` : ''}`),
+  jobs: (projectId?: string) =>
+    request<Job[]>(`/api/jobs${projectId ? `?projectId=${projectId}` : ''}`),
   job: (id: string) => request<JobDetail>(`/api/jobs/${id}`),
   createJob: (projectId: string, req: string, acceptance: string[], autostart: boolean) =>
     request<Job>('/api/jobs', {
       method: 'POST',
       body: JSON.stringify({ projectId, request: req, acceptance, autostart }),
     }),
-  startJob: (id: string) => request<{ started: boolean }>(`/api/jobs/${id}/start`, { method: 'POST' }),
-  cancelJob: (id: string) => request<{ cancelled: boolean }>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
+  startJob: (id: string) =>
+    request<{ started: boolean }>(`/api/jobs/${id}/start`, { method: 'POST' }),
+  cancelJob: (id: string) =>
+    request<{ cancelled: boolean }>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
   acceptJob: (id: string) => request<Job>(`/api/jobs/${id}/accept`, { method: 'POST' }),
 
   memory: (params: Record<string, string>) =>
     request<{ items: Memory[]; total: number }>(`/api/memory?${new URLSearchParams(params)}`),
   memoryOne: (id: string) =>
-    request<{ memory: Memory; supersedes: Memory | null; supersededBy: Memory | null }>(`/api/memory/${id}`),
-  searchMemory: (query: string, projectId: string | null) =>
-    request<Array<{ memory: Memory; score: number; reason: string; signals: Record<string, unknown> }>>(
-      '/api/memory/search',
-      { method: 'POST', body: JSON.stringify({ query, projectId }) },
+    request<{ memory: Memory; supersedes: Memory | null; supersededBy: Memory | null }>(
+      `/api/memory/${id}`,
     ),
+  searchMemory: (query: string, projectId: string | null) =>
+    request<
+      Array<{ memory: Memory; score: number; reason: string; signals: Record<string, unknown> }>
+    >('/api/memory/search', { method: 'POST', body: JSON.stringify({ query, projectId }) }),
   addMemory: (body: Partial<Memory> & { content: string }) =>
     request<{ status: string; memory?: Memory; reason?: string; detail?: string }>('/api/memory', {
       method: 'POST',
@@ -230,7 +325,10 @@ export const api = {
   pinMemory: (id: string, pinned: boolean) =>
     request<Memory>(`/api/memory/${id}`, { method: 'PATCH', body: JSON.stringify({ pinned }) }),
   correctMemory: (id: string, content: string) =>
-    request<{ status: string }>(`/api/memory/${id}`, { method: 'PATCH', body: JSON.stringify({ content }) }),
+    request<{ status: string }>(`/api/memory/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ content }),
+    }),
   deleteMemory: (id: string, hard = false) =>
     request<{ deleted: boolean }>(`/api/memory/${id}?hard=${hard}`, { method: 'DELETE' }),
 
@@ -249,6 +347,8 @@ export const api = {
 export function artifactUrl(absolutePath: string, artifactsRoot: string): string {
   const normalised = absolutePath.replace(/\\/g, '/');
   const root = artifactsRoot.replace(/\\/g, '/');
-  const relative = normalised.startsWith(root) ? normalised.slice(root.length).replace(/^\//, '') : normalised;
+  const relative = normalised.startsWith(root)
+    ? normalised.slice(root.length).replace(/^\//, '')
+    : normalised;
   return `/api/artifacts/${relative.split('/').map(encodeURIComponent).join('/')}`;
 }

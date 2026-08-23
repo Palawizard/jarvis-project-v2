@@ -27,15 +27,65 @@ export interface JsonlRunOutcome {
   cancelled: boolean;
   startError?: string;
   stderr: string;
+  malformedLines: number;
+  malformedPreview?: string;
 }
 
-/** Kill a process tree. On Windows a plain kill() orphans grandchildren. */
-export function killTree(child: ChildProcess): void {
-  if (child.pid && process.platform === 'win32') {
-    spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
-  } else {
+export function jsonlProtocolError(
+  provider: string,
+  outcome: Pick<JsonlRunOutcome, 'malformedLines' | 'malformedPreview'>,
+  sawTerminal: boolean,
+): string | null {
+  if (outcome.malformedLines > 0) {
+    return `${provider} emitted ${outcome.malformedLines} malformed JSONL line(s)${
+      outcome.malformedPreview ? `: ${outcome.malformedPreview}` : ''
+    }`;
+  }
+  return sawTerminal ? null : `${provider} exited without a terminal structured event`;
+}
+
+function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      child.removeListener('close', done);
+      resolve(false);
+    }, timeoutMs);
+    child.once('close', done);
+  });
+}
+
+/** Kill a detached process tree and wait for bounded TERM -> KILL cleanup. */
+export async function killTree(child: ChildProcess): Promise<void> {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === 'win32') {
+    await new Promise<void>((resolve) => {
+      const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      killer.once('error', () => resolve());
+      killer.once('close', () => resolve());
+    });
+    await waitForExit(child, 1500);
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
     child.kill('SIGTERM');
   }
+  if (await waitForExit(child, 1500)) return;
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    child.kill('SIGKILL');
+  }
+  await waitForExit(child, 500);
 }
 
 /**
@@ -51,12 +101,20 @@ export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
       env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
       shell: false,
       windowsHide: true,
+      detached: process.platform !== 'win32',
     });
 
     const stderrChunks: string[] = [];
     let settled = false;
     let timedOut = false;
     let cancelled = false;
+    let malformedLines = 0;
+    let malformedPreview: string | undefined;
+
+    const protocolFields = () => ({
+      malformedLines,
+      ...(malformedPreview ? { malformedPreview } : {}),
+    });
 
     const finish = (outcome: JsonlRunOutcome) => {
       if (settled) return;
@@ -68,17 +126,25 @@ export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
 
     const timer = setTimeout(() => {
       timedOut = true;
-      killTree(child);
+      void killTree(child);
     }, spec.timeoutMs);
 
     const onAbort = () => {
       cancelled = true;
-      killTree(child);
+      void killTree(child);
     };
-    spec.signal?.addEventListener('abort', onAbort, { once: true });
+    if (spec.signal?.aborted) onAbort();
+    else spec.signal?.addEventListener('abort', onAbort, { once: true });
 
     child.on('error', (error) => {
-      finish({ code: null, timedOut, cancelled, startError: error.message, stderr: stderrChunks.join('') });
+      finish({
+        code: null,
+        timedOut,
+        cancelled,
+        startError: error.message,
+        stderr: stderrChunks.join(''),
+        ...protocolFields(),
+      });
     });
 
     child.stderr.on('data', (chunk: Buffer) => {
@@ -89,11 +155,14 @@ export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
     const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
     rl.on('line', (line) => {
       const trimmed = line.trim();
-      if (!trimmed.startsWith('{')) return;
+      if (!trimmed) return;
       try {
-        spec.onLine(JSON.parse(trimmed) as Record<string, unknown>);
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
+        spec.onLine(parsed as Record<string, unknown>);
       } catch {
-        // A malformed line is a provider bug, not a job failure.
+        malformedLines += 1;
+        malformedPreview ??= trimmed.slice(0, 200);
         log.debug('unparseable stream line', { scope: spec.scope, line: trimmed.slice(0, 200) });
       }
     });
@@ -104,7 +173,13 @@ export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
     child.stdin.end(spec.stdin);
 
     child.on('close', (code) => {
-      finish({ code, timedOut, cancelled, stderr: stderrChunks.join('').trim().slice(-3000) });
+      finish({
+        code,
+        timedOut,
+        cancelled,
+        stderr: stderrChunks.join('').trim().slice(-3000),
+        ...protocolFields(),
+      });
     });
   });
 }

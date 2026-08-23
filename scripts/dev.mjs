@@ -46,7 +46,10 @@ function shutdown(code) {
   for (const child of children) {
     if (!child.pid || child.exitCode !== null) continue;
     if (isWindows) {
-      spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+      spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
     } else {
       child.kill('SIGTERM');
     }

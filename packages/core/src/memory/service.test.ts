@@ -19,7 +19,10 @@ import type { EmbeddingProvider } from './embeddings.js';
 function fakeEmbeddings(dim = 64): EmbeddingProvider {
   const embed = (text: string): Float32Array => {
     const vec = new Float32Array(dim);
-    for (const token of text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)) {
+    for (const token of text
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean)) {
       let hash = 0;
       for (let i = 0; i < token.length; i++) hash = (hash * 31 + token.charCodeAt(i)) >>> 0;
       vec[hash % dim] = (vec[hash % dim] as number) + 1;
@@ -212,7 +215,10 @@ describe('explicit remember and forget', () => {
 
     expect(memory.forget(stored.memory.id)).toBe(true);
 
-    const active = await memory.retrieve({ query: 'windows', scopes: [{ scope: 'user', scopeId: null }] });
+    const active = await memory.retrieve({
+      query: 'windows',
+      scopes: [{ scope: 'user', scopeId: null }],
+    });
     expect(active.find((r) => r.memory.id === stored.memory.id)).toBeUndefined();
 
     // Still inspectable.
@@ -254,6 +260,32 @@ describe('temporal correction', () => {
     expect(results.map((r) => r.memory.id)).not.toContain(first.memory.id);
   });
 
+  it('treats a near-identical A to B subject update as supersession, not deduplication', async () => {
+    const first = await memory.remember({
+      scope: 'user',
+      kind: 'preference',
+      subject: 'preference.test',
+      content: 'Preference = A',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+    const second = await memory.remember({
+      scope: 'user',
+      kind: 'preference',
+      subject: 'preference.test',
+      content: 'Preference = B',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+
+    expect(first.status).toBe('stored');
+    expect(second.status).toBe('stored');
+    if (first.status === 'stored' && second.status === 'stored') {
+      expect(second.supersededId).toBe(first.memory.id);
+      expect(memory.get(first.memory.id)?.status).toBe('superseded');
+    }
+  });
+
   it('correct() links supersession even without a shared subject key', async () => {
     const first = await memory.remember({
       scope: 'user',
@@ -264,16 +296,81 @@ describe('temporal correction', () => {
     });
     if (first.status !== 'stored') throw new Error('setup failed');
 
-    const corrected = await memory.correct(first.memory.id, 'The user deploys the API to Scalingo, not Heroku.');
+    const corrected = await memory.correct(
+      first.memory.id,
+      'The user deploys the API to Scalingo, not Heroku.',
+    );
     expect(corrected.status).toBe('stored');
     expect(memory.get(first.memory.id)?.status).toBe('superseded');
     if (corrected.status === 'stored') {
       expect(memory.get(corrected.memory.id)?.supersedes).toBe(first.memory.id);
     }
   });
+
+  it('correct() cannot be swallowed by near-deduplication', async () => {
+    const first = await memory.remember({
+      scope: 'user',
+      kind: 'preference',
+      content: 'Preference = A',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+    if (first.status !== 'stored') throw new Error('setup failed');
+
+    const corrected = await memory.correct(first.memory.id, 'Preference = B');
+
+    expect(corrected.status).toBe('stored');
+    if (corrected.status === 'stored') {
+      expect(corrected.supersededId).toBe(first.memory.id);
+      expect(memory.get(first.memory.id)?.status).toBe('superseded');
+    }
+  });
 });
 
 describe('deduplication', () => {
+  it('keeps identical content under distinct structured identities', async () => {
+    const first = await memory.remember({
+      scope: 'user',
+      kind: 'fact',
+      subject: 'editor.primary',
+      content: 'Neovim',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+    const second = await memory.remember({
+      scope: 'user',
+      kind: 'preference',
+      subject: 'editor.preferred',
+      content: 'Neovim',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+    expect(first.status).toBe('stored');
+    expect(second.status).toBe('stored');
+  });
+
+  it('correction supersedes its target even when the new content already exists', async () => {
+    const target = await memory.remember({
+      scope: 'user',
+      kind: 'fact',
+      content: 'Editor A',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+    await memory.remember({
+      scope: 'user',
+      kind: 'fact',
+      content: 'Editor B',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+    if (target.status !== 'stored') throw new Error('setup failed');
+
+    const corrected = await memory.correct(target.memory.id, 'Editor B');
+    expect(corrected.status).toBe('stored');
+    expect(memory.get(target.memory.id)?.status).toBe('superseded');
+  });
+
   it('does not grow storage when the same fact is asserted repeatedly', async () => {
     const content = 'The Jarvis orchestrator listens on port 4319 by default.';
     for (let i = 0; i < 6; i++) {
@@ -320,7 +417,10 @@ describe('expiry', () => {
       explicit: true,
       validUntil: past,
     });
-    const results = await memory.retrieve({ query: 'holiday sprint', scopes: [{ scope: 'user', scopeId: null }] });
+    const results = await memory.retrieve({
+      query: 'holiday sprint',
+      scopes: [{ scope: 'user', scopeId: null }],
+    });
     expect(results).toHaveLength(0);
 
     expect(memory.expireStale()).toBe(1);
@@ -337,7 +437,10 @@ describe('expiry', () => {
       explicit: true,
       validFrom: future,
     });
-    const now = await memory.retrieve({ query: 'dependency upgrades freeze', scopes: [{ scope: 'user', scopeId: null }] });
+    const now = await memory.retrieve({
+      query: 'dependency upgrades freeze',
+      scopes: [{ scope: 'user', scopeId: null }],
+    });
     expect(now).toHaveLength(0);
 
     const later = await memory.retrieve({
@@ -502,11 +605,29 @@ describe('secret handling', () => {
       scope: 'project',
       scopeId: PROJECT_A,
       kind: 'project_knowledge',
-      content: 'The auth module validates tokens with the provider SDK; secrets live in the OS keychain.',
+      content:
+        'The auth module validates tokens with the provider SDK; secrets live in the OS keychain.',
       sourceType: 'user_explicit',
       explicit: true,
     });
     expect(outcome.status).toBe('stored');
+  });
+
+  it.each([
+    { subject: 'password = SuperSecret123!' },
+    { sourceRef: { note: 'ghp_abcdefghijklmnopqrstuvwxyz0123456789' } },
+    { metadata: { token: 'sk-ant-api03-QQQQwwwweeeerrrrttttyyyyuuuuiiiioooo' } },
+  ])('rejects credentials anywhere in the persisted envelope: %o', async (extra) => {
+    const outcome = await memory.remember({
+      scope: 'user',
+      kind: 'fact',
+      content: 'This otherwise harmless memory must not be stored.',
+      sourceType: 'user_explicit',
+      explicit: true,
+      ...extra,
+    });
+    expect(outcome.status).toBe('rejected');
+    if (outcome.status === 'rejected') expect(outcome.reason).toBe('secret_detected');
   });
 });
 
@@ -554,7 +675,11 @@ describe('context pack budgeting', () => {
     }
 
     const budget = 400;
-    const builder = new ContextPackBuilder(db, memory, loadConfig({ home, context: { ...config.context, budgetTokens: budget } }));
+    const builder = new ContextPackBuilder(
+      db,
+      memory,
+      loadConfig({ home, context: { ...config.context, budgetTokens: budget } }),
+    );
     const pack = await builder.build({
       role: 'implementer',
       query: 'scheduler queue',
@@ -595,6 +720,25 @@ describe('context pack budgeting', () => {
     const stored = builder.getPack(pack.id);
     expect(stored?.selections.length).toBe(pack.selections.length);
     expect(stored?.jobId).toBe('job_abc');
+  });
+
+  it('injects each memory id at most once across context sections', async () => {
+    await memory.remember({
+      scope: 'user',
+      kind: 'preference',
+      subject: 'preference.editor',
+      content: 'The user prefers Neovim for editing code.',
+      sourceType: 'user_explicit',
+      explicit: true,
+    });
+    const pack = await new ContextPackBuilder(db, memory, config).build({
+      role: 'implementer',
+      query: 'preferred code editor Neovim',
+    });
+    const ids = pack.selections.map((selection) => selection.memoryId);
+
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(pack.rendered.match(/Neovim/g)).toHaveLength(1);
   });
 
   it('never includes an unrelated project in the pack', async () => {
@@ -647,7 +791,10 @@ describe('embedding lifecycle', () => {
     expect(calls).toBe(1);
 
     // Changing the text does require a fresh vector.
-    const changed = { ...stored.memory, content: 'Something entirely different about browser caching.' };
+    const changed = {
+      ...stored.memory,
+      content: 'Something entirely different about browser caching.',
+    };
     await service.indexEmbedding(changed);
     expect(calls).toBe(2);
   });
@@ -663,7 +810,13 @@ describe('embedding lifecycle', () => {
       embedQuery: async () => {
         throw new Error('onnx runtime unavailable');
       },
-      status: () => ({ enabled: true, ready: false, model: 'broken', dim: 8, error: 'onnx runtime unavailable' }),
+      status: () => ({
+        enabled: true,
+        ready: false,
+        model: 'broken',
+        dim: 8,
+        error: 'onnx runtime unavailable',
+      }),
     };
     const service = new MemoryService({ db, bus, config, embeddings: broken });
 
@@ -803,8 +956,12 @@ describe('semantic calibration', () => {
   });
 
   it('falls back to the absolute floor with too few candidates for statistics', () => {
-    expect(calibrateSemantic([{ id: 'a', sim: 0.9 }], { absoluteFloor: 0.2, margin: 0.06 }).has('a')).toBe(true);
-    expect(calibrateSemantic([{ id: 'a', sim: 0.05 }], { absoluteFloor: 0.2, margin: 0.06 }).has('a')).toBe(false);
+    expect(
+      calibrateSemantic([{ id: 'a', sim: 0.9 }], { absoluteFloor: 0.2, margin: 0.06 }).has('a'),
+    ).toBe(true);
+    expect(
+      calibrateSemantic([{ id: 'a', sim: 0.05 }], { absoluteFloor: 0.2, margin: 0.06 }).has('a'),
+    ).toBe(false);
   });
 
   it('never emits a score outside 0..1', () => {

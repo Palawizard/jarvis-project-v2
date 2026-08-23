@@ -22,10 +22,26 @@ export {
   type EmbeddingStatus,
 } from './memory/embeddings.js';
 
-export { ContextPackBuilder, estimateTokens, type ContextPack, type ContextSelection } from './context/pack.js';
+export {
+  ContextPackBuilder,
+  estimateTokens,
+  type ContextPack,
+  type ContextSelection,
+} from './context/pack.js';
 
-export { ProjectService, detectStack, type Project, type ProjectCommands, type ProjectStack } from './projects/service.js';
-export { SessionService, type Session, type SessionState, type Message } from './sessions/service.js';
+export {
+  ProjectService,
+  detectStack,
+  type Project,
+  type ProjectCommands,
+  type ProjectStack,
+} from './projects/service.js';
+export {
+  SessionService,
+  type Session,
+  type SessionState,
+  type Message,
+} from './sessions/service.js';
 
 export { JobService, normaliseGoal, type Job, type AgentRun } from './jobs/service.js';
 export {
@@ -47,12 +63,34 @@ export { CodexProvider } from './agents/codex.js';
 export { extractMemoryProposals, MEMORY_PROPOSAL_INSTRUCTIONS } from './agents/proposals.js';
 export * from './agents/types.js';
 
-export { GitWorkspace, repoStatus, GitError, type RepoStatus, type Worktree } from './git/workspace.js';
-export { VerificationEngine, type VerificationReport, type VerificationResult } from './verification/engine.js';
-export { ReviewEngine, parseReviewOutput, type Review, type ReviewFinding } from './review/engine.js';
+export {
+  GitWorkspace,
+  repoStatus,
+  GitError,
+  type RepoStatus,
+  type Worktree,
+} from './git/workspace.js';
+export {
+  VerificationEngine,
+  type VerificationReport,
+  type VerificationResult,
+} from './verification/engine.js';
+export {
+  ReviewEngine,
+  parseReviewOutput,
+  type Review,
+  type ReviewFinding,
+} from './review/engine.js';
 export { VisualQaEngine, startDevServer, type VisualQaShot } from './visualqa/engine.js';
 
-export { ToolRegistry, riskExceeds, ToolPermissionError, type RiskLevel, type ToolDefinition, type ToolContext } from './tools/registry.js';
+export {
+  ToolRegistry,
+  riskExceeds,
+  ToolPermissionError,
+  type RiskLevel,
+  type ToolDefinition,
+  type ToolContext,
+} from './tools/registry.js';
 export { registerBuiltinTools } from './tools/builtin.js';
 
 export { createLogger } from './logger.js';

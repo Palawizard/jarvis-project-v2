@@ -2,7 +2,13 @@ import type { Db } from '../db/index.js';
 import { parseJson } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
-import { assertTransition, isTerminal, statusForStage, type JobStage, type JobStatus } from './machine.js';
+import {
+  assertTransition,
+  isTerminal,
+  statusForStage,
+  type JobStage,
+  type JobStatus,
+} from './machine.js';
 
 export interface Job {
   id: string;
@@ -182,7 +188,8 @@ export class JobService {
     const now = nowIso();
     const status = statusForStage(to);
     const next = { ...job, ...patch, stage: to, status, updatedAt: now };
-    const finishedAt = isTerminal(to) && to !== 'awaiting_user' ? now : (patch.finishedAt ?? job.finishedAt);
+    const finishedAt =
+      isTerminal(to) && to !== 'awaiting_user' ? now : (patch.finishedAt ?? job.finishedAt);
 
     this.db
       .prepare(
@@ -213,7 +220,8 @@ export class JobService {
       payload: { from: job.stage, to, status },
     });
     if (to === 'completed') this.bus.emit({ type: 'job.completed', jobId: id, payload: {} });
-    if (to === 'failed') this.bus.emit({ type: 'job.failed', jobId: id, payload: { error: next.error } });
+    if (to === 'failed')
+      this.bus.emit({ type: 'job.failed', jobId: id, payload: { error: next.error } });
     if (to === 'cancelled') this.bus.emit({ type: 'job.cancelled', jobId: id, payload: {} });
 
     return { ...next, finishedAt };
@@ -276,7 +284,17 @@ export class JobService {
         `INSERT INTO agent_runs (id, job_id, provider, model, role, cwd, status, context_pack_id, started_at)
          VALUES (?,?,?,?,?,?,?,?,?)`,
       )
-      .run(run.id, run.jobId, run.provider, run.model, run.role, run.cwd, run.status, run.contextPackId, run.startedAt);
+      .run(
+        run.id,
+        run.jobId,
+        run.provider,
+        run.model,
+        run.role,
+        run.cwd,
+        run.status,
+        run.contextPackId,
+        run.startedAt,
+      );
     this.bus.emit({
       type: 'agent.started',
       jobId: input.jobId,
@@ -329,7 +347,9 @@ export class JobService {
     const now = nowIso();
     const runs = Number(
       this.db
-        .prepare(`UPDATE agent_runs SET status='interrupted', error=?, ended_at=? WHERE status='running'`)
+        .prepare(
+          `UPDATE agent_runs SET status='interrupted', error=?, ended_at=? WHERE status='running'`,
+        )
         .run('orchestrator restarted while this run was in flight', now).changes,
     );
     const stale = this.db
@@ -337,8 +357,15 @@ export class JobService {
       .all() as Array<{ id: string; stage: JobStage }>;
     for (const job of stale) {
       this.db
-        .prepare(`UPDATE jobs SET stage='failed', status='failed', error=?, updated_at=?, finished_at=? WHERE id=?`)
-        .run(`Orchestrator restarted during stage "${job.stage}". Worktree preserved; re-run to continue.`, now, now, job.id);
+        .prepare(
+          `UPDATE jobs SET stage='failed', status='failed', error=?, updated_at=?, finished_at=? WHERE id=?`,
+        )
+        .run(
+          `Orchestrator restarted during stage "${job.stage}". Worktree preserved; re-run to continue.`,
+          now,
+          now,
+          job.id,
+        );
       this.bus.emit({
         type: 'system.recovery',
         jobId: job.id,

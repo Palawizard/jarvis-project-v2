@@ -7,6 +7,7 @@ import { loadConfig } from '../config.js';
 import { EventBus } from '../events/bus.js';
 import { JobService, normaliseGoal } from './service.js';
 import { ProjectService } from '../projects/service.js';
+import { candidateRejectionReason } from './pipeline.js';
 import {
   canTransition,
   assertTransition,
@@ -16,9 +17,37 @@ import {
   type JobStage,
 } from './machine.js';
 
+describe('candidate acceptance gate', () => {
+  it('only exposes verified, independently approved candidates', () => {
+    expect(
+      candidateRejectionReason({ passed: true, ran: 1, failureSummary: '' }, 'approve'),
+    ).toBeNull();
+    expect(
+      candidateRejectionReason(
+        { passed: false, ran: 1, failureSummary: 'tests failed' },
+        'approve',
+      ),
+    ).toContain('verification failed');
+    expect(
+      candidateRejectionReason({ passed: true, ran: 1, failureSummary: '' }, 'request_changes'),
+    ).toContain('did not approve');
+    expect(
+      candidateRejectionReason({ passed: false, ran: 0, failureSummary: '' }, 'approve'),
+    ).toContain('remains unverified');
+  });
+});
+
 describe('state machine transitions', () => {
   it('allows the happy path', () => {
-    const happy: JobStage[] = ['queued', 'planning', 'implementing', 'verifying', 'reviewing', 'visual_qa', 'awaiting_user'];
+    const happy: JobStage[] = [
+      'queued',
+      'planning',
+      'implementing',
+      'verifying',
+      'reviewing',
+      'visual_qa',
+      'awaiting_user',
+    ];
     for (let i = 0; i < happy.length - 1; i++) {
       expect(canTransition(happy[i] as JobStage, happy[i + 1] as JobStage)).toBe(true);
     }
@@ -93,7 +122,10 @@ describe('job persistence and crash recovery', () => {
     execFileSync('git', ['add', '-A'], { cwd: repo });
     execFileSync('git', ['commit', '-qm', 'init'], { cwd: repo });
 
-    const project = await new ProjectService(db).register({ rootPath: repo, name: 'recovery-test' });
+    const project = await new ProjectService(db).register({
+      rootPath: repo,
+      name: 'recovery-test',
+    });
     projectId = project.id;
   });
 
@@ -155,8 +187,17 @@ describe('job persistence and crash recovery', () => {
 
   it('persists the provider session id so a run is resumable', () => {
     const job = jobs.create({ projectId, request: 'Resumable work' });
-    const run = jobs.startRun({ jobId: job.id, provider: 'claude', role: 'implementer', cwd: home });
-    jobs.finishRun(run.id, { status: 'completed', result: 'done', externalSessionId: 'sess-abc-123' });
+    const run = jobs.startRun({
+      jobId: job.id,
+      provider: 'claude',
+      role: 'implementer',
+      cwd: home,
+    });
+    jobs.finishRun(run.id, {
+      status: 'completed',
+      result: 'done',
+      externalSessionId: 'sess-abc-123',
+    });
     expect(jobs.runs(job.id)[0]?.externalSessionId).toBe('sess-abc-123');
   });
 });

@@ -33,7 +33,8 @@ export function CommandView({
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (lastEvent?.type === 'session.updated' || lastEvent?.type.startsWith('job.')) conversation.reload();
+    if (lastEvent?.type === 'session.updated' || lastEvent?.type.startsWith('job.'))
+      conversation.reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent]);
 
@@ -67,9 +68,7 @@ export function CommandView({
         <div>
           <Card title="Conversation">
             {messages.length === 0 ? (
-              <Empty>
-                Ask Jarvis to build something, or tell it something worth remembering.
-              </Empty>
+              <Empty>Ask Jarvis to build something, or tell it something worth remembering.</Empty>
             ) : (
               <div className="chat">
                 {messages.map((m) => (
@@ -98,20 +97,30 @@ export function CommandView({
               />
               <div className="spread">
                 <span className="composer-hint">
-                  ⌘/Ctrl + Enter to send. "remember/forget/update" is handled locally — no agent quota spent.
+                  ⌘/Ctrl + Enter to send. "remember/forget/update" is handled locally — no agent
+                  quota spent.
                 </span>
-                <button className="btn primary" onClick={() => void submit()} disabled={busy || !text.trim()}>
+                <button
+                  className="btn primary"
+                  onClick={() => void submit()}
+                  disabled={busy || !text.trim()}
+                >
                   {busy ? 'Working…' : 'Send'}
                 </button>
               </div>
-              {error && <div className="small" style={{ color: 'var(--err)' }}>{error}</div>}
+              {error && (
+                <div className="small" style={{ color: 'var(--err)' }}>
+                  {error}
+                </div>
+              )}
             </div>
           </Card>
         </div>
 
         <div>
           <Card title="Session working memory">
-            {!state || (!state.goal && state.constraints.length === 0 && state.decisions.length === 0) ? (
+            {!state ||
+            (!state.goal && state.constraints.length === 0 && state.decisions.length === 0) ? (
               <div className="small faint">
                 Empty. This is Layer 1 — a compact structured state, never a transcript.
               </div>
@@ -123,13 +132,25 @@ export function CommandView({
                   </Field>
                 )}
                 {state.constraints.length > 0 && (
-                  <Field label="Constraints">{state.constraints.map((x, i) => <div key={i}>{x}</div>)}</Field>
+                  <Field label="Constraints">
+                    {state.constraints.map((x, i) => (
+                      <div key={i}>{x}</div>
+                    ))}
+                  </Field>
                 )}
                 {state.decisions.length > 0 && (
-                  <Field label="Decisions">{state.decisions.map((x, i) => <div key={i}>{x}</div>)}</Field>
+                  <Field label="Decisions">
+                    {state.decisions.map((x, i) => (
+                      <div key={i}>{x}</div>
+                    ))}
+                  </Field>
                 )}
                 {state.unresolved.length > 0 && (
-                  <Field label="Open">{state.unresolved.map((x, i) => <div key={i}>{x}</div>)}</Field>
+                  <Field label="Open">
+                    {state.unresolved.map((x, i) => (
+                      <div key={i}>{x}</div>
+                    ))}
+                  </Field>
                 )}
                 {state.activeJobIds.length > 0 && (
                   <Field label="Active jobs">

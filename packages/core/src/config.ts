@@ -97,8 +97,7 @@ function envBool(name: string, fallback: boolean): boolean {
 let cached: JarvisConfig | undefined;
 
 export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig {
-  const home =
-    overrides.home ?? process.env.JARVIS_HOME ?? path.join(os.homedir(), '.jarvis');
+  const home = overrides.home ?? process.env.JARVIS_HOME ?? path.join(os.homedir(), '.jarvis');
 
   const config: JarvisConfig = {
     home,
@@ -111,7 +110,8 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
     agents: {
       claudeModel: process.env.JARVIS_CLAUDE_MODEL || 'sonnet',
       claudePermissionMode:
-        (process.env.JARVIS_CLAUDE_PERMISSION_MODE as JarvisConfig['agents']['claudePermissionMode']) ||
+        (process.env
+          .JARVIS_CLAUDE_PERMISSION_MODE as JarvisConfig['agents']['claudePermissionMode']) ||
         'acceptEdits',
       codexModel: process.env.JARVIS_CODEX_MODEL || undefined,
       runTimeoutMs: envInt('JARVIS_AGENT_TIMEOUT_MS', 30 * 60_000),
@@ -129,7 +129,13 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
     },
     context: {
       budgetTokens: envInt('JARVIS_CONTEXT_BUDGET_TOKENS', 2400),
-      sectionShare: { coreUser: 0.15, projectSnapshot: 0.2, memories: 0.35, episodes: 0.2, session: 0.1 },
+      sectionShare: {
+        coreUser: 0.15,
+        projectSnapshot: 0.2,
+        memories: 0.35,
+        episodes: 0.2,
+        session: 0.1,
+      },
     },
     pipeline: {
       maxFixCycles: envInt('JARVIS_MAX_FIX_CYCLES', 1),

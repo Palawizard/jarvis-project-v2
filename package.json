@@ -12,7 +12,7 @@
     "dev:orchestrator": "pnpm --filter @jarvis/orchestrator dev",
     "dev:web": "pnpm --filter @jarvis/web dev",
     "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm --filter @jarvis/core build && pnpm -r typecheck",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
@@ -21,14 +21,14 @@
     "test:integration": "vitest run --project integration",
     "test:all": "vitest run",
     "test:e2e": "playwright test",
-    "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:all && pnpm build",
-    "jarvis": "node --experimental-strip-types --no-warnings packages/core/src/cli.ts"
+    "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:all && pnpm build"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
     "@playwright/test": "^1.57.0",
     "@types/node": "^22.19.2",
     "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "prettier": "^3.6.2",
     "tsx": "^4.20.7",
     "typescript": "^5.9.3",

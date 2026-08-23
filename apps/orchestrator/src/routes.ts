@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import {
   detectExplicitCommand,
+  GitWorkspace,
   normaliseGoal,
   renderProjectSnapshot,
   PIPELINE_STAGES,
@@ -12,12 +13,28 @@ import {
   type MemoryScope,
 } from '@jarvis/core';
 
+const MEMORY_SCOPES = new Set<MemoryScope>(['user', 'project', 'session', 'agent', 'procedure']);
+const MEMORY_KINDS = new Set<MemoryKind>([
+  'preference',
+  'fact',
+  'constraint',
+  'decision',
+  'project_knowledge',
+  'episode',
+  'procedure',
+  'unresolved',
+  'correction',
+  'other',
+]);
+const MEMORY_STATUSES = new Set<string>(['active', 'superseded', 'expired', 'deleted', 'all']);
+
 /**
  * HTTP surface. Thin on purpose: every route delegates to a core service, so the
  * API can be replaced (or joined by a CLI / MCP server) without touching domain logic.
  */
 export function createRoutes(jarvis: Jarvis): Hono {
   const app = new Hono();
+  const git = new GitWorkspace(jarvis.config.worktreesDir);
 
   const fail = (message: string, status = 400) => Response.json({ error: message }, { status });
 
@@ -42,23 +59,33 @@ export function createRoutes(jarvis: Jarvis): Hono {
     streamSSE(c, async (stream) => {
       const afterId = Number(c.req.query('afterId') ?? '0');
       let lastId = Number.isFinite(afterId) ? afterId : 0;
-
-      for (const event of jarvis.bus.list({ afterId: lastId, limit: 200 })) {
-        lastId = event.id ?? lastId;
-        await stream.writeSSE({ id: String(lastId), event: event.type, data: JSON.stringify(event) });
-      }
-
       const queue: string[] = [];
       const unsubscribe = jarvis.bus.on((event) => {
         queue.push(JSON.stringify(event));
       });
 
       try {
+        // Subscribe before replay so an event emitted between the SELECT and
+        // listener registration cannot disappear. Page through the full gap;
+        // the cursor de-duplicates events also seen by the live listener.
+        for (;;) {
+          const replay = jarvis.bus.list({ afterId: lastId, limit: 500 });
+          for (const event of replay) {
+            lastId = event.id ?? lastId;
+            await stream.writeSSE({ id: String(lastId), data: JSON.stringify(event) });
+          }
+          if (replay.length < 500) break;
+        }
+
         while (!stream.closed) {
           const next = queue.shift();
           if (next) {
             const parsed = JSON.parse(next) as { id?: number; type: string };
-            await stream.writeSSE({ id: String(parsed.id ?? ''), event: parsed.type, data: next });
+            if (parsed.id && parsed.id <= lastId) continue;
+            lastId = parsed.id ?? lastId;
+            // Default SSE messages are intentionally unnamed: EventSource's
+            // onmessage receives every normalized Jarvis event.
+            await stream.writeSSE({ id: String(parsed.id ?? ''), data: next });
           } else {
             // Comment frames keep proxies from closing an idle connection.
             await stream.writeSSE({ data: '', event: 'ping' });
@@ -75,7 +102,11 @@ export function createRoutes(jarvis: Jarvis): Hono {
   app.get('/api/projects', (c) => c.json(jarvis.projects.list()));
 
   app.post('/api/projects', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { rootPath?: string; name?: string; devUrl?: string };
+    const body = (await c.req.json().catch(() => ({}))) as {
+      rootPath?: string;
+      name?: string;
+      devUrl?: string;
+    };
     if (!body.rootPath) return fail('rootPath is required');
     try {
       const project = await jarvis.projects.register({
@@ -162,7 +193,9 @@ export function createRoutes(jarvis: Jarvis): Hono {
     const text = body.text?.trim();
     if (!text) return fail('text is required');
 
-    const session = body.sessionId ? jarvis.sessions.get(body.sessionId) : jarvis.sessions.current();
+    const session = body.sessionId
+      ? jarvis.sessions.get(body.sessionId)
+      : jarvis.sessions.current();
     if (!session) return fail('session not found', 404);
     jarvis.sessions.addMessage(session.id, 'user', text);
 
@@ -237,7 +270,9 @@ export function createRoutes(jarvis: Jarvis): Hono {
             sourceRef: { sessionId: session.id },
             explicit: true,
           });
-      const reply = target ? 'Updated — the previous version is kept as superseded.' : 'Noted as a new memory.';
+      const reply = target
+        ? 'Updated — the previous version is kept as superseded.'
+        : 'Noted as a new memory.';
       jarvis.sessions.addMessage(session.id, 'assistant', reply);
       return c.json({ kind: 'memory', action: 'update', outcome, reply });
     }
@@ -283,16 +318,28 @@ export function createRoutes(jarvis: Jarvis): Hono {
     return c.json(job, 201);
   });
 
-  app.get('/api/jobs/:id', (c) => {
+  app.get('/api/jobs/:id', async (c) => {
     const job = jarvis.jobs.get(c.req.param('id'));
     if (!job) return fail('job not found', 404);
     const runs = jarvis.jobs.runs(job.id);
     const packIds = [...new Set(runs.map((r) => r.contextPackId).filter(Boolean))] as string[];
+    const running = jarvis.pipeline.isRunning(job.id);
+    const terminal = ['awaiting_user', 'completed', 'failed', 'cancelled'].includes(job.stage);
+    let candidate: Awaited<ReturnType<GitWorkspace['collectChanges']>> | null = null;
+    if (
+      (terminal || !running) &&
+      job.worktreePath &&
+      job.baseRef &&
+      fs.existsSync(job.worktreePath)
+    ) {
+      candidate = await git.collectChanges(job.worktreePath, job.baseRef).catch(() => null);
+    }
     return c.json({
       job,
       stages: PIPELINE_STAGES,
-      running: jarvis.pipeline.isRunning(job.id),
+      running,
       runs,
+      candidate,
       verifications: jarvis.verification.list(job.id),
       reviews: jarvis.review.list(job.id),
       visualQa: jarvis.visualQa.list(job.id),
@@ -317,25 +364,45 @@ export function createRoutes(jarvis: Jarvis): Hono {
   });
 
   /** User accepts the candidate. V1 never auto-merges; this only records the decision. */
-  app.post('/api/jobs/:id/accept', (c) => {
+  app.post('/api/jobs/:id/accept', async (c) => {
     const job = jarvis.jobs.get(c.req.param('id'));
     if (!job) return fail('job not found', 404);
     if (job.stage !== 'awaiting_user') return fail(`job is ${job.stage}, not awaiting_user`, 409);
+    if (!job.worktreePath || !job.baseRef || !job.headRef || !fs.existsSync(job.worktreePath)) {
+      return fail('candidate worktree or reviewed identity is unavailable', 409);
+    }
+    try {
+      await git.validateCandidate(job.worktreePath, job.baseRef, job.headRef);
+    } catch (error) {
+      return fail(
+        `candidate no longer matches the reviewed identity: ${error instanceof Error ? error.message : String(error)}`,
+        409,
+      );
+    }
     return c.json(jarvis.jobs.transition(job.id, 'completed'));
   });
 
   // ------------------------------------------------------------------ memory --
   app.get('/api/memory', (c) => {
     const q = c.req.query();
+    if (q.scope && !MEMORY_SCOPES.has(q.scope as MemoryScope)) return fail('invalid scope');
+    if (q.kind && !MEMORY_KINDS.has(q.kind as MemoryKind)) return fail('invalid kind');
+    if (q.status && !MEMORY_STATUSES.has(q.status)) return fail('invalid status');
+    const limit = Math.min(200, Math.max(1, Number.parseInt(q.limit ?? '100', 10) || 100));
+    const offset = Math.max(0, Number.parseInt(q.offset ?? '0', 10) || 0);
     return c.json(
       jarvis.memory.list({
         ...(q.scope ? { scope: q.scope as MemoryScope } : {}),
         ...(q.scopeId ? { scopeId: q.scopeId } : {}),
         ...(q.kind ? { kind: q.kind as MemoryKind } : {}),
-        ...(q.status ? { status: q.status as 'active' | 'all' } : {}),
+        ...(q.status
+          ? {
+              status: q.status as 'active' | 'superseded' | 'expired' | 'deleted' | 'all',
+            }
+          : {}),
         ...(q.search ? { search: q.search } : {}),
-        limit: Number(q.limit ?? 100),
-        offset: Number(q.offset ?? 0),
+        limit,
+        offset,
       }),
     );
   });
@@ -347,13 +414,18 @@ export function createRoutes(jarvis: Jarvis): Hono {
       limit?: number;
     };
     if (!body.query) return fail('query is required');
+    if (body.limit !== undefined && (!Number.isInteger(body.limit) || body.limit < 1)) {
+      return fail('limit must be a positive integer');
+    }
+    if (body.projectId && !jarvis.projects.get(body.projectId))
+      return fail('project not found', 404);
     const results = await jarvis.memory.retrieve({
       query: body.query,
       scopes: [
         { scope: 'user', scopeId: null },
         ...(body.projectId ? [{ scope: 'project' as MemoryScope, scopeId: body.projectId }] : []),
       ],
-      limit: body.limit ?? 12,
+      limit: Math.min(body.limit ?? 12, 50),
     });
     return c.json(results);
   });
@@ -368,10 +440,24 @@ export function createRoutes(jarvis: Jarvis): Hono {
       importance?: number;
     };
     if (!body.content) return fail('content is required');
+    const scope = body.scope ?? 'user';
+    const kind = body.kind ?? 'fact';
+    if (!MEMORY_SCOPES.has(scope)) return fail('invalid scope');
+    if (!MEMORY_KINDS.has(kind)) return fail('invalid kind');
+    if (scope !== 'user' && !body.scopeId) return fail(`${scope} scope requires scopeId`);
+    if (scope === 'project' && !jarvis.projects.get(body.scopeId ?? '')) {
+      return fail('project not found', 404);
+    }
+    if (
+      body.importance !== undefined &&
+      (!Number.isFinite(body.importance) || body.importance < 0 || body.importance > 1)
+    ) {
+      return fail('importance must be between 0 and 1');
+    }
     const outcome = await jarvis.memory.remember({
-      scope: body.scope ?? 'user',
+      scope,
       scopeId: body.scopeId ?? null,
-      kind: body.kind ?? 'fact',
+      kind,
       subject: body.subject ?? null,
       content: body.content,
       ...(body.importance !== undefined ? { importance: body.importance } : {}),
@@ -393,11 +479,18 @@ export function createRoutes(jarvis: Jarvis): Hono {
 
   app.patch('/api/memory/:id', async (c) => {
     const id = c.req.param('id');
-    const body = (await c.req.json().catch(() => ({}))) as { pinned?: boolean; content?: string };
+    const body = (await c.req.json().catch(() => ({}))) as {
+      pinned?: unknown;
+      content?: unknown;
+    };
     if (body.pinned !== undefined) {
+      if (typeof body.pinned !== 'boolean') return fail('pinned must be boolean');
       if (!jarvis.memory.setPinned(id, body.pinned)) return fail('memory not found', 404);
     }
-    if (body.content) {
+    if (body.content !== undefined) {
+      if (typeof body.content !== 'string' || !body.content.trim()) {
+        return fail('content must be a non-empty string');
+      }
       const outcome = await jarvis.memory.correct(id, body.content);
       return c.json(outcome, outcome.status === 'rejected' ? 422 : 200);
     }
@@ -406,7 +499,9 @@ export function createRoutes(jarvis: Jarvis): Hono {
 
   app.delete('/api/memory/:id', (c) => {
     const hard = c.req.query('hard') === 'true';
-    const ok = hard ? jarvis.memory.purge(c.req.param('id')) : jarvis.memory.forget(c.req.param('id'));
+    const ok = hard
+      ? jarvis.memory.purge(c.req.param('id'))
+      : jarvis.memory.forget(c.req.param('id'));
     if (!ok) return fail('memory not found', 404);
     return c.json({ deleted: true, mode: hard ? 'hard' : 'soft' });
   });
@@ -448,8 +543,15 @@ export function createRoutes(jarvis: Jarvis): Hono {
     if (target !== root && !target.startsWith(root + path.sep)) return fail('forbidden', 403);
     if (!fs.existsSync(target) || !fs.statSync(target).isFile()) return fail('not found', 404);
     const ext = path.extname(target).toLowerCase();
-    const type = ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'text/plain';
-    return new Response(fs.readFileSync(target) as unknown as BodyInit, { headers: { 'content-type': type } });
+    const type =
+      ext === '.png'
+        ? 'image/png'
+        : ext === '.jpg' || ext === '.jpeg'
+          ? 'image/jpeg'
+          : 'text/plain';
+    return new Response(fs.readFileSync(target) as unknown as BodyInit, {
+      headers: { 'content-type': type },
+    });
   });
 
   // ------------------------------------------------------------------- tools --

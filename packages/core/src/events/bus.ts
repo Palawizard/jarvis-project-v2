@@ -94,7 +94,9 @@ export class EventBus {
   }
 
   /** Replay persisted events, optionally after a cursor id. Used by SSE reconnects. */
-  list(opts: { jobId?: string; sessionId?: string; afterId?: number; limit?: number } = {}): JarvisEvent[] {
+  list(
+    opts: { jobId?: string; sessionId?: string; afterId?: number; limit?: number } = {},
+  ): JarvisEvent[] {
     const where: string[] = [];
     const params: (string | number)[] = [];
     if (opts.jobId) {

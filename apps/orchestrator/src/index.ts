@@ -21,7 +21,10 @@ async function main(): Promise<void> {
 
   const app = new Hono();
   // The UI dev server runs on a different port; the API is bound to localhost only.
-  app.use('/api/*', cors({ origin: (origin) => (origin?.startsWith('http://localhost') ? origin : null) }));
+  app.use(
+    '/api/*',
+    cors({ origin: (origin) => (origin?.startsWith('http://localhost') ? origin : null) }),
+  );
   app.route('/', createRoutes(jarvis));
 
   // Serve the built UI when it exists, so `pnpm build && node dist` is a single process.
@@ -30,9 +33,10 @@ async function main(): Promise<void> {
     app.get('*', (c) => {
       const requested = c.req.path === '/' ? '/index.html' : c.req.path;
       const target = path.resolve(webDist, `.${requested}`);
-      const file = target.startsWith(webDist) && fs.existsSync(target) && fs.statSync(target).isFile()
-        ? target
-        : path.join(webDist, 'index.html');
+      const file =
+        target.startsWith(webDist) && fs.existsSync(target) && fs.statSync(target).isFile()
+          ? target
+          : path.join(webDist, 'index.html');
       const ext = path.extname(file);
       const types: Record<string, string> = {
         '.html': 'text/html',
@@ -47,8 +51,27 @@ async function main(): Promise<void> {
     });
   }
 
-  const server = serve({ fetch: app.fetch, port: jarvis.config.port, hostname: '127.0.0.1' }, (info) => {
-    log.info(`Jarvis orchestrator listening on http://127.0.0.1:${info.port}`);
+  const server = serve(
+    { fetch: app.fetch, port: jarvis.config.port, hostname: '127.0.0.1' },
+    (info) => {
+      log.info(`Jarvis orchestrator listening on http://127.0.0.1:${info.port}`);
+    },
+  );
+
+  // A failed bind must be fatal and loud. Otherwise a stale instance keeps
+  // serving the old build while the new process lingers, and every request
+  // silently hits code you think you replaced.
+  server.on('error', (error: NodeJS.ErrnoException) => {
+    if (error.code === 'EADDRINUSE') {
+      log.error(
+        `port ${jarvis.config.port} is already in use — another Jarvis orchestrator is running. ` +
+          `Stop it first, or set JARVIS_PORT to a free port.`,
+      );
+    } else {
+      log.error('server error', { error: error.message });
+    }
+    jarvis.close();
+    process.exit(1);
   });
 
   const shutdown = (signal: string) => {

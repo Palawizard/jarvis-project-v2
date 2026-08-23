@@ -31,6 +31,8 @@ const STEP_ORDER: (keyof ProjectCommands)[] = ['format', 'lint', 'typecheck', 't
 
 const MAX_STORED_OUTPUT = 8000;
 const STEP_TIMEOUT_MS = 15 * 60_000;
+/** Dependency installs are slower than any single check and worth their own budget. */
+const INSTALL_TIMEOUT_MS = 20 * 60_000;
 
 /**
  * Deterministic verification.
@@ -60,13 +62,27 @@ export class VerificationEngine {
     const logDir = path.join(this.artifactsDir, opts.jobId, `verify-${cycle}`);
     fs.mkdirSync(logDir, { recursive: true });
 
+    // A git worktree is a fresh checkout with no node_modules, so every command
+    // below would fail with "module not found" and look like a broken change.
+    // Install once per worktree, and only when the deps are actually missing.
+    const steps: Array<{ name: string; command: string; timeoutMs: number }> = [];
+    if (opts.commands.install && needsInstall(opts.cwd)) {
+      steps.push({
+        name: 'install',
+        command: opts.commands.install,
+        timeoutMs: INSTALL_TIMEOUT_MS,
+      });
+    }
     for (const name of STEP_ORDER) {
       const command = opts.commands[name];
-      if (!command) continue;
+      if (command) steps.push({ name, command, timeoutMs: STEP_TIMEOUT_MS });
+    }
+
+    for (const { name, command, timeoutMs } of steps) {
       if (opts.signal?.aborted) break;
 
       const started = Date.now();
-      const outcome = await runCommand(command, opts.cwd, STEP_TIMEOUT_MS, opts.signal);
+      const outcome = await runCommand(command, opts.cwd, timeoutMs, opts.signal);
       const durationMs = Date.now() - started;
 
       const outputPath = path.join(logDir, `${name}.log`);
@@ -80,7 +96,10 @@ export class VerificationEngine {
         status: outcome.startFailed ? 'error' : outcome.exitCode === 0 ? 'passed' : 'failed',
         exitCode: outcome.exitCode,
         // Keep the tail: test runners put the failure summary at the end.
-        output: fullOutput.length > MAX_STORED_OUTPUT ? `...\n${fullOutput.slice(-MAX_STORED_OUTPUT)}` : fullOutput,
+        output:
+          fullOutput.length > MAX_STORED_OUTPUT
+            ? `...\n${fullOutput.slice(-MAX_STORED_OUTPUT)}`
+            : fullOutput,
         outputPath,
         durationMs,
       };
@@ -111,19 +130,33 @@ export class VerificationEngine {
         jobId: opts.jobId,
         payload: { name, status: result.status, exitCode: result.exitCode, durationMs },
       });
+
+      // If dependencies could not be installed, every later check would fail for
+      // the same reason. Stop and report the real cause instead of a cascade.
+      if (name === 'install' && result.status !== 'passed') break;
     }
 
-    const passed = results.every((r) => r.status === 'passed');
+    // `install` is setup, not evidence: it must not make an unverified change
+    // look verified, so it is excluded from the pass decision and the count.
+    const checks = results.filter((r) => r.name !== 'install');
+    const installFailed = results.some((r) => r.name === 'install' && r.status !== 'passed');
+    const passed =
+      !installFailed && checks.length > 0 && checks.every((r) => r.status === 'passed');
     const report: VerificationReport = {
       results,
       passed,
-      ran: results.length,
+      ran: checks.length,
       failureSummary: summariseFailures(results),
     };
     this.bus?.emit({
       type: 'verification.completed',
       jobId: opts.jobId,
-      payload: { cycle, passed, ran: results.length, steps: results.map((r) => ({ name: r.name, status: r.status })) },
+      payload: {
+        cycle,
+        passed,
+        ran: checks.length,
+        steps: results.map((r) => ({ name: r.name, status: r.status })),
+      },
     });
     return report;
   }
@@ -143,6 +176,17 @@ export class VerificationEngine {
       durationMs: Number(row.duration_ms),
     }));
   }
+}
+
+/**
+ * True when a JS project's dependencies are missing. Cheap existence check
+ * rather than a full integrity check: pnpm/npm are themselves idempotent and
+ * fast when everything is already present, but skipping the spawn entirely
+ * keeps repeat verification cycles quick.
+ */
+function needsInstall(cwd: string): boolean {
+  if (!fs.existsSync(path.join(cwd, 'package.json'))) return false;
+  return !fs.existsSync(path.join(cwd, 'node_modules'));
 }
 
 interface CommandOutcome {
@@ -197,7 +241,10 @@ function runCommand(
 
     const kill = () => {
       if (child.pid && process.platform === 'win32') {
-        spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+        spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+          stdio: 'ignore',
+          windowsHide: true,
+        });
       } else {
         child.kill('SIGTERM');
       }
@@ -205,7 +252,11 @@ function runCommand(
 
     const timer = setTimeout(() => {
       kill();
-      done({ exitCode: null, output: `${chunks.join('')}\n[timed out after ${timeoutMs}ms]`, startFailed: false });
+      done({
+        exitCode: null,
+        output: `${chunks.join('')}\n[timed out after ${timeoutMs}ms]`,
+        startFailed: false,
+      });
     }, timeoutMs);
 
     const onAbort = () => {
@@ -215,7 +266,11 @@ function runCommand(
     signal?.addEventListener('abort', onAbort, { once: true });
 
     child.on('error', (error) => {
-      done({ exitCode: null, output: `could not run command: ${error.message}`, startFailed: true });
+      done({
+        exitCode: null,
+        output: `could not run command: ${error.message}`,
+        startFailed: true,
+      });
     });
     child.on('close', (code) => {
       done({ exitCode: code, output: chunks.join(''), startFailed: false });

@@ -25,7 +25,10 @@ const BLOCK_RE = /```(?:json\s+)?jarvis-memory\s*\n([\s\S]*?)```/gi;
  * a malformed block yields zero proposals rather than throwing, because a bad
  * memory block must never fail an otherwise-successful job.
  */
-export function extractMemoryProposals(text: string): { proposals: MemoryProposal[]; cleanedText: string } {
+export function extractMemoryProposals(text: string): {
+  proposals: MemoryProposal[];
+  cleanedText: string;
+} {
   const proposals: MemoryProposal[] = [];
   let cleanedText = text;
 
@@ -40,8 +43,10 @@ export function extractMemoryProposals(text: string): { proposals: MemoryProposa
     }
     const items = Array.isArray(parsed)
       ? parsed
-      : typeof parsed === 'object' && parsed !== null && Array.isArray((parsed as { memories?: unknown }).memories)
-        ? ((parsed as { memories: unknown[] }).memories)
+      : typeof parsed === 'object' &&
+          parsed !== null &&
+          Array.isArray((parsed as { memories?: unknown }).memories)
+        ? (parsed as { memories: unknown[] }).memories
         : [parsed];
 
     for (const item of items) {
@@ -63,7 +68,9 @@ function validateProposal(raw: unknown): MemoryProposal | null {
 
   const type = obj.type ?? obj.kind;
   const kind = VALID_KINDS.includes(type as MemoryKind) ? (type as MemoryKind) : 'other';
-  const scope = VALID_SCOPES.includes(obj.scope as MemoryScope) ? (obj.scope as MemoryScope) : 'project';
+  const scope = VALID_SCOPES.includes(obj.scope as MemoryScope)
+    ? (obj.scope as MemoryScope)
+    : 'project';
 
   const clamp = (value: unknown, fallback: number): number => {
     const n = typeof value === 'number' ? value : Number.NaN;
@@ -73,7 +80,9 @@ function validateProposal(raw: unknown): MemoryProposal | null {
   return {
     type: kind,
     scope,
-    ...(typeof obj.subject === 'string' && obj.subject.trim() ? { subject: obj.subject.trim().slice(0, 120) } : {}),
+    ...(typeof obj.subject === 'string' && obj.subject.trim()
+      ? { subject: obj.subject.trim().slice(0, 120) }
+      : {}),
     content,
     // Agents systematically over-rate their own output; cap the self-assessment.
     importance: Math.min(0.85, clamp(obj.importance, 0.6)),

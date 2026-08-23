@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
 import { resolveCli, type ResolvedCli } from './resolve.js';
-import { runJsonlProcess } from './spawn.js';
+import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
 import type {
   AgentEvent,
   AgentProvider,
@@ -64,22 +64,34 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     try {
-      const { stdout } = await exec(cli.command, [...cli.prefixArgs, '--version'], { timeout: 30_000 });
+      const { stdout } = await exec(cli.command, [...cli.prefixArgs, '--version'], {
+        timeout: 30_000,
+      });
       base.version = stdout.trim();
     } catch (error) {
-      this.cached = { ...base, reason: `Claude Code CLI could not be executed: ${(error as Error).message}` };
+      this.cached = {
+        ...base,
+        reason: `Claude Code CLI could not be executed: ${(error as Error).message}`,
+      };
       return this.cached;
     }
 
     try {
-      const { stdout } = await exec(cli.command, [...cli.prefixArgs, 'auth', 'status'], { timeout: 45_000 });
-      const status = JSON.parse(stdout) as { loggedIn?: boolean; authMethod?: string; subscriptionType?: string };
+      const { stdout } = await exec(cli.command, [...cli.prefixArgs, 'auth', 'status'], {
+        timeout: 45_000,
+      });
+      const status = JSON.parse(stdout) as {
+        loggedIn?: boolean;
+        authMethod?: string;
+        subscriptionType?: string;
+      };
       base.authenticated = Boolean(status.loggedIn);
       if (status.authMethod) {
         base.authMethod = `${status.authMethod}${status.subscriptionType ? ` (${status.subscriptionType})` : ''}`;
       }
       base.available = base.authenticated;
-      if (!base.authenticated) base.reason = 'Claude Code is installed but not logged in. Run `claude auth login`.';
+      if (!base.authenticated)
+        base.reason = 'Claude Code is installed but not logged in. Run `claude auth login`.';
     } catch (error) {
       base.reason = `could not read Claude auth status: ${(error as Error).message}`;
     }
@@ -87,7 +99,10 @@ export class ClaudeProvider implements AgentProvider {
     return base;
   }
 
-  async run(options: AgentStartOptions, onEvent: (event: AgentEvent) => void): Promise<AgentRunResult> {
+  async run(
+    options: AgentStartOptions,
+    onEvent: (event: AgentEvent) => void,
+  ): Promise<AgentRunResult> {
     const cli = this.resolve();
     if (!cli) {
       const error = 'Claude Code CLI not found on this machine.';
@@ -96,26 +111,13 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     const model = options.model ?? this.config.agents.claudeModel;
-    const args = [
-      '-p',
-      '--output-format',
-      'stream-json',
-      // stream-json in print mode requires --verbose; the CLI errors out without it.
-      '--verbose',
-      '--model',
-      model,
-      '--permission-mode',
-      this.config.agents.claudePermissionMode,
-      '--no-chrome',
-    ];
-    if (options.resumeSessionId) args.push('--resume', options.resumeSessionId);
-    if (options.appendSystemPrompt) args.push('--append-system-prompt', options.appendSystemPrompt);
-    // No prompt argument: it goes on stdin (see spawn.ts for why).
+    const args = buildClaudeArgs(options, model, this.config.agents.claudePermissionMode);
 
     let sessionId: string | undefined;
     let finalResult = '';
     let usage: Record<string, unknown> | undefined;
     let reportedError: string | undefined;
+    let sawTerminalResult = false;
     const textChunks: string[] = [];
 
     const outcome = await runJsonlProcess({
@@ -127,6 +129,7 @@ export class ClaudeProvider implements AgentProvider {
       ...(options.signal ? { signal: options.signal } : {}),
       scope: 'claude',
       onLine: (event) => {
+        if (event.type === 'result') sawTerminalResult = true;
         const id = event.session_id as string | undefined;
         if (id) sessionId = id;
         handleClaudeEvent(event, {
@@ -150,20 +153,45 @@ export class ClaudeProvider implements AgentProvider {
     const { proposals, cleanedText } = extractMemoryProposals(raw);
 
     if (outcome.cancelled) {
-      return { status: 'cancelled', result: cleanedText, error: 'cancelled by user', memoryProposals: proposals, ...(sessionId ? { sessionId } : {}) };
+      return {
+        status: 'cancelled',
+        result: cleanedText,
+        error: 'cancelled by user',
+        memoryProposals: proposals,
+        ...(sessionId ? { sessionId } : {}),
+      };
     }
     if (outcome.timedOut) {
       const error = `agent exceeded ${options.timeoutMs ?? this.config.agents.runTimeoutMs}ms`;
       onEvent({ kind: 'failed', error });
-      return { status: 'timeout', result: cleanedText, error, memoryProposals: proposals, ...(sessionId ? { sessionId } : {}) };
+      return {
+        status: 'timeout',
+        result: cleanedText,
+        error,
+        memoryProposals: proposals,
+        ...(sessionId ? { sessionId } : {}),
+      };
     }
     if (outcome.startError) {
       const error = `could not start Claude Code: ${outcome.startError}`;
       onEvent({ kind: 'failed', error });
       return { status: 'failed', result: '', error, memoryProposals: [] };
     }
+    const protocolError = jsonlProtocolError('Claude Code', outcome, sawTerminalResult);
+    if (protocolError) {
+      onEvent({ kind: 'failed', error: protocolError, ...(sessionId ? { sessionId } : {}) });
+      return {
+        status: 'failed',
+        result: cleanedText,
+        error: protocolError,
+        memoryProposals: proposals,
+        ...(sessionId ? { sessionId } : {}),
+      };
+    }
     if (reportedError || outcome.code !== 0) {
-      const error = reportedError ?? `claude exited with code ${outcome.code}${outcome.stderr ? `: ${outcome.stderr}` : ''}`;
+      const error =
+        reportedError ??
+        `claude exited with code ${outcome.code}${outcome.stderr ? `: ${outcome.stderr}` : ''}`;
       onEvent({ kind: 'failed', error, ...(sessionId ? { sessionId } : {}) });
       return {
         status: 'failed',
@@ -175,7 +203,12 @@ export class ClaudeProvider implements AgentProvider {
       };
     }
 
-    onEvent({ kind: 'completed', result: cleanedText, ...(sessionId ? { sessionId } : {}), ...(usage ? { usage } : {}) });
+    onEvent({
+      kind: 'completed',
+      result: cleanedText,
+      ...(sessionId ? { sessionId } : {}),
+      ...(usage ? { usage } : {}),
+    });
     return {
       status: 'completed',
       result: cleanedText,
@@ -184,6 +217,29 @@ export class ClaudeProvider implements AgentProvider {
       ...(usage ? { usage } : {}),
     };
   }
+}
+
+export function buildClaudeArgs(
+  options: AgentStartOptions,
+  model: string,
+  configuredPermissionMode: JarvisConfig['agents']['claudePermissionMode'],
+): string[] {
+  const readOnly = options.role === 'reviewer' || options.role === 'visual_reviewer';
+  const args = [
+    '-p',
+    '--output-format',
+    'stream-json',
+    // stream-json in print mode requires --verbose; the CLI errors out without it.
+    '--verbose',
+    '--model',
+    model,
+    '--permission-mode',
+    readOnly ? 'plan' : configuredPermissionMode,
+    '--no-chrome',
+  ];
+  if (options.resumeSessionId) args.push('--resume', options.resumeSessionId);
+  if (options.appendSystemPrompt) args.push('--append-system-prompt', options.appendSystemPrompt);
+  return args;
 }
 
 interface Handlers {
@@ -276,7 +332,11 @@ function previewToolResult(content: unknown): string {
       ? content
       : Array.isArray(content)
         ? content
-            .map((c) => (typeof c === 'object' && c && 'text' in c ? String((c as { text: unknown }).text) : ''))
+            .map((c) =>
+              typeof c === 'object' && c && 'text' in c
+                ? String((c as { text: unknown }).text)
+                : '',
+            )
             .join('')
         : '';
   return text.length > 400 ? `${text.slice(0, 400)}...` : text;

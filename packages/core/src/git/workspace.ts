@@ -129,7 +129,11 @@ export class GitWorkspace {
       // Leave no half-created directory behind.
       fs.rmSync(target, { recursive: true, force: true });
       throw error instanceof GitError
-        ? new GitError(`could not create worktree: ${error.detail ?? error.message}`, 'worktree_create_failed', error.detail)
+        ? new GitError(
+            `could not create worktree: ${error.detail ?? error.message}`,
+            'worktree_create_failed',
+            error.detail,
+          )
         : error;
     }
 
@@ -137,7 +141,11 @@ export class GitWorkspace {
     return { path: target, branch, baseRef: status.head, warnings };
   }
 
-  async removeWorktree(repoRoot: string, worktreePath: string, opts: { deleteBranch?: string } = {}): Promise<void> {
+  async removeWorktree(
+    repoRoot: string,
+    worktreePath: string,
+    opts: { deleteBranch?: string } = {},
+  ): Promise<void> {
     const status = await repoStatus(repoRoot);
     if (!status.root) return;
     await git(status.root, ['worktree', 'remove', '--force', worktreePath]).catch((e: unknown) => {
@@ -150,7 +158,10 @@ export class GitWorkspace {
   }
 
   /** Everything the reviewer needs about what the worker actually changed. */
-  async collectChanges(worktreePath: string, baseRef: string): Promise<{
+  async collectChanges(
+    worktreePath: string,
+    baseRef: string,
+  ): Promise<{
     head: string;
     commits: { sha: string; subject: string }[];
     files: { path: string; added: number; removed: number }[];
@@ -159,19 +170,19 @@ export class GitWorkspace {
     uncommitted: string[];
   }> {
     const head = await git(worktreePath, ['rev-parse', 'HEAD']);
-    const logOut = await git(worktreePath, ['log', '--format=%H %s', `${baseRef}..HEAD`]).catch(() => '');
+    const logOut = await git(worktreePath, ['log', '--format=%H %s', `${baseRef}..HEAD`]);
     const commits = logOut
       .split('\n')
       .filter(Boolean)
       .map((line) => ({ sha: line.slice(0, 40), subject: line.slice(41) }));
 
     // Include uncommitted worker changes: agents do not always commit.
-    const uncommitted = (await git(worktreePath, ['status', '--porcelain']).catch(() => ''))
+    const uncommitted = (await git(worktreePath, ['status', '--porcelain']))
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean);
 
-    const numstat = await git(worktreePath, ['diff', '--numstat', baseRef]).catch(() => '');
+    const numstat = await git(worktreePath, ['diff', '--numstat', baseRef]);
     const files = numstat
       .split('\n')
       .filter(Boolean)
@@ -181,19 +192,40 @@ export class GitWorkspace {
       });
 
     const MAX_DIFF = 220_000; // ~60k tokens; reviewer prompt caps it further
-    let diff = await git(worktreePath, ['diff', baseRef]).catch(() => '');
+    let diff = await git(worktreePath, ['diff', baseRef]);
     const diffTruncated = diff.length > MAX_DIFF;
-    if (diffTruncated) diff = `${diff.slice(0, MAX_DIFF)}\n\n[diff truncated at ${MAX_DIFF} characters]`;
+    if (diffTruncated)
+      diff = `${diff.slice(0, MAX_DIFF)}\n\n[diff truncated at ${MAX_DIFF} characters]`;
 
     return { head, commits, files, diff, diffTruncated, uncommitted };
   }
 
+  /** Fail closed unless the candidate is a clean, optionally expected Git identity. */
+  async validateCandidate(worktreePath: string, baseRef: string, expectedHead?: string) {
+    const changes = await this.collectChanges(worktreePath, baseRef);
+    if (changes.uncommitted.length) {
+      throw new Error(`candidate has uncommitted changes: ${changes.uncommitted.join(', ')}`);
+    }
+    if (expectedHead && changes.head !== expectedHead) {
+      throw new Error(`candidate HEAD changed after review (${expectedHead} -> ${changes.head})`);
+    }
+    return changes;
+  }
+
   /** Commit whatever the worker left uncommitted, so the candidate is a real ref. */
   async commitPending(worktreePath: string, message: string): Promise<string | null> {
-    const dirty = await git(worktreePath, ['status', '--porcelain']).catch(() => '');
+    const dirty = await git(worktreePath, ['status', '--porcelain']);
     if (!dirty.trim()) return null;
     await git(worktreePath, ['add', '-A']);
-    await git(worktreePath, ['-c', 'user.name=Jarvis', '-c', 'user.email=jarvis@localhost', 'commit', '-m', message]);
+    await git(worktreePath, [
+      '-c',
+      'user.name=Jarvis',
+      '-c',
+      'user.email=jarvis@localhost',
+      'commit',
+      '-m',
+      message,
+    ]);
     return git(worktreePath, ['rev-parse', 'HEAD']);
   }
 

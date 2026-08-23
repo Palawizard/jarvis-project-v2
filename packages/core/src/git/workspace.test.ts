@@ -10,7 +10,8 @@ let repo: string;
 let worktreesDir: string;
 let workspace: GitWorkspace;
 
-const git = (args: string[], cwd = repo) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+const git = (args: string[], cwd = repo) =>
+  execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-git-'));
@@ -99,11 +100,15 @@ describe('worktree isolation', () => {
 
   it('refuses to reuse an existing worktree path', async () => {
     await workspace.createWorktree({ repoRoot: repo, jobId: 'job_dup' });
-    await expect(workspace.createWorktree({ repoRoot: repo, jobId: 'job_dup' })).rejects.toThrow(GitError);
+    await expect(workspace.createWorktree({ repoRoot: repo, jobId: 'job_dup' })).rejects.toThrow(
+      GitError,
+    );
   });
 
   it('fails explicitly on a non-repository', async () => {
-    await expect(workspace.createWorktree({ repoRoot: home, jobId: 'job_x' })).rejects.toMatchObject({
+    await expect(
+      workspace.createWorktree({ repoRoot: home, jobId: 'job_x' }),
+    ).rejects.toMatchObject({
       code: 'not_a_repo',
     });
   });
@@ -112,7 +117,9 @@ describe('worktree isolation', () => {
     const empty = path.join(home, 'empty');
     fs.mkdirSync(empty);
     execFileSync('git', ['init', '-q'], { cwd: empty });
-    await expect(workspace.createWorktree({ repoRoot: empty, jobId: 'job_e' })).rejects.toMatchObject({
+    await expect(
+      workspace.createWorktree({ repoRoot: empty, jobId: 'job_e' }),
+    ).rejects.toMatchObject({
       code: 'no_commits',
     });
   });
@@ -124,7 +131,10 @@ describe('collecting the candidate change', () => {
     fs.writeFileSync(path.join(worktree.path, 'feature.ts'), 'export const answer = 42;\n');
     fs.writeFileSync(path.join(worktree.path, 'README.md'), '# original\n\nNow documented.\n');
     git(['add', '-A'], worktree.path);
-    git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'add feature'], worktree.path);
+    git(
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'add feature'],
+      worktree.path,
+    );
 
     const changes = await workspace.collectChanges(worktree.path, worktree.baseRef);
     expect(changes.commits).toHaveLength(1);
@@ -149,6 +159,26 @@ describe('collecting the candidate change', () => {
   it('returns null when there is nothing to commit', async () => {
     const worktree = await workspace.createWorktree({ repoRoot: repo, jobId: 'job_noop' });
     expect(await workspace.commitPending(worktree.path, 'nothing')).toBeNull();
+  });
+
+  it('binds approval to a clean reviewed HEAD', async () => {
+    const worktree = await workspace.createWorktree({ repoRoot: repo, jobId: 'job_identity' });
+    fs.writeFileSync(path.join(worktree.path, 'candidate.txt'), 'reviewed\n');
+    const reviewedHead = await workspace.commitPending(worktree.path, 'reviewed candidate');
+    if (!reviewedHead) throw new Error('setup failed');
+
+    await expect(
+      workspace.validateCandidate(worktree.path, worktree.baseRef, reviewedHead),
+    ).resolves.toMatchObject({ head: reviewedHead, uncommitted: [] });
+
+    fs.writeFileSync(path.join(worktree.path, 'candidate.txt'), 'mutated\n');
+    await expect(
+      workspace.validateCandidate(worktree.path, worktree.baseRef, reviewedHead),
+    ).rejects.toThrow('uncommitted changes');
+    await workspace.commitPending(worktree.path, 'post-review mutation');
+    await expect(
+      workspace.validateCandidate(worktree.path, worktree.baseRef, reviewedHead),
+    ).rejects.toThrow('HEAD changed after review');
   });
 
   it('truncates an enormous diff instead of blowing up the reviewer prompt', async () => {

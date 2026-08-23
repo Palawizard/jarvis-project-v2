@@ -5,7 +5,8 @@ import { z } from 'zod';
  * policy maps levels to permission, so adding a tool never means inventing new
  * permission logic.
  */
-export type RiskLevel = 'observe' | 'safe_action' | 'reversible_modification' | 'sensitive' | 'destructive';
+export type RiskLevel =
+  'observe' | 'safe_action' | 'reversible_modification' | 'sensitive' | 'destructive';
 
 export interface ToolDefinition<TInput = unknown, TOutput = unknown> {
   name: string;
@@ -23,7 +24,13 @@ export interface ToolContext {
   maxRisk: RiskLevel;
 }
 
-const RISK_ORDER: RiskLevel[] = ['observe', 'safe_action', 'reversible_modification', 'sensitive', 'destructive'];
+const RISK_ORDER: RiskLevel[] = [
+  'observe',
+  'safe_action',
+  'reversible_modification',
+  'sensitive',
+  'destructive',
+];
 
 export function riskExceeds(risk: RiskLevel, max: RiskLevel): boolean {
   return RISK_ORDER.indexOf(risk) > RISK_ORDER.indexOf(max);
@@ -67,10 +74,13 @@ export class ToolRegistry {
   async execute(name: string, rawInput: unknown, ctx: ToolContext): Promise<unknown> {
     const tool = this.tools.get(name);
     if (!tool) throw new Error(`unknown tool: ${name}`);
-    if (riskExceeds(tool.risk, ctx.maxRisk)) throw new ToolPermissionError(name, tool.risk, ctx.maxRisk);
+    if (riskExceeds(tool.risk, ctx.maxRisk))
+      throw new ToolPermissionError(name, tool.risk, ctx.maxRisk);
     const parsed = (tool.input as z.ZodType).safeParse(rawInput);
     if (!parsed.success) {
-      throw new Error(`invalid input for ${name}: ${parsed.error.issues.map((i) => `${i.path.join('.')} ${i.message}`).join('; ')}`);
+      throw new Error(
+        `invalid input for ${name}: ${parsed.error.issues.map((i) => `${i.path.join('.')} ${i.message}`).join('; ')}`,
+      );
     }
     return tool.execute(parsed.data as never, ctx);
   }

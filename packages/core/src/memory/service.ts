@@ -104,12 +104,22 @@ export class MemoryService {
    * Never calls an LLM. Callers that need semantic extraction do it upstream,
    * piggybacked on a model call the task already required.
    */
-  async remember(input: MemoryInput): Promise<RememberOutcome> {
+  async remember(input: MemoryInput, supersedesId?: string): Promise<RememberOutcome> {
     const content = input.content.trim();
     if (!content) return { status: 'rejected', reason: 'empty content' };
 
     // --- Stage: secret screening (hard gate, applies even to explicit requests) --
-    const scan = scanForSecrets(content);
+    let persistedEnvelope: string;
+    try {
+      persistedEnvelope = JSON.stringify({
+        subject: input.subject ?? null,
+        sourceRef: input.sourceRef ?? {},
+        metadata: input.metadata ?? {},
+      });
+    } catch {
+      return { status: 'rejected', reason: 'invalid_metadata' };
+    }
+    const scan = scanForSecrets(`${content}\n${persistedEnvelope}`);
     if (!scan.clean) {
       this.bus?.emit({
         type: 'memory.rejected',
@@ -135,19 +145,28 @@ export class MemoryService {
     const scored = scoreCandidate(input, { minImportance: this.config.memory.minImportance });
     this.bus?.emit({
       type: 'memory.candidate',
-      payload: { kind: input.kind, scope: input.scope, accepted: scored.accept, reason: scored.reason },
+      payload: {
+        kind: input.kind,
+        scope: input.scope,
+        accepted: scored.accept,
+        reason: scored.reason,
+      },
     });
     if (!scored.accept) {
       return { status: 'rejected', reason: 'below_importance_threshold', detail: scored.reason };
     }
 
     const scopeId = input.scopeId ?? null;
-    const contentHash = sha256(`${input.scope}|${scopeId ?? ''}|${normaliseForHash(content)}`);
+    const contentHash = sha256(
+      `${input.scope}|${scopeId ?? ''}|${input.kind}|${input.subject ?? ''}|${normaliseForHash(content)}`,
+    );
 
     // --- Stage C: deduplication ------------------------------------------------
-    const exact = this.db
-      .prepare(`${SELECT_MEMORY} WHERE content_hash = ? AND status = 'active' LIMIT 1`)
-      .get(contentHash) as Row | undefined;
+    const exact = supersedesId
+      ? undefined
+      : (this.db
+          .prepare(`${SELECT_MEMORY} WHERE content_hash = ? AND status = 'active' LIMIT 1`)
+          .get(contentHash) as Row | undefined);
     if (exact) {
       const memory = rowToMemory(exact);
       // Re-asserting a known fact is evidence of importance, not a reason to duplicate.
@@ -163,25 +182,36 @@ export class MemoryService {
       input.kind,
       content,
       input.subject ?? null,
+      Boolean(supersedesId),
     );
     if (nearDuplicate?.match) {
       this.db
         .prepare('UPDATE memories SET importance = ?, updated_at = ? WHERE id = ?')
-        .run(Math.min(1, nearDuplicate.match.memory.importance + 0.02), nowIso(), nearDuplicate.match.memory.id);
-      return { status: 'duplicate', memory: nearDuplicate.match.memory, reason: nearDuplicate.match.reason };
+        .run(
+          Math.min(1, nearDuplicate.match.memory.importance + 0.02),
+          nowIso(),
+          nearDuplicate.match.memory.id,
+        );
+      return {
+        status: 'duplicate',
+        memory: nearDuplicate.match.memory,
+        reason: nearDuplicate.match.reason,
+      };
     }
 
     // --- Supersession: a new value for a known structured key replaces the old --
-    let supersededId: string | undefined;
-    if (input.subject) {
+    let supersededId = supersedesId;
+    if (!supersededId && input.subject) {
       const prior = this.db
         .prepare(
           `${SELECT_MEMORY} WHERE scope = ? AND ${scopeId === null ? 'scope_id IS NULL' : 'scope_id = ?'}
            AND subject = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`,
         )
-        .get(...(scopeId === null ? [input.scope, input.subject] : [input.scope, scopeId, input.subject])) as
-        | Row
-        | undefined;
+        .get(
+          ...(scopeId === null
+            ? [input.scope, input.subject]
+            : [input.scope, scopeId, input.subject]),
+        ) as Row | undefined;
       if (prior) supersededId = (prior as Row).id as string;
     }
 
@@ -249,7 +279,9 @@ export class MemoryService {
       if (supersededId) {
         // History is preserved: the old row stays inspectable, just not retrievable.
         this.db
-          .prepare(`UPDATE memories SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE id = ?`)
+          .prepare(
+            `UPDATE memories SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE id = ?`,
+          )
           .run(memory.id, now, supersededId);
       }
     });
@@ -262,7 +294,12 @@ export class MemoryService {
     }
     this.bus?.emit({
       type: 'memory.stored',
-      payload: { memoryId: memory.id, scope: memory.scope, kind: memory.kind, subject: memory.subject },
+      payload: {
+        memoryId: memory.id,
+        scope: memory.scope,
+        kind: memory.kind,
+        subject: memory.subject,
+      },
     });
 
     // Reuse the vector the dedupe probe already computed for this exact text.
@@ -292,6 +329,7 @@ export class MemoryService {
     kind: MemoryKind,
     content: string,
     subject: string | null,
+    skipNearDuplicate: boolean,
   ): Promise<{ match: { memory: Memory; reason: string } | null; vector: Float32Array | null }> {
     // Only ever compares within the same scope+kind: a project fact can never be
     // deduped against an unrelated project's fact.
@@ -304,19 +342,24 @@ export class MemoryService {
 
     // Two different structured keys are two different facts, however similar the
     // wording. Supersession — not dedupe — is what resolves a same-key conflict.
-    const candidates = rows
-      .map(rowToMemory)
-      .filter((c) => !(subject && c.subject && c.subject !== subject));
+    // A subject is a stable fact key. Exact repeats were caught by the hash
+    // above; any different value must reach supersession, even if only "A"
+    // changed to "B" and lexical/semantic similarity is otherwise near-perfect.
+    const candidates = subject || skipNearDuplicate ? [] : rows.map(rowToMemory);
 
     // Cheap lexical pass first: a hit here skips the model entirely.
     for (const candidate of candidates) {
       const lex = jaccard(content, candidate.content);
       if (lex >= this.config.memory.dedupeLexical) {
-        return { match: { memory: candidate, reason: `lexical_similarity ${lex.toFixed(2)}` }, vector: null };
+        return {
+          match: { memory: candidate, reason: `lexical_similarity ${lex.toFixed(2)}` },
+          vector: null,
+        };
       }
     }
 
-    if (this.semanticDisabled || !this.config.memory.embeddingsEnabled) return { match: null, vector: null };
+    if (this.semanticDisabled || !this.config.memory.embeddingsEnabled)
+      return { match: null, vector: null };
     try {
       // Always embed, even with no candidates: this single vector serves both the
       // duplicate check and the index write, so a write costs exactly one
@@ -330,7 +373,10 @@ export class MemoryService {
         if (!vec || vec.length !== vector.length) continue;
         const sim = cosine(vector, vec);
         if (sim >= this.config.memory.dedupeSimilarity) {
-          return { match: { memory: candidate, reason: `semantic_similarity ${sim.toFixed(2)}` }, vector };
+          return {
+            match: { memory: candidate, reason: `semantic_similarity ${sim.toFixed(2)}` },
+            vector,
+          };
         }
       }
       return { match: null, vector };
@@ -370,7 +416,14 @@ export class MemoryService {
            model=excluded.model, dim=excluded.dim, text_hash=excluded.text_hash,
            vector=excluded.vector, created_at=excluded.created_at`,
       )
-      .run(memory.id, this.embeddings.id, vector.length, sha256(text), vectorToBlob(vector), nowIso());
+      .run(
+        memory.id,
+        this.embeddings.id,
+        vector.length,
+        sha256(text),
+        vectorToBlob(vector),
+        nowIso(),
+      );
   }
 
   async indexEmbedding(memory: Memory): Promise<void> {
@@ -379,7 +432,8 @@ export class MemoryService {
 
   /** Batch-embed, skipping rows whose text hash already matches. */
   async indexEmbeddings(memories: Memory[]): Promise<void> {
-    if (this.semanticDisabled || !this.config.memory.embeddingsEnabled || memories.length === 0) return;
+    if (this.semanticDisabled || !this.config.memory.embeddingsEnabled || memories.length === 0)
+      return;
 
     const pending: { memory: Memory; text: string; hash: string }[] = [];
     for (const memory of memories) {
@@ -466,7 +520,9 @@ export class MemoryService {
     const lexical = this.lexicalScores(options.query, byId);
 
     // ---- Step 3: semantic ----------------------------------------------------
-    const semantic = options.lexicalOnly ? new Map<string, number>() : await this.semanticScores(options.query, candidates);
+    const semantic = options.lexicalOnly
+      ? new Map<string, number>()
+      : await this.semanticScores(options.query, candidates);
 
     // ---- Step 4: fusion ------------------------------------------------------
     const ranked = this.fuse(candidates, lexical, semantic, options.query, at);
@@ -474,13 +530,20 @@ export class MemoryService {
     // ---- Step 5: diversity, then cut ----------------------------------------
     const selected = diversify(ranked, limit);
 
-    this.touch(selected.map((r) => r.memory.id), at);
+    this.touch(
+      selected.map((r) => r.memory.id),
+      at,
+    );
     this.bus?.emit({
       type: 'memory.retrieved',
       payload: {
         query: options.query,
         scopes: options.scopes,
-        returned: selected.map((r) => ({ id: r.memory.id, score: Number(r.score.toFixed(4)), reason: r.reason })),
+        returned: selected.map((r) => ({
+          id: r.memory.id,
+          score: Number(r.score.toFixed(4)),
+          reason: r.reason,
+        })),
       },
     });
     return selected;
@@ -584,7 +647,9 @@ export class MemoryService {
    * Similarity statistics for this query against topically neutral text.
    * Embedded once per process; the cost is six short passages.
    */
-  private async nullBaseline(queryVec: Float32Array): Promise<{ mean: number; stdev: number } | null> {
+  private async nullBaseline(
+    queryVec: Float32Array,
+  ): Promise<{ mean: number; stdev: number } | null> {
     try {
       this.anchorVectors ??= await this.embeddings.embedPassages([...NULL_ANCHORS]);
       const sims = this.anchorVectors
@@ -674,7 +739,13 @@ export class MemoryService {
     // would return the whole scope ordered by importance, which is exactly the
     // "dump everything" behaviour the design forbids.
     return results
-      .filter((r) => r.signals.lexical !== undefined || r.signals.semantic !== undefined || r.signals.subjectMatch || r.memory.pinned)
+      .filter(
+        (r) =>
+          r.signals.lexical !== undefined ||
+          r.signals.semantic !== undefined ||
+          r.signals.subjectMatch ||
+          r.memory.pinned,
+      )
       .sort((a, b) => b.score - a.score);
   }
 
@@ -690,15 +761,17 @@ export class MemoryService {
 
   // ---------------------------------------------------------- user commands --
 
-  list(filter: {
-    scope?: MemoryScope;
-    scopeId?: string | null;
-    kind?: MemoryKind;
-    status?: Memory['status'] | 'all';
-    search?: string;
-    limit?: number;
-    offset?: number;
-  } = {}): { items: Memory[]; total: number } {
+  list(
+    filter: {
+      scope?: MemoryScope;
+      scopeId?: string | null;
+      kind?: MemoryKind;
+      status?: Memory['status'] | 'all';
+      search?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ): { items: Memory[]; total: number } {
     const where: string[] = [];
     const params: (string | number)[] = [];
     if (filter.scope) {
@@ -726,7 +799,11 @@ export class MemoryService {
     }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const total = Number(
-      (this.db.prepare(`SELECT COUNT(*) AS n FROM memories ${clause}`).get(...params) as { n: number }).n,
+      (
+        this.db.prepare(`SELECT COUNT(*) AS n FROM memories ${clause}`).get(...params) as {
+          n: number;
+        }
+      ).n,
     );
     const rows = this.db
       .prepare(`${SELECT_MEMORY} ${clause} ORDER BY pinned DESC, updated_at DESC LIMIT ? OFFSET ?`)
@@ -735,40 +812,38 @@ export class MemoryService {
   }
 
   /** Explicit correction: mark `id` superseded by a new memory. */
-  async correct(id: string, content: string, sourceRef: Memory['sourceRef'] = {}): Promise<RememberOutcome> {
+  async correct(
+    id: string,
+    content: string,
+    sourceRef: Memory['sourceRef'] = {},
+  ): Promise<RememberOutcome> {
     const prior = this.get(id);
     if (!prior) return { status: 'rejected', reason: 'not_found' };
-    const outcome = await this.remember({
-      scope: prior.scope,
-      scopeId: prior.scopeId,
-      kind: prior.kind,
-      // Reuse the subject so the supersession path in remember() fires; if the
-      // prior had no subject we link explicitly below.
-      subject: prior.subject,
-      content,
-      sourceType: 'user_explicit',
-      sourceRef,
-      explicit: true,
-      confidence: 0.95,
-    });
-    if (outcome.status === 'stored' && !outcome.supersededId) {
-      const now = nowIso();
-      transaction(this.db, () => {
-        this.db
-          .prepare(`UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?`)
-          .run(outcome.memory.id, now, id);
-        this.db.prepare('UPDATE memories SET supersedes=?, updated_at=? WHERE id=?').run(id, now, outcome.memory.id);
-      });
-      this.bus?.emit({ type: 'memory.superseded', payload: { memoryId: id, supersededBy: outcome.memory.id } });
-      return { status: 'stored', memory: outcome.memory, supersededId: id };
-    }
+    const outcome = await this.remember(
+      {
+        scope: prior.scope,
+        scopeId: prior.scopeId,
+        kind: prior.kind,
+        // Reuse the subject so the supersession path in remember() fires; if the
+        // prior had no subject we link explicitly below.
+        subject: prior.subject,
+        content,
+        sourceType: 'user_explicit',
+        sourceRef,
+        explicit: true,
+        confidence: 0.95,
+      },
+      id,
+    );
     return outcome;
   }
 
   /** Soft delete: the row survives for audit, retrieval ignores it. */
   forget(id: string): boolean {
     const info = this.db
-      .prepare(`UPDATE memories SET status='deleted', updated_at=? WHERE id=? AND status!='deleted'`)
+      .prepare(
+        `UPDATE memories SET status='deleted', updated_at=? WHERE id=? AND status!='deleted'`,
+      )
       .run(nowIso(), id);
     if (Number(info.changes) > 0) {
       this.bus?.emit({ type: 'memory.deleted', payload: { memoryId: id, mode: 'soft' } });
@@ -789,9 +864,15 @@ export class MemoryService {
 
   /** Delete an entire project's Jarvis memory. */
   purgeScope(scope: MemoryScope, scopeId: string): number {
-    const info = this.db.prepare('DELETE FROM memories WHERE scope = ? AND scope_id = ?').run(scope, scopeId);
+    const info = this.db
+      .prepare('DELETE FROM memories WHERE scope = ? AND scope_id = ?')
+      .run(scope, scopeId);
     const n = Number(info.changes);
-    if (n > 0) this.bus?.emit({ type: 'memory.deleted', payload: { scope, scopeId, count: n, mode: 'hard' } });
+    if (n > 0)
+      this.bus?.emit({
+        type: 'memory.deleted',
+        payload: { scope, scopeId, count: n, mode: 'hard' },
+      });
     return n;
   }
 
@@ -805,7 +886,9 @@ export class MemoryService {
   /** Mark memories whose validity window has closed. Cheap; run on boot. */
   expireStale(at: string = nowIso()): number {
     const info = this.db
-      .prepare(`UPDATE memories SET status='expired', updated_at=? WHERE status='active' AND valid_until IS NOT NULL AND valid_until <= ?`)
+      .prepare(
+        `UPDATE memories SET status='expired', updated_at=? WHERE status='active' AND valid_until IS NOT NULL AND valid_until <= ?`,
+      )
       .run(at, at);
     return Number(info.changes);
   }
@@ -832,7 +915,13 @@ export class MemoryService {
     return rows.length;
   }
 
-  stats(): { active: number; superseded: number; deleted: number; expired: number; embedded: number } {
+  stats(): {
+    active: number;
+    superseded: number;
+    deleted: number;
+    expired: number;
+    embedded: number;
+  } {
     const counts = this.db
       .prepare('SELECT status, COUNT(*) AS n FROM memories GROUP BY status')
       .all() as Array<{ status: string; n: number }>;
@@ -860,16 +949,115 @@ export class MemoryService {
  */
 const STOPWORDS = new Set([
   // English
-  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out',
-  'his', 'has', 'had', 'him', 'she', 'its', 'who', 'get', 'why', 'how', 'what', 'when', 'where',
-  'which', 'that', 'this', 'with', 'from', 'they', 'them', 'were', 'been', 'have', 'does', 'did',
-  'about', 'would', 'could', 'should', 'there', 'their', 'then', 'than', 'into', 'some', 'any',
-  'more', 'most', 'much', 'very', 'just', 'also', 'only', 'over', 'such', 'each', 'both', 'does',
+  'the',
+  'and',
+  'for',
+  'are',
+  'but',
+  'not',
+  'you',
+  'all',
+  'can',
+  'her',
+  'was',
+  'one',
+  'our',
+  'out',
+  'his',
+  'has',
+  'had',
+  'him',
+  'she',
+  'its',
+  'who',
+  'get',
+  'why',
+  'how',
+  'what',
+  'when',
+  'where',
+  'which',
+  'that',
+  'this',
+  'with',
+  'from',
+  'they',
+  'them',
+  'were',
+  'been',
+  'have',
+  'does',
+  'did',
+  'about',
+  'would',
+  'could',
+  'should',
+  'there',
+  'their',
+  'then',
+  'than',
+  'into',
+  'some',
+  'any',
+  'more',
+  'most',
+  'much',
+  'very',
+  'just',
+  'also',
+  'only',
+  'over',
+  'such',
+  'each',
+  'both',
+  'does',
   // French
-  'les', 'des', 'une', 'que', 'qui', 'pour', 'dans', 'sur', 'pas', 'avec', 'sont', 'est', 'ete',
-  'aux', 'par', 'plus', 'mais', 'nous', 'vous', 'ils', 'elle', 'elles', 'son', 'ses', 'leur',
-  'comment', 'quand', 'quel', 'quelle', 'quels', 'quelles', 'quoi', 'cette', 'ces', 'cela',
-  'faire', 'fait', 'etre', 'avoir', 'tout', 'tous', 'toute', 'toutes', 'donc', 'alors', 'ainsi',
+  'les',
+  'des',
+  'une',
+  'que',
+  'qui',
+  'pour',
+  'dans',
+  'sur',
+  'pas',
+  'avec',
+  'sont',
+  'est',
+  'ete',
+  'aux',
+  'par',
+  'plus',
+  'mais',
+  'nous',
+  'vous',
+  'ils',
+  'elle',
+  'elles',
+  'son',
+  'ses',
+  'leur',
+  'comment',
+  'quand',
+  'quel',
+  'quelle',
+  'quels',
+  'quelles',
+  'quoi',
+  'cette',
+  'ces',
+  'cela',
+  'faire',
+  'fait',
+  'etre',
+  'avoir',
+  'tout',
+  'tous',
+  'toute',
+  'toutes',
+  'donc',
+  'alors',
+  'ainsi',
 ]);
 
 /**
@@ -924,7 +1112,10 @@ export function calibrateSemantic(
   // about PDF rendering just because it is the least-bad option available.
   let floor = options.absoluteFloor;
   if (options.nullBaseline) {
-    floor = Math.max(floor, options.nullBaseline.mean + Math.max(options.margin, 1.5 * options.nullBaseline.stdev));
+    floor = Math.max(
+      floor,
+      options.nullBaseline.mean + Math.max(options.margin, 1.5 * options.nullBaseline.stdev),
+    );
   }
 
   const passing = raw.filter((r) => r.sim >= floor);
@@ -961,7 +1152,9 @@ function diversify(ranked: RetrievedMemory[], limit: number): RetrievedMemory[] 
   const selected: RetrievedMemory[] = [];
   for (const candidate of ranked) {
     if (selected.length >= limit) break;
-    const tooSimilar = selected.some((s) => jaccard(s.memory.content, candidate.memory.content) > 0.6);
+    const tooSimilar = selected.some(
+      (s) => jaccard(s.memory.content, candidate.memory.content) > 0.6,
+    );
     if (tooSimilar) continue;
     selected.push(candidate);
   }

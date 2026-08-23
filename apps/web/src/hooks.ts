@@ -2,7 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { JarvisEvent } from './api.ts';
 
 /** Fetch-on-mount with a manual `reload`. Small enough not to warrant a query library. */
-export function useAsync<T>(fn: () => Promise<T>, deps: unknown[]): {
+export function useAsync<T>(
+  fn: () => Promise<T>,
+  deps: unknown[],
+): {
   data: T | null;
   error: string | null;
   loading: boolean;

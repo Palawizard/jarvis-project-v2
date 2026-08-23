@@ -44,7 +44,9 @@ export function registerBuiltinTools(deps: {
       limit: z.number().int().min(1).max(50).default(10),
     }),
     async execute(input) {
-      const scopes: { scope: MemoryScope; scopeId: string | null }[] = [{ scope: 'user', scopeId: null }];
+      const scopes: { scope: MemoryScope; scopeId: string | null }[] = [
+        { scope: 'user', scopeId: null },
+      ];
       if (input.projectId) scopes.push({ scope: 'project', scopeId: input.projectId });
       const results = await deps.memory.retrieve({
         query: input.query,
@@ -66,7 +68,8 @@ export function registerBuiltinTools(deps: {
 
   registry.register({
     name: 'memory.store',
-    description: 'Store a durable memory. Runs the full write policy (secrets, dedupe, supersession).',
+    description:
+      'Store a durable memory. Runs the full write policy (secrets, dedupe, supersession).',
     risk: 'reversible_modification',
     input: z.object({
       scope: z.enum(SCOPES),

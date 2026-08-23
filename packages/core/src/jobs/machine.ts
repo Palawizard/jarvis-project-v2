@@ -18,9 +18,15 @@ export type JobStage =
   | 'failed'
   | 'cancelled';
 
-export type JobStatus = 'pending' | 'running' | 'awaiting_user' | 'completed' | 'failed' | 'cancelled';
+export type JobStatus =
+  'pending' | 'running' | 'awaiting_user' | 'completed' | 'failed' | 'cancelled';
 
-export const TERMINAL_STAGES: readonly JobStage[] = ['completed', 'failed', 'cancelled', 'awaiting_user'];
+export const TERMINAL_STAGES: readonly JobStage[] = [
+  'completed',
+  'failed',
+  'cancelled',
+  'awaiting_user',
+];
 
 /** Stages shown as pipeline steps in the UI, in order. */
 export const PIPELINE_STAGES: readonly JobStage[] = [

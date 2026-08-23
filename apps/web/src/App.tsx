@@ -18,7 +18,6 @@ export type Route =
 export function App() {
   const [route, setRoute] = useState<Route>({ name: 'command' });
   const [theme, toggleTheme] = useTheme();
-  const [eventTick, setEventTick] = useState(0);
   const [lastEvent, setLastEvent] = useState<JarvisEvent | null>(null);
 
   const health = useAsync<Health>(() => api.health(), []);
@@ -27,13 +26,12 @@ export function App() {
     () => api.session() as never,
     [],
   );
-  const jobs = useAsync<Job[]>(() => api.jobs(), [eventTick === -1]);
+  const jobs = useAsync<Job[]>(() => api.jobs(), []);
 
   // A single stream feeds every view; each view re-reads what it needs.
   const { connected } = useEventStream(
     useCallback((event: JarvisEvent) => {
       setLastEvent(event);
-      setEventTick((t) => t + 1);
     }, []),
   );
 
@@ -49,7 +47,13 @@ export function App() {
     () => (jobs.data ?? []).filter((j) => j.status === 'running' || j.status === 'pending'),
     [jobs.data],
   );
-  const awaiting = useMemo(() => (jobs.data ?? []).filter((j) => j.status === 'awaiting_user'), [jobs.data]);
+  const awaiting = useMemo(
+    () => (jobs.data ?? []).filter((j) => j.status === 'awaiting_user'),
+    [jobs.data],
+  );
+  const apiErrors = [health.error, projects.error, sessionData.error, jobs.error].filter(
+    (error): error is string => !!error,
+  );
 
   const session = sessionData.data?.session ?? null;
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -66,11 +70,15 @@ export function App() {
   );
 
   const title =
-    route.name === 'command' ? 'Command'
-    : route.name === 'projects' ? 'Projects'
-    : route.name === 'jobs' ? 'Jobs'
-    : route.name === 'job' ? 'Job'
-    : 'Memory';
+    route.name === 'command'
+      ? 'Command'
+      : route.name === 'projects'
+        ? 'Projects'
+        : route.name === 'jobs'
+          ? 'Jobs'
+          : route.name === 'job'
+            ? 'Job'
+            : 'Memory';
 
   return (
     <div className="app">
@@ -79,7 +87,11 @@ export function App() {
           <span className="brand-dot" />
           Jarvis
         </div>
-        <NavItem active={route.name === 'command'} onClick={() => setRoute({ name: 'command' })} label="Command" />
+        <NavItem
+          active={route.name === 'command'}
+          onClick={() => setRoute({ name: 'command' })}
+          label="Command"
+        />
         <NavItem
           active={route.name === 'projects'}
           onClick={() => setRoute({ name: 'projects' })}
@@ -107,7 +119,9 @@ export function App() {
           {health.data?.providers.map((p) => (
             <div key={p.id} title={p.reason ?? p.authMethod ?? ''}>
               <span>{p.id}</span>
-              <span style={{ color: p.available ? 'var(--ok)' : 'var(--err)' }}>{p.available ? 'ready' : 'off'}</span>
+              <span style={{ color: p.available ? 'var(--ok)' : 'var(--err)' }}>
+                {p.available ? 'ready' : 'off'}
+              </span>
             </div>
           ))}
           <div title={health.data?.memory.embeddings.error ?? health.data?.memory.embeddings.model}>
@@ -145,9 +159,9 @@ export function App() {
           )}
           <span className="spacer" />
           <select
+            className="topbar-project"
             value={projectId ?? ''}
             onChange={(e) => void selectProject(e.target.value || null)}
-            style={{ width: 200 }}
             aria-label="Active project"
           >
             <option value="">No project selected</option>
@@ -158,10 +172,16 @@ export function App() {
               </option>
             ))}
           </select>
-          <button className="btn sm" onClick={toggleTheme} aria-label="Toggle theme">
+          <button className="btn sm theme-toggle" onClick={toggleTheme} aria-label="Toggle theme">
             {theme === 'dark' ? '☾' : '☀'}
           </button>
         </header>
+
+        {apiErrors.length > 0 && (
+          <div className="api-error" role="alert">
+            Jarvis API error: {[...new Set(apiErrors)].join(' · ')}
+          </div>
+        )}
 
         {route.name === 'command' && (
           <CommandView
@@ -197,7 +217,9 @@ export function App() {
             onBack={() => setRoute({ name: 'jobs' })}
           />
         )}
-        {route.name === 'memory' && <MemoryView projects={projects.data ?? []} lastEvent={lastEvent} />}
+        {route.name === 'memory' && (
+          <MemoryView projects={projects.data ?? []} lastEvent={lastEvent} />
+        )}
       </main>
     </div>
   );

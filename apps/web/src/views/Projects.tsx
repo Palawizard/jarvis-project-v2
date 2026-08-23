@@ -17,7 +17,14 @@ export function ProjectsView({
   onChanged: () => void;
 }) {
   if (selectedId) {
-    return <ProjectDetail id={selectedId} onBack={() => onSelect(undefined)} onOpenJob={onOpenJob} onChanged={onChanged} />;
+    return (
+      <ProjectDetail
+        id={selectedId}
+        onBack={() => onSelect(undefined)}
+        onOpenJob={onOpenJob}
+        onChanged={onChanged}
+      />
+    );
   }
   return <ProjectList projects={projects} onSelect={onSelect} onChanged={onChanged} />;
 }
@@ -72,11 +79,19 @@ function ProjectList({
             style={{ flex: 1, minWidth: 200 }}
             aria-label="Dev URL"
           />
-          <button className="btn primary" onClick={() => void add()} disabled={busy || !rootPath.trim()}>
+          <button
+            className="btn primary"
+            onClick={() => void add()}
+            disabled={busy || !rootPath.trim()}
+          >
             Register
           </button>
         </div>
-        {error && <div className="small" style={{ color: 'var(--err)', marginTop: 8 }}>{error}</div>}
+        {error && (
+          <div className="small" style={{ color: 'var(--err)', marginTop: 8 }}>
+            {error}
+          </div>
+        )}
         <div className="small faint" style={{ marginTop: 8 }}>
           The repository must be a git repo with at least one commit. Jarvis never writes to your
           working tree — jobs run in an isolated worktree.
@@ -98,7 +113,20 @@ function ProjectList({
             </thead>
             <tbody>
               {projects.map((p) => (
-                <tr key={p.id} className="clickable" onClick={() => onSelect(p.id)}>
+                <tr
+                  key={p.id}
+                  className="clickable"
+                  role="link"
+                  tabIndex={0}
+                  aria-label={`Open project ${p.name}`}
+                  onClick={() => onSelect(p.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      onSelect(p.id);
+                    }
+                  }}
+                >
                   <td>
                     <div className="row">
                       <strong>{p.name}</strong>
@@ -108,9 +136,13 @@ function ProjectList({
                   <td className="small dim">
                     {[...p.stack.languages, ...p.stack.frameworks].slice(0, 4).join(', ') || '—'}
                   </td>
-                  <td className="mono tiny dim nowrap" style={{ maxWidth: 300 }}>{p.rootPath}</td>
+                  <td className="mono tiny dim nowrap" style={{ maxWidth: 300 }}>
+                    {p.rootPath}
+                  </td>
                   <td className="small dim">
-                    {['lint', 'typecheck', 'test', 'build'].filter((k) => p.commands[k]).join(', ') || 'none detected'}
+                    {['lint', 'typecheck', 'test', 'build']
+                      .filter((k) => p.commands[k])
+                      .join(', ') || 'none detected'}
                   </td>
                 </tr>
               ))}
@@ -137,8 +169,18 @@ function ProjectDetail({
   const [request, setRequest] = useState('');
   const [busy, setBusy] = useState(false);
 
-  if (detail.error) return <div className="page"><Card title="Error">{detail.error}</Card></div>;
-  if (!detail.data) return <div className="page"><Empty>Loading…</Empty></div>;
+  if (detail.error)
+    return (
+      <div className="page">
+        <Card title="Error">{detail.error}</Card>
+      </div>
+    );
+  if (!detail.data)
+    return (
+      <div className="page">
+        <Empty>Loading…</Empty>
+      </div>
+    );
 
   const { project, jobs, memory, snapshot } = detail.data;
 
@@ -157,13 +199,20 @@ function ProjectDetail({
   return (
     <div className="page">
       <div className="row" style={{ marginBottom: 14 }}>
-        <button className="btn sm" onClick={onBack}>← Projects</button>
+        <button className="btn sm" onClick={onBack}>
+          ← Projects
+        </button>
         <h2 style={{ margin: 0, fontSize: 18 }}>{project.name}</h2>
         {project.isSelf && <Badge tone="accent">self-development target</Badge>}
         <span style={{ flex: 1 }} />
         <button
           className="btn sm"
-          onClick={() => void api.refreshProject(project.id).then(() => { detail.reload(); onChanged(); })}
+          onClick={() =>
+            void api.refreshProject(project.id).then(() => {
+              detail.reload();
+              onChanged();
+            })
+          }
         >
           Re-detect stack
         </button>
@@ -180,7 +229,11 @@ function ProjectDetail({
             />
             <div className="spread" style={{ marginTop: 8 }}>
               <span className="small faint">Runs in an isolated worktree. Never auto-merged.</span>
-              <button className="btn primary" onClick={() => void createJob()} disabled={busy || !request.trim()}>
+              <button
+                className="btn primary"
+                onClick={() => void createJob()}
+                disabled={busy || !request.trim()}
+              >
                 Start job
               </button>
             </div>
@@ -197,9 +250,24 @@ function ProjectDetail({
               <table>
                 <tbody>
                   {jobs.map((j) => (
-                    <tr key={j.id} className="clickable" onClick={() => onOpenJob(j.id)}>
+                    <tr
+                      key={j.id}
+                      className="clickable"
+                      role="link"
+                      tabIndex={0}
+                      aria-label={`Open job ${j.goal}`}
+                      onClick={() => onOpenJob(j.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          onOpenJob(j.id);
+                        }
+                      }}
+                    >
                       <td>{j.goal}</td>
-                      <td style={{ width: 130 }}><StageBadge stage={j.stage} /></td>
+                      <td style={{ width: 130 }}>
+                        <StageBadge stage={j.stage} />
+                      </td>
                       <td className="tiny faint nowrap" style={{ width: 100 }}>
                         {new Date(j.createdAt).toLocaleDateString()}
                       </td>
@@ -215,12 +283,26 @@ function ProjectDetail({
           <Card title="Configuration">
             <table>
               <tbody>
-                <tr><td className="dim small">Path</td><td className="mono tiny">{project.rootPath}</td></tr>
-                <tr><td className="dim small">Branch</td><td className="mono tiny">{project.defaultBranch}</td></tr>
-                <tr><td className="dim small">Dev URL</td><td className="mono tiny">{project.devUrl ?? '—'}</td></tr>
-                {Object.entries(project.commands).filter(([, v]) => v).map(([k, v]) => (
-                  <tr key={k}><td className="dim small">{k}</td><td className="mono tiny">{v}</td></tr>
-                ))}
+                <tr>
+                  <td className="dim small">Path</td>
+                  <td className="mono tiny">{project.rootPath}</td>
+                </tr>
+                <tr>
+                  <td className="dim small">Branch</td>
+                  <td className="mono tiny">{project.defaultBranch}</td>
+                </tr>
+                <tr>
+                  <td className="dim small">Dev URL</td>
+                  <td className="mono tiny">{project.devUrl ?? '—'}</td>
+                </tr>
+                {Object.entries(project.commands)
+                  .filter(([, v]) => v)
+                  .map(([k, v]) => (
+                    <tr key={k}>
+                      <td className="dim small">{k}</td>
+                      <td className="mono tiny">{v}</td>
+                    </tr>
+                  ))}
               </tbody>
             </table>
           </Card>
@@ -231,7 +313,9 @@ function ProjectDetail({
               <button
                 className="btn sm danger"
                 onClick={() => {
-                  if (confirm(`Delete ALL Jarvis memory for ${project.name}? This cannot be undone.`)) {
+                  if (
+                    confirm(`Delete ALL Jarvis memory for ${project.name}? This cannot be undone.`)
+                  ) {
                     void api.purgeProjectMemory(project.id).then(() => detail.reload());
                   }
                 }}

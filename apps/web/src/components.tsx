@@ -1,11 +1,25 @@
 import type { ReactNode } from 'react';
-import type { JobStage, Memory } from './api.ts';
+import type { JarvisEvent, JobStage, Memory } from './api.ts';
 
-export function Badge({ tone, children }: { tone?: 'ok' | 'warn' | 'err' | 'run' | 'accent'; children: ReactNode }) {
+export function Badge({
+  tone,
+  children,
+}: {
+  tone?: 'ok' | 'warn' | 'err' | 'run' | 'accent';
+  children: ReactNode;
+}) {
   return <span className={`badge ${tone ?? ''}`}>{children}</span>;
 }
 
-export function Card({ title, actions, children }: { title?: string; actions?: ReactNode; children: ReactNode }) {
+export function Card({
+  title,
+  actions,
+  children,
+}: {
+  title?: string;
+  actions?: ReactNode;
+  children: ReactNode;
+}) {
   return (
     <div className="card">
       {(title || actions) && (
@@ -42,15 +56,25 @@ export function Pipeline({
   stage,
   status,
   skipped = [],
+  events = [],
 }: {
   stage: JobStage;
   status: string;
   skipped?: JobStage[];
+  events?: JarvisEvent[];
 }) {
-  const terminal = ['completed', 'failed', 'cancelled', 'awaiting_user'].includes(stage);
   // `fixing` belongs to the verify loop; show verification as the active step.
   const effective = stage === 'fixing' ? 'verifying' : stage;
   const currentIndex = ORDER.indexOf(effective as JobStage);
+  const transitions = events.filter((event) => event.type === 'job.stage.changed');
+  const reached = new Set(
+    transitions.map((event) => event.payload?.to).filter((value): value is JobStage => !!value),
+  );
+  const stoppedAt =
+    stage === 'failed' || stage === 'cancelled'
+      ? (transitions.findLast((event) => event.payload?.to === stage)?.payload?.from as
+          JobStage | undefined)
+      : undefined;
 
   return (
     <div className="pipeline">
@@ -61,13 +85,15 @@ export function Pipeline({
         if (isSkipped) {
           state = 'skipped';
           icon = '–';
-        } else if (stage === 'failed' && i === currentIndex) {
+        } else if (stoppedAt === s) {
           state = 'failed';
-          icon = '✕';
-        } else if (terminal || (currentIndex >= 0 && i < currentIndex)) {
-          const reached = terminal ? true : i < currentIndex;
-          state = reached ? 'done' : 'pending';
-          icon = reached ? '✓' : '○';
+          icon = stage === 'cancelled' ? '■' : '✕';
+        } else if (reached.has(s) && s !== effective) {
+          state = 'done';
+          icon = '✓';
+        } else if (currentIndex >= 0 && i < currentIndex) {
+          state = 'done';
+          icon = '✓';
         } else if (i === currentIndex) {
           state = 'current';
           icon = '●';
@@ -84,30 +110,41 @@ export function Pipeline({
           </div>
         );
       })}
-      {stage === 'fixing' && <div className="tiny dim" style={{ paddingLeft: 34 }}>fix cycle in progress</div>}
+      {stage === 'fixing' && (
+        <div className="tiny dim" style={{ paddingLeft: 34 }}>
+          fix cycle in progress
+        </div>
+      )}
     </div>
   );
 }
 
 export function StageBadge({ stage }: { stage: JobStage }) {
   const tone =
-    stage === 'completed' ? 'ok'
-    : stage === 'failed' ? 'err'
-    : stage === 'cancelled' ? undefined
-    : stage === 'awaiting_user' ? 'warn'
-    : stage === 'queued' ? undefined
-    : 'run';
+    stage === 'completed'
+      ? 'ok'
+      : stage === 'failed'
+        ? 'err'
+        : stage === 'cancelled'
+          ? undefined
+          : stage === 'awaiting_user'
+            ? 'warn'
+            : stage === 'queued'
+              ? undefined
+              : 'run';
   return <Badge tone={tone}>{stage.replace('_', ' ')}</Badge>;
 }
 
 export function MemoryCard({
   memory,
   onPin,
+  onEdit,
   onForget,
   onInspect,
 }: {
   memory: Memory;
   onPin?: (m: Memory) => void;
+  onEdit?: (m: Memory) => void;
   onForget?: (m: Memory) => void;
   onInspect?: (m: Memory) => void;
 }) {
@@ -128,6 +165,11 @@ export function MemoryCard({
         {onInspect && (
           <button className="btn sm" onClick={() => onInspect(memory)}>
             Provenance
+          </button>
+        )}
+        {onEdit && memory.status === 'active' && (
+          <button className="btn sm" onClick={() => onEdit(memory)}>
+            Edit
           </button>
         )}
         {onForget && memory.status === 'active' && (
@@ -156,13 +198,14 @@ export function Diff({ text }: { text: string }) {
   return (
     <pre>
       {text.split('\n').map((line, i) => {
-        const cls = line.startsWith('+') && !line.startsWith('+++')
-          ? 'diff-add'
-          : line.startsWith('-') && !line.startsWith('---')
-            ? 'diff-del'
-            : line.startsWith('@@')
-              ? 'diff-hunk'
-              : '';
+        const cls =
+          line.startsWith('+') && !line.startsWith('+++')
+            ? 'diff-add'
+            : line.startsWith('-') && !line.startsWith('---')
+              ? 'diff-del'
+              : line.startsWith('@@')
+                ? 'diff-hunk'
+                : '';
         return (
           <div key={i} className={cls}>
             {line || ' '}

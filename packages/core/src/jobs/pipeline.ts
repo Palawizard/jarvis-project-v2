@@ -1,7 +1,6 @@
 import type { Db } from '../db/index.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { createLogger } from '../logger.js';
-import { nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { JobService, Job } from './service.js';
 import type { ProjectService, Project } from '../projects/service.js';
@@ -14,7 +13,12 @@ import type { ReviewEngine, Review } from '../review/engine.js';
 import { VisualQaEngine, startDevServer } from '../visualqa/engine.js';
 import { GitWorkspace } from '../git/workspace.js';
 import { MEMORY_PROPOSAL_INSTRUCTIONS } from '../agents/proposals.js';
-import { proposalToInput, type AgentEvent, type ProviderId } from '../agents/types.js';
+import {
+  proposalToInput,
+  type AgentEvent,
+  type AgentRunResult,
+  type ProviderId,
+} from '../agents/types.js';
 import type { MemoryInput } from '../memory/types.js';
 
 const log = createLogger('pipeline');
@@ -88,7 +92,7 @@ export class JobPipeline {
   }
 
   private async execute(jobId: string, signal: AbortSignal): Promise<void> {
-    const { jobs, projects, memory, context, agents, verification, review, sessions, bus } = this.deps;
+    const { jobs, projects, context, agents, verification, review, sessions, bus } = this.deps;
     let job = jobs.get(jobId);
     if (!job) throw new Error(`job not found: ${jobId}`);
     const project = projects.get(job.projectId);
@@ -106,7 +110,11 @@ export class JobPipeline {
     if (!worktree) return;
 
     if (worktree.warnings.length) {
-      bus.emit({ type: 'job.stage.changed', jobId, payload: { note: worktree.warnings.join(' ') } });
+      bus.emit({
+        type: 'job.stage.changed',
+        jobId,
+        payload: { note: worktree.warnings.join(' ') },
+      });
     }
     job = jobs.patch(jobId, {
       branch: worktree.branch,
@@ -151,12 +159,14 @@ export class JobPipeline {
       return;
     }
     if (implResult.status !== 'completed') {
-      jobs.transition(jobId, 'failed', { error: `Implementer failed: ${implResult.error ?? 'unknown'}` });
+      jobs.transition(jobId, 'failed', {
+        error: `Implementer failed: ${implResult.error ?? 'unknown'}`,
+      });
       return;
     }
 
     // Agents do not reliably commit; make the candidate a real ref either way.
-    await this.git.commitPending(worktree.path, `jarvis: ${job.goal}`).catch(() => null);
+    await this.git.commitPending(worktree.path, `jarvis: ${job.goal}`);
 
     // ------------------------------------------------ verifying (+ fixing) ---
     let verificationReport: VerificationReport | null = null;
@@ -176,7 +186,9 @@ export class JobPipeline {
         bus.emit({
           type: 'verification.completed',
           jobId,
-          payload: { note: `verification still failing after ${cycle} fix cycle(s); continuing to review` },
+          payload: {
+            note: `verification still failing after ${cycle} fix cycle(s); continuing to review`,
+          },
         });
         break;
       }
@@ -195,15 +207,25 @@ export class JobPipeline {
         // re-sending it, which is both cheaper and more accurate.
         resumeSessionId: implResult.sessionId,
       });
-      await this.git.commitPending(worktree.path, `jarvis: fix cycle ${cycle}`).catch(() => null);
+      await this.git.commitPending(worktree.path, `jarvis: fix cycle ${cycle}`);
       if (fixResult.status === 'cancelled') return void jobs.transition(jobId, 'cancelled');
     }
 
-    const changes = await this.git.collectChanges(worktree.path, worktree.baseRef);
+    await this.git.commitPending(worktree.path, 'jarvis: deterministic verification updates');
+    const changes = await this.git.validateCandidate(worktree.path, worktree.baseRef);
     job = jobs.patch(jobId, { headRef: changes.head });
 
     // ------------------------------------------------------------ reviewing --
     if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
+    const reviewerPack = await context.build({
+      role: 'reviewer',
+      query: `${job.goal}\n${job.request}`,
+      projectId: project.id,
+      sessionId: job.sessionId,
+      jobId,
+      projectSnapshot: renderProjectSnapshot(project),
+      sessionState: session ? sessions.renderState(session.state) : null,
+    });
     jobs.transition(jobId, 'reviewing');
     const reviewResult = await review.review({
       jobId,
@@ -214,18 +236,48 @@ export class JobPipeline {
       diff: changes.diff,
       files: changes.files,
       verification: verificationReport,
-      contextPack: pack.rendered,
+      contextPack: reviewerPack.rendered,
+      contextPackId: reviewerPack.id,
       implementerProvider: providerId,
       implementerSummary: implResult.result,
       signal,
     });
 
-    // ------------------------------------------------------------ visual QA --
     if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
+    const rejection = candidateRejectionReason(verificationReport, reviewResult.verdict);
+    if (rejection) {
+      const episodeId = await this.consolidate({
+        job,
+        project,
+        changes,
+        verification: verificationReport,
+        review: reviewResult,
+        implementerSummary: implResult.result,
+        proposals: [],
+        runId: implResult.runId,
+      });
+      jobs.transition(jobId, 'failed', {
+        episodeId,
+        error: rejection,
+      });
+      return;
+    }
+
+    // ------------------------------------------------------------ visual QA --
     const shouldVisualQa = Boolean(project.commands.dev && project.devUrl);
     if (shouldVisualQa) {
       jobs.transition(jobId, 'visual_qa');
       await this.runVisualQa(jobId, project, worktree.path, signal);
+    }
+    if (signal.aborted) return void jobs.transition(jobId, 'cancelled');
+
+    try {
+      await this.git.validateCandidate(worktree.path, worktree.baseRef, changes.head);
+    } catch (error) {
+      jobs.transition(jobId, 'failed', {
+        error: `Candidate changed after review: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
     }
 
     // ------------------------------------------- memory consolidation + done --
@@ -239,17 +291,32 @@ export class JobPipeline {
       proposals: implResult.proposals,
       runId: implResult.runId,
     });
+    if (signal.aborted) return void jobs.transition(jobId, 'cancelled', { episodeId });
 
     // V1 safety rule: a successful job NEVER auto-merges. The user decides.
     jobs.transition(jobId, 'awaiting_user', { episodeId });
-    log.info('job finished', { jobId, verdict: reviewResult.verdict, verified: verificationReport.passed });
+    log.info('job finished', {
+      jobId,
+      verdict: reviewResult.verdict,
+      verified: verificationReport.passed,
+    });
   }
 
-  private async runVisualQa(jobId: string, project: Project, cwd: string, signal: AbortSignal): Promise<void> {
+  private async runVisualQa(
+    jobId: string,
+    project: Project,
+    cwd: string,
+    signal: AbortSignal,
+  ): Promise<void> {
     if (!project.commands.dev || !project.devUrl) return;
     let server: Awaited<ReturnType<typeof startDevServer>> | undefined;
     try {
-      server = await startDevServer({ command: project.commands.dev, cwd, url: project.devUrl });
+      server = await startDevServer({
+        command: project.commands.dev,
+        cwd,
+        url: project.devUrl,
+        signal,
+      });
       await this.visualQa.capture({
         jobId,
         projectId: project.id,
@@ -258,11 +325,21 @@ export class JobPipeline {
         signal,
       });
     } catch (error) {
+      if (signal.aborted) return;
       // Visual QA failing must never fail the job — it is evidence, not a gate.
+      // But record WHY, as a real row: an empty screenshot list with no
+      // explanation is indistinguishable from "the page was fine".
+      const message = error instanceof Error ? error.message : String(error);
+      this.visualQa.recordFailure({
+        jobId,
+        projectId: project.id,
+        route: project.devUrl ?? '(dev server)',
+        error: `Could not start the dev server for visual QA: ${message}`,
+      });
       this.deps.bus.emit({
         type: 'visual_qa.completed',
         jobId,
-        payload: { error: error instanceof Error ? error.message : String(error), captured: 0 },
+        payload: { error: message, captured: 0 },
       });
     } finally {
       await server?.stop();
@@ -299,13 +376,28 @@ export class JobPipeline {
     const onEvent = (event: AgentEvent) => {
       switch (event.kind) {
         case 'text':
-          bus.emit({ type: 'agent.output', jobId: opts.jobId, runId: run.id, payload: { text: event.text.slice(0, 4000) } });
+          bus.emit({
+            type: 'agent.output',
+            jobId: opts.jobId,
+            runId: run.id,
+            payload: { text: event.text.slice(0, 4000) },
+          });
           break;
         case 'thinking':
-          bus.emit({ type: 'agent.thinking', jobId: opts.jobId, runId: run.id, payload: { chars: event.text.length } });
+          bus.emit({
+            type: 'agent.thinking',
+            jobId: opts.jobId,
+            runId: run.id,
+            payload: { chars: event.text.length },
+          });
           break;
         case 'tool_started':
-          bus.emit({ type: 'agent.tool.started', jobId: opts.jobId, runId: run.id, payload: { tool: event.tool, id: event.id } });
+          bus.emit({
+            type: 'agent.tool.started',
+            jobId: opts.jobId,
+            runId: run.id,
+            payload: { tool: event.tool, id: event.id },
+          });
           break;
         case 'tool_completed':
           bus.emit({
@@ -316,23 +408,38 @@ export class JobPipeline {
           });
           break;
         case 'waiting':
-          bus.emit({ type: 'agent.waiting', jobId: opts.jobId, runId: run.id, payload: { note: event.note } });
+          bus.emit({
+            type: 'agent.waiting',
+            jobId: opts.jobId,
+            runId: run.id,
+            payload: { note: event.note },
+          });
           break;
         default:
           break;
       }
     };
 
-    const result = await provider.run(
-      {
-        cwd: opts.cwd,
-        prompt: opts.prompt,
-        role: opts.role,
-        signal: opts.signal,
-        ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
-      },
-      onEvent,
-    );
+    let result: AgentRunResult;
+    try {
+      result = await provider.run(
+        {
+          cwd: opts.cwd,
+          prompt: opts.prompt,
+          role: opts.role,
+          signal: opts.signal,
+          ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
+        },
+        onEvent,
+      );
+    } catch (error) {
+      result = {
+        status: 'failed',
+        result: '',
+        error: error instanceof Error ? error.message : String(error),
+        memoryProposals: [],
+      };
+    }
 
     jobs.finishRun(run.id, {
       status: result.status === 'completed' ? 'completed' : result.status,
@@ -375,7 +482,11 @@ export class JobPipeline {
   private async consolidate(input: {
     job: Job;
     project: Project;
-    changes: { commits: { sha: string; subject: string }[]; files: { path: string }[]; head: string };
+    changes: {
+      commits: { sha: string; subject: string }[];
+      files: { path: string }[];
+      head: string;
+    };
     verification: VerificationReport;
     review: Review;
     implementerSummary: string;
@@ -387,13 +498,22 @@ export class JobPipeline {
     const verificationLine = input.verification.ran
       ? input.verification.results.map((r) => `${r.name}:${r.status}`).join(', ')
       : 'no verification commands configured';
-    const blocking = input.review.findings.filter((f) => f.severity === 'critical' || f.severity === 'high');
+    const blocking = input.review.findings.filter(
+      (f) => f.severity === 'critical' || f.severity === 'high',
+    );
 
     const episode = [
       `${input.job.createdAt.slice(0, 10)} — Job: ${input.job.goal}`,
       ``,
       `Outcome: ${firstSentences(input.implementerSummary, 3)}`,
-      `Files changed: ${input.changes.files.length}${input.changes.files.length ? ` (${input.changes.files.slice(0, 6).map((f) => f.path).join(', ')}${input.changes.files.length > 6 ? ', ...' : ''})` : ''}`,
+      `Files changed: ${input.changes.files.length}${
+        input.changes.files.length
+          ? ` (${input.changes.files
+              .slice(0, 6)
+              .map((f) => f.path)
+              .join(', ')}${input.changes.files.length > 6 ? ', ...' : ''})`
+          : ''
+      }`,
       `Verification: ${verificationLine}`,
       `Review: ${input.review.verdict}${input.review.findings.length ? ` — ${input.review.findings.length} finding(s), ${blocking.length} blocking` : ' — no findings'}`,
       input.review.summary ? `Reviewer said: ${firstSentences(input.review.summary, 2)}` : '',
@@ -411,7 +531,11 @@ export class JobPipeline {
       importance: input.review.verdict === 'approve' && input.verification.passed ? 0.72 : 0.66,
       confidence: 0.95,
       sourceType: 'job_consolidation',
-      sourceRef: { jobId: input.job.id, runId: input.runId, sessionId: input.job.sessionId ?? undefined },
+      sourceRef: {
+        jobId: input.job.id,
+        runId: input.runId,
+        sessionId: input.job.sessionId ?? undefined,
+      },
       metadata: {
         verdict: input.review.verdict,
         verified: input.verification.passed,
@@ -423,7 +547,9 @@ export class JobPipeline {
     });
 
     // Promote durable project knowledge the agent proposed during work we already paid for.
-    const valid = input.proposals.filter((p): p is MemoryInput => p !== null && p.kind !== 'episode');
+    const valid = input.proposals.filter(
+      (p): p is MemoryInput => p !== null && p.kind !== 'episode',
+    );
     if (valid.length) await memory.rememberMany(valid);
 
     // Unresolved review findings become explicit open items, not silent debt.
@@ -432,10 +558,11 @@ export class JobPipeline {
         scope: 'project',
         scopeId: input.project.id,
         kind: 'unresolved',
-        content: `Open review finding from "${input.job.goal}": ${finding.description} (recommendation: ${finding.recommendation})`.slice(
-          0,
-          600,
-        ),
+        content:
+          `Open review finding from "${input.job.goal}": ${finding.description} (recommendation: ${finding.recommendation})`.slice(
+            0,
+            600,
+          ),
         importance: finding.severity === 'critical' ? 0.85 : 0.7,
         confidence: 0.8,
         sourceType: 'job_consolidation',
@@ -448,10 +575,32 @@ export class JobPipeline {
   }
 }
 
+export function candidateRejectionReason(
+  verification: Pick<VerificationReport, 'passed' | 'ran' | 'failureSummary'>,
+  reviewVerdict: Review['verdict'],
+): string | null {
+  if (!verification.passed) {
+    return verification.ran === 0 && !verification.failureSummary
+      ? 'No deterministic verification commands are configured; candidate remains unverified.'
+      : 'Deterministic verification failed; candidate requires changes.';
+  }
+  return reviewVerdict === 'approve'
+    ? null
+    : `Independent review did not approve the candidate (${reviewVerdict}).`;
+}
+
 function firstSentences(text: string, count: number): string {
-  const clean = text.replace(/```[\s\S]*?```/g, '').replace(/\s+/g, ' ').trim();
-  const sentences = clean.split(/(?<=[.!?])\s+/).slice(0, count).join(' ');
-  return sentences.length > 400 ? `${sentences.slice(0, 397)}...` : sentences || '(no summary provided)';
+  const clean = text
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const sentences = clean
+    .split(/(?<=[.!?])\s+/)
+    .slice(0, count)
+    .join(' ');
+  return sentences.length > 400
+    ? `${sentences.slice(0, 397)}...`
+    : sentences || '(no summary provided)';
 }
 
 export function renderProjectSnapshot(project: Project): string {
@@ -471,7 +620,11 @@ export function renderProjectSnapshot(project: Project): string {
   return lines.filter(Boolean).join('\n');
 }
 
-function buildImplementerPrompt(input: { job: Job; project: Project; contextPack: string }): string {
+function buildImplementerPrompt(input: {
+  job: Job;
+  project: Project;
+  contextPack: string;
+}): string {
   return `You are a senior engineer working inside an isolated git worktree created for this task.
 
 ## Task

@@ -68,6 +68,7 @@ export class ContextPackBuilder {
     const budget = request.budgetTokens ?? this.config.context.budgetTokens;
     const share = this.config.context.sectionShare;
     const selections: ContextSelection[] = [];
+    const selectedMemoryIds = new Set<string>();
     const dropped: ContextPack['dropped'] = [];
     const parts: string[] = [];
     let used = 0;
@@ -86,7 +87,12 @@ export class ContextPackBuilder {
     // ---- Section: core user memory (Layer 2) --------------------------------
     // Always-available, deliberately tiny. Pinned + highest-importance only.
     const coreCap = Math.floor(budget * share.coreUser);
-    const core = this.memory.list({ scope: 'user', scopeId: null, status: 'active', limit: 60 }).items;
+    const core = this.memory.list({
+      scope: 'user',
+      scopeId: null,
+      status: 'active',
+      limit: 60,
+    }).items;
     if (core.length > 0) {
       const lines: string[] = [];
       let coreUsed = 0;
@@ -111,9 +117,11 @@ export class ContextPackBuilder {
           tokens: cost,
           section: 'core_user',
         });
+        selectedMemoryIds.add(memory.id);
       }
       if (lines.length) push(`## What Jarvis knows about you\n${lines.join('\n')}`, coreCap + 20);
-      if (coreDropped) dropped.push({ section: 'core_user', reason: 'section budget', count: coreDropped });
+      if (coreDropped)
+        dropped.push({ section: 'core_user', reason: 'section budget', count: coreDropped });
     }
 
     // ---- Section: project snapshot (Layer 3 rollup) --------------------------
@@ -139,7 +147,16 @@ export class ContextPackBuilder {
     const atomic = await this.memory.retrieve({
       query: request.query,
       scopes,
-      kinds: ['preference', 'fact', 'constraint', 'decision', 'project_knowledge', 'unresolved', 'correction', 'procedure'],
+      kinds: [
+        'preference',
+        'fact',
+        'constraint',
+        'decision',
+        'project_knowledge',
+        'unresolved',
+        'correction',
+        'procedure',
+      ],
       limit: 14,
     });
     const episodes = await this.memory.retrieve({
@@ -150,12 +167,30 @@ export class ContextPackBuilder {
     });
 
     for (const group of [
-      { items: atomic, cap: Math.floor(budget * share.memories), heading: 'Relevant memory', section: 'memories' },
-      { items: episodes, cap: Math.floor(budget * share.episodes), heading: 'Related past work', section: 'episodes' },
+      {
+        items: atomic,
+        cap: Math.floor(budget * share.memories),
+        heading: 'Relevant memory',
+        section: 'memories',
+      },
+      {
+        items: episodes,
+        cap: Math.floor(budget * share.episodes),
+        heading: 'Related past work',
+        section: 'episodes',
+      },
     ]) {
-      const block = renderMemoryBlock(group.items, group.cap, budget - used, group.heading, group.section);
+      const block = renderMemoryBlock(
+        group.items.filter((item) => !selectedMemoryIds.has(item.memory.id)),
+        group.cap,
+        budget - used,
+        group.heading,
+        group.section,
+      );
       selections.push(...block.selections);
-      if (block.skipped) dropped.push({ section: group.section, reason: 'section budget', count: block.skipped });
+      for (const selection of block.selections) selectedMemoryIds.add(selection.memoryId);
+      if (block.skipped)
+        dropped.push({ section: group.section, reason: 'section budget', count: block.skipped });
       if (block.text) {
         parts.push(block.text);
         used += estimateTokens(block.text);
@@ -166,7 +201,8 @@ export class ContextPackBuilder {
     if (request.sessionState?.trim()) {
       const cap = Math.floor(budget * share.session);
       const text = `## Current session state\n${request.sessionState.trim()}`;
-      if (!push(text, cap)) dropped.push({ section: 'session', reason: 'budget exhausted', count: 1 });
+      if (!push(text, cap))
+        dropped.push({ section: 'session', reason: 'budget exhausted', count: 1 });
     }
 
     const rendered = parts.join('\n\n');
@@ -205,8 +241,7 @@ export class ContextPackBuilder {
   /** Read back a stored pack for the "why did Jarvis use this?" UI. */
   getPack(id: string): (ContextPack & { jobId: string | null; createdAt: string }) | null {
     const row = this.db.prepare('SELECT * FROM context_packs WHERE id = ?').get(id) as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     if (!row) return null;
     return {
       id: row.id as string,

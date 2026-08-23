@@ -16,11 +16,7 @@ export type MemoryKind =
 export type MemoryStatus = 'active' | 'superseded' | 'expired' | 'deleted';
 
 export type MemorySourceType =
-  | 'user_explicit'
-  | 'job_consolidation'
-  | 'agent_proposal'
-  | 'system'
-  | 'import';
+  'user_explicit' | 'job_consolidation' | 'agent_proposal' | 'system' | 'import';
 
 export interface MemorySourceRef {
   sessionId?: string;

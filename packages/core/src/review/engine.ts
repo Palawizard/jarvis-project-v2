@@ -3,7 +3,7 @@ import { parseJson } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { AgentRegistry } from '../agents/registry.js';
-import type { ProviderId } from '../agents/types.js';
+import type { AgentRunResult, ProviderId } from '../agents/types.js';
 import type { VerificationReport } from '../verification/engine.js';
 
 export interface ReviewFinding {
@@ -54,15 +54,20 @@ export class ReviewEngine {
     files: { path: string; added: number; removed: number }[];
     verification: VerificationReport;
     contextPack: string;
+    contextPackId: string;
     implementerProvider: ProviderId;
     implementerSummary: string;
     signal?: AbortSignal;
   }): Promise<Review> {
-    this.bus?.emit({ type: 'review.started', jobId: opts.jobId, payload: { files: opts.files.length } });
+    this.bus?.emit({
+      type: 'review.started',
+      jobId: opts.jobId,
+      payload: { files: opts.files.length },
+    });
 
     const routed = await this.agents.route('reviewer', { avoid: opts.implementerProvider });
     if (!routed.provider) {
-      return this.persist({
+      const review = this.persist({
         jobId: opts.jobId,
         runId: null,
         provider: 'none',
@@ -70,6 +75,12 @@ export class ReviewEngine {
         summary: `No reviewer available: ${routed.reason}`,
         findings: [],
       });
+      this.bus?.emit({
+        type: 'review.completed',
+        jobId: opts.jobId,
+        payload: { verdict: 'error', findings: 0, provider: 'none' },
+      });
+      return review;
     }
 
     const prompt = buildReviewPrompt(opts);
@@ -77,32 +88,54 @@ export class ReviewEngine {
     const startedAt = nowIso();
     this.db
       .prepare(
-        `INSERT INTO agent_runs (id, job_id, provider, model, role, cwd, status, started_at)
-         VALUES (?,?,?,?,?,?,?,?)`,
+        `INSERT INTO agent_runs (id, job_id, provider, model, role, cwd, status, context_pack_id, started_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
       )
-      .run(runId, opts.jobId, routed.provider.id, null, 'reviewer', opts.cwd, 'running', startedAt);
+      .run(
+        runId,
+        opts.jobId,
+        routed.provider.id,
+        null,
+        'reviewer',
+        opts.cwd,
+        'running',
+        opts.contextPackId,
+        startedAt,
+      );
 
-    const result = await routed.provider.run(
-      {
-        cwd: opts.cwd,
-        prompt,
-        role: 'reviewer',
-        ...(opts.signal ? { signal: opts.signal } : {}),
-      },
-      (event) => {
-        if (event.kind === 'text') {
-          this.bus?.emit({
-            type: 'agent.output',
-            jobId: opts.jobId,
-            runId,
-            payload: { role: 'reviewer', text: event.text.slice(0, 2000) },
-          });
-        }
-      },
-    );
+    let result: AgentRunResult;
+    try {
+      result = await routed.provider.run(
+        {
+          cwd: opts.cwd,
+          prompt,
+          role: 'reviewer',
+          ...(opts.signal ? { signal: opts.signal } : {}),
+        },
+        (event) => {
+          if (event.kind === 'text') {
+            this.bus?.emit({
+              type: 'agent.output',
+              jobId: opts.jobId,
+              runId,
+              payload: { role: 'reviewer', text: event.text.slice(0, 2000) },
+            });
+          }
+        },
+      );
+    } catch (error) {
+      result = {
+        status: 'failed',
+        result: '',
+        error: error instanceof Error ? error.message : String(error),
+        memoryProposals: [],
+      };
+    }
 
     this.db
-      .prepare(`UPDATE agent_runs SET status=?, result=?, error=?, external_session_id=?, ended_at=? WHERE id=?`)
+      .prepare(
+        `UPDATE agent_runs SET status=?, result=?, error=?, external_session_id=?, ended_at=? WHERE id=?`,
+      )
       .run(
         result.status === 'completed' ? 'completed' : 'failed',
         result.result.slice(0, 20_000),
@@ -114,7 +147,7 @@ export class ReviewEngine {
 
     if (result.status !== 'completed') {
       // A reviewer failure is a real, visible state — not a silent approval.
-      return this.persist({
+      const review = this.persist({
         jobId: opts.jobId,
         runId,
         provider: routed.provider.id,
@@ -122,6 +155,13 @@ export class ReviewEngine {
         summary: `Reviewer failed: ${result.error ?? 'unknown error'}`,
         findings: [],
       });
+      this.bus?.emit({
+        type: 'review.completed',
+        jobId: opts.jobId,
+        runId,
+        payload: { verdict: 'error', findings: 0, provider: routed.provider.id },
+      });
+      return review;
     }
 
     const parsed = parseReviewOutput(result.result);
@@ -137,7 +177,11 @@ export class ReviewEngine {
       type: 'review.completed',
       jobId: opts.jobId,
       runId,
-      payload: { verdict: review.verdict, findings: review.findings.length, provider: routed.provider.id },
+      payload: {
+        verdict: review.verdict,
+        findings: review.findings.length,
+        provider: routed.provider.id,
+      },
     });
     return review;
   }
@@ -188,7 +232,10 @@ function buildReviewPrompt(opts: {
   contextPack: string;
   implementerSummary: string;
 }): string {
-  const diff = opts.diff.length > MAX_DIFF_CHARS ? `${opts.diff.slice(0, MAX_DIFF_CHARS)}\n[diff truncated]` : opts.diff;
+  const diff =
+    opts.diff.length > MAX_DIFF_CHARS
+      ? `${opts.diff.slice(0, MAX_DIFF_CHARS)}\n[diff truncated]`
+      : opts.diff;
   const verification = opts.verification.results
     .map((r) => `- ${r.name}: ${r.status}${r.exitCode !== null ? ` (exit ${r.exitCode})` : ''}`)
     .join('\n');
@@ -257,7 +304,9 @@ export function parseReviewOutput(text: string): {
   summary: string;
   findings: ReviewFinding[];
 } {
-  const blocks = [...text.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)].map((m) => m[1]).filter(Boolean);
+  const blocks = [...text.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)]
+    .map((m) => m[1])
+    .filter(Boolean);
   // Prefer the last block: models often show an example before their answer.
   for (const block of blocks.reverse()) {
     try {

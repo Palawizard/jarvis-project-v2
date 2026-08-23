@@ -1,10 +1,76 @@
 import { describe, it, expect } from 'vitest';
+import { spawn } from 'node:child_process';
 import { extractMemoryProposals } from './proposals.js';
 import { proposalToInput } from './types.js';
-import { handleClaudeEvent } from './claude.js';
+import { buildClaudeArgs, handleClaudeEvent } from './claude.js';
+import { buildCodexArgs } from './codex.js';
+import { jsonlProtocolError, killTree, runJsonlProcess } from './spawn.js';
 import { parseReviewOutput } from '../review/engine.js';
 import { detectExplicitCommand, scoreCandidate } from '../memory/policy.js';
 import type { AgentEvent } from './types.js';
+
+describe('provider process protocol', () => {
+  it('waits for a spawned process to exit when its tree is cancelled', async () => {
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+      detached: process.platform !== 'win32',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await killTree(child);
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+  });
+
+  it('puts Codex exec options before resume', () => {
+    const args = buildCodexArgs(
+      {
+        cwd: 'C:\\repo',
+        prompt: 'fix it',
+        role: 'fixer',
+        resumeSessionId: 'thread-1',
+      },
+      'gpt-5',
+    );
+    expect(args.indexOf('--sandbox')).toBeLessThan(args.indexOf('resume'));
+    expect(args.indexOf('-C')).toBeLessThan(args.indexOf('resume'));
+    expect(args.slice(-3)).toEqual(['resume', 'thread-1', '-']);
+  });
+
+  it('forces Claude reviewers into read-only plan mode', () => {
+    const reviewer = buildClaudeArgs(
+      { cwd: 'C:\\repo', prompt: 'review', role: 'reviewer' },
+      'sonnet',
+      'acceptEdits',
+    );
+    const implementer = buildClaudeArgs(
+      { cwd: 'C:\\repo', prompt: 'implement', role: 'implementer' },
+      'sonnet',
+      'acceptEdits',
+    );
+    expect(reviewer[reviewer.indexOf('--permission-mode') + 1]).toBe('plan');
+    expect(implementer[implementer.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+  });
+
+  it('records malformed JSONL and rejects a stream with no terminal event', async () => {
+    const outcome = await runJsonlProcess({
+      cli: {
+        command: process.execPath,
+        prefixArgs: ['-e', 'process.stdout.write("not-json\\n")'],
+        source: 'test',
+      },
+      args: [],
+      cwd: process.cwd(),
+      stdin: '',
+      timeoutMs: 5_000,
+      scope: 'test',
+      onLine: () => undefined,
+    });
+    expect(outcome.malformedLines).toBe(1);
+    expect(jsonlProtocolError('test provider', outcome, false)).toContain('malformed JSONL');
+    expect(jsonlProtocolError('test provider', { malformedLines: 0 }, false)).toContain(
+      'without a terminal structured event',
+    );
+  });
+});
 
 describe('memory proposal extraction', () => {
   it('parses a well-formed block and strips it from the visible result', () => {
@@ -24,7 +90,9 @@ describe('memory proposal extraction', () => {
   });
 
   it('accepts a single object and a {memories:[...]} wrapper', () => {
-    const single = extractMemoryProposals('```jarvis-memory\n{"type":"fact","content":"Node 22 is required here."}\n```');
+    const single = extractMemoryProposals(
+      '```jarvis-memory\n{"type":"fact","content":"Node 22 is required here."}\n```',
+    );
     expect(single.proposals).toHaveLength(1);
     const wrapped = extractMemoryProposals(
       '```jarvis-memory\n{"memories":[{"type":"fact","content":"Node 22 is required here."}]}\n```',
@@ -78,7 +146,11 @@ describe('proposal validation before persistence', () => {
 
   it('refuses the agent scope outright', () => {
     const input = proposalToInput(
-      { type: 'fact', scope: 'agent', content: 'Something the agent wants to remember about itself.' },
+      {
+        type: 'fact',
+        scope: 'agent',
+        content: 'Something the agent wants to remember about itself.',
+      },
       { projectId: 'prj_1' },
     );
     expect(input).toBeNull();
@@ -86,12 +158,21 @@ describe('proposal validation before persistence', () => {
 
   it('binds a valid proposal to the run provenance', () => {
     const input = proposalToInput(
-      { type: 'decision', scope: 'project', content: 'Use SQLite for local persistence.', reason: 'chosen in this job' },
+      {
+        type: 'decision',
+        scope: 'project',
+        content: 'Use SQLite for local persistence.',
+        reason: 'chosen in this job',
+      },
       { projectId: 'prj_1', sessionId: 'ses_1', jobId: 'job_1', runId: 'run_1' },
     );
     expect(input?.scopeId).toBe('prj_1');
     expect(input?.sourceType).toBe('agent_proposal');
-    expect(input?.sourceRef).toMatchObject({ jobId: 'job_1', runId: 'run_1', note: 'chosen in this job' });
+    expect(input?.sourceRef).toMatchObject({
+      jobId: 'job_1',
+      runId: 'run_1',
+      note: 'chosen in this job',
+    });
   });
 });
 
@@ -117,9 +198,23 @@ describe('claude stream-json translation', () => {
     const { out, state, text } = collect([
       { type: 'system', subtype: 'init', session_id: 's1', model: 'claude-sonnet-5' },
       { type: 'assistant', message: { content: [{ type: 'text', text: 'Working on it.' }] } },
-      { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Edit', input: { path: 'a.ts' } }] } },
-      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } },
-      { type: 'result', subtype: 'success', result: 'Done.', usage: { output_tokens: 5 }, is_error: false },
+      {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'tool_use', id: 't1', name: 'Edit', input: { path: 'a.ts' } }],
+        },
+      },
+      {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Done.',
+        usage: { output_tokens: 5 },
+        is_error: false,
+      },
     ]);
 
     expect(out.map((e) => e.kind)).toEqual(['started', 'text', 'tool_started', 'tool_completed']);
@@ -138,12 +233,16 @@ describe('claude stream-json translation', () => {
   });
 
   it('surfaces an error result as a failure, not a success', () => {
-    const { state } = collect([{ type: 'result', subtype: 'error_max_turns', is_error: true, result: 'hit max turns' }]);
+    const { state } = collect([
+      { type: 'result', subtype: 'error_max_turns', is_error: true, result: 'hit max turns' },
+    ]);
     expect(state.failure).toBe('hit max turns');
   });
 
   it('reports rate limiting as a waiting event', () => {
-    const { out } = collect([{ type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } }]);
+    const { out } = collect([
+      { type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } },
+    ]);
     expect(out[0]).toMatchObject({ kind: 'waiting' });
   });
 
@@ -191,7 +290,9 @@ And my actual review:
   });
 
   it('accepts a clean approval with no findings', () => {
-    const parsed = parseReviewOutput('```json\n{"verdict":"approve","summary":"Clean and focused.","findings":[]}\n```');
+    const parsed = parseReviewOutput(
+      '```json\n{"verdict":"approve","summary":"Clean and focused.","findings":[]}\n```',
+    );
     expect(parsed.verdict).toBe('approve');
     expect(parsed.findings).toEqual([]);
   });
@@ -245,7 +346,11 @@ describe('candidate scoring (Stage B, no LLM)', () => {
       opts,
     );
     const firm = scoreCandidate(
-      { ...base, kind: 'decision', content: 'The queue uses Redis streams with a five minute visibility timeout.' },
+      {
+        ...base,
+        kind: 'decision',
+        content: 'The queue uses Redis streams with a five minute visibility timeout.',
+      },
       opts,
     );
     expect(firm.importance).toBeGreaterThan(hedged.importance);
@@ -253,11 +358,19 @@ describe('candidate scoring (Stage B, no LLM)', () => {
 
   it('rewards concrete identifiers', () => {
     const concrete = scoreCandidate(
-      { ...base, kind: 'project_knowledge', content: 'The retry policy lives in src/queue/retry.ts and backs off exponentially.' },
+      {
+        ...base,
+        kind: 'project_knowledge',
+        content: 'The retry policy lives in src/queue/retry.ts and backs off exponentially.',
+      },
       opts,
     );
     const vague = scoreCandidate(
-      { ...base, kind: 'project_knowledge', content: 'The retry policy is somewhere in the queue code and backs off.' },
+      {
+        ...base,
+        kind: 'project_knowledge',
+        content: 'The retry policy is somewhere in the queue code and backs off.',
+      },
       opts,
     );
     expect(concrete.importance).toBeGreaterThan(vague.importance);

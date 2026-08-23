@@ -57,7 +57,11 @@ export class Jarvis {
     this.verification = new VerificationEngine(this.db, config.artifactsDir, this.bus);
     this.review = new ReviewEngine(this.db, this.agents, this.bus);
     this.visualQa = new VisualQaEngine(this.db, config.artifactsDir, this.bus);
-    this.tools = registerBuiltinTools({ memory: this.memory, projects: this.projects, jobs: this.jobs });
+    this.tools = registerBuiltinTools({
+      memory: this.memory,
+      projects: this.projects,
+      jobs: this.jobs,
+    });
     this.pipeline = new JobPipeline({
       db: this.db,
       bus: this.bus,
@@ -81,7 +85,11 @@ export class Jarvis {
    * Startup housekeeping. Idempotent and safe to run on every boot.
    * Order matters: recover crashed jobs before anything reads job state.
    */
-  async boot(): Promise<{ recovered: { jobs: number; runs: number }; expired: number; selfProject: string | null }> {
+  async boot(): Promise<{
+    recovered: { jobs: number; runs: number };
+    expired: number;
+    selfProject: string | null;
+  }> {
     const recovered = this.jobs.recoverInterrupted();
     if (recovered.jobs || recovered.runs) {
       log.warn('recovered interrupted work from a previous run', recovered);

@@ -88,7 +88,7 @@ export function JobDetailView({
             Start
           </button>
         )}
-        {job.stage === 'awaiting_user' && (
+        {job.stage === 'awaiting_user' && detail.data.acceptanceEligible && (
           <button
             className="btn sm primary"
             onClick={() => void api.acceptJob(job.id).then(detail.reload)}
@@ -102,6 +102,11 @@ export function JobDetailView({
         <Card title="Failure">
           <div style={{ color: 'var(--err)' }}>{job.error}</div>
         </Card>
+      )}
+      {job.stage === 'awaiting_user' && detail.data.acceptanceError && (
+        <div className="alert error">
+          This stored candidate cannot be accepted: {detail.data.acceptanceError}
+        </div>
       )}
 
       <div className="grid cols-2" style={{ alignItems: 'start' }}>

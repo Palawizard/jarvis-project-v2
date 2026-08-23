@@ -176,6 +176,8 @@ export interface JobDetail {
   job: Job;
   stages: JobStage[];
   running: boolean;
+  acceptanceEligible: boolean;
+  acceptanceError: string | null;
   runs: AgentRun[];
   candidate: CandidateChanges | null;
   verifications: Verification[];

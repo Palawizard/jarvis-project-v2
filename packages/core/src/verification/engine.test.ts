@@ -87,6 +87,15 @@ describe('deterministic verification', () => {
     expect(fs.existsSync(outputPath)).toBe(true);
   });
 
+  it('reconstructs acceptance evidence from the latest fix cycle only', async () => {
+    await engine.run({ jobId: JOB_ID, cwd: home, commands: { test: FAIL }, cycle: 0 });
+    await engine.run({ jobId: JOB_ID, cwd: home, commands: { test: OK }, cycle: 1 });
+    const latest = engine.latestReport(JOB_ID);
+    expect(latest.passed).toBe(true);
+    expect(latest.results).toHaveLength(1);
+    expect(latest.results[0]?.cycle).toBe(1);
+  });
+
   it('emits step and completion events', async () => {
     await engine.run({ jobId: JOB_ID, cwd: home, commands: { lint: OK } });
     const types = bus.list({ jobId: JOB_ID }).map((e) => e.type);

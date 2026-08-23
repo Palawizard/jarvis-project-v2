@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import {
   detectExplicitCommand,
+  candidateRejectionReason,
   GitWorkspace,
   normaliseGoal,
   renderProjectSnapshot,
@@ -324,6 +325,11 @@ export function createRoutes(jarvis: Jarvis): Hono {
     const runs = jarvis.jobs.runs(job.id);
     const packIds = [...new Set(runs.map((r) => r.contextPackId).filter(Boolean))] as string[];
     const running = jarvis.pipeline.isRunning(job.id);
+    const reviews = jarvis.review.list(job.id);
+    const acceptanceError = candidateRejectionReason(
+      jarvis.verification.latestReport(job.id),
+      reviews.at(-1)?.verdict ?? 'error',
+    );
     const terminal = ['awaiting_user', 'completed', 'failed', 'cancelled'].includes(job.stage);
     let candidate: Awaited<ReturnType<GitWorkspace['collectChanges']>> | null = null;
     if (
@@ -338,10 +344,12 @@ export function createRoutes(jarvis: Jarvis): Hono {
       job,
       stages: PIPELINE_STAGES,
       running,
+      acceptanceEligible: job.stage === 'awaiting_user' && !acceptanceError,
+      acceptanceError,
       runs,
       candidate,
       verifications: jarvis.verification.list(job.id),
-      reviews: jarvis.review.list(job.id),
+      reviews,
       visualQa: jarvis.visualQa.list(job.id),
       events: jarvis.bus.list({ jobId: job.id, limit: 400 }),
       episode: job.episodeId ? jarvis.memory.get(job.episodeId) : null,
@@ -368,6 +376,11 @@ export function createRoutes(jarvis: Jarvis): Hono {
     const job = jarvis.jobs.get(c.req.param('id'));
     if (!job) return fail('job not found', 404);
     if (job.stage !== 'awaiting_user') return fail(`job is ${job.stage}, not awaiting_user`, 409);
+    const evidenceError = candidateRejectionReason(
+      jarvis.verification.latestReport(job.id),
+      jarvis.review.list(job.id).at(-1)?.verdict ?? 'error',
+    );
+    if (evidenceError) return fail(`candidate is not acceptable: ${evidenceError}`, 409);
     if (!job.worktreePath || !job.baseRef || !job.headRef || !fs.existsSync(job.worktreePath)) {
       return fail('candidate worktree or reviewed identity is unavailable', 409);
     }

@@ -16,6 +16,7 @@ export interface VerificationResult {
   output: string;
   outputPath: string | null;
   durationMs: number;
+  cycle: number;
 }
 
 export interface VerificationReport {
@@ -102,6 +103,7 @@ export class VerificationEngine {
             : fullOutput,
         outputPath,
         durationMs,
+        cycle,
       };
       results.push(result);
 
@@ -174,7 +176,18 @@ export class VerificationEngine {
       output: row.output as string,
       outputPath: (row.output_path as string) ?? null,
       durationMs: Number(row.duration_ms),
+      cycle: Number(row.cycle),
     }));
+  }
+
+  /** Reconstruct the final deterministic gate from persisted evidence. */
+  latestReport(jobId: string): VerificationReport {
+    const all = this.list(jobId);
+    const cycle = all.reduce((latest, result) => Math.max(latest, result.cycle), -1);
+    const results = all.filter((result) => result.cycle === cycle);
+    const checks = results.filter((result) => result.name !== 'install');
+    const passed = checks.length > 0 && results.every((result) => result.status === 'passed');
+    return { results, passed, ran: checks.length, failureSummary: summariseFailures(results) };
   }
 }
 

@@ -55,7 +55,7 @@ export {
   type JobStage,
   type JobStatus,
 } from './jobs/machine.js';
-export { JobPipeline, renderProjectSnapshot } from './jobs/pipeline.js';
+export { JobPipeline, candidateRejectionReason, renderProjectSnapshot } from './jobs/pipeline.js';
 
 export { AgentRegistry } from './agents/registry.js';
 export { ClaudeProvider } from './agents/claude.js';

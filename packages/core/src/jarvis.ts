@@ -14,6 +14,7 @@ import { AgentRegistry } from './agents/registry.js';
 import { VerificationEngine } from './verification/engine.js';
 import { ReviewEngine } from './review/engine.js';
 import { VisualQaEngine } from './visualqa/engine.js';
+import { CandidateApplicationService } from './application/service.js';
 import { registerBuiltinTools } from './tools/builtin.js';
 import type { ToolRegistry } from './tools/registry.js';
 import { createLogger } from './logger.js';
@@ -40,6 +41,7 @@ export class Jarvis {
   readonly review: ReviewEngine;
   readonly visualQa: VisualQaEngine;
   readonly pipeline: JobPipeline;
+  readonly applications: CandidateApplicationService;
   readonly tools: ToolRegistry;
 
   constructor(config: JarvisConfig = getConfig()) {
@@ -57,6 +59,15 @@ export class Jarvis {
     this.verification = new VerificationEngine(this.db, config.artifactsDir, this.bus);
     this.review = new ReviewEngine(this.db, this.agents, this.bus, this.config);
     this.visualQa = new VisualQaEngine(this.db, config.artifactsDir, this.bus);
+    this.applications = new CandidateApplicationService(
+      this.db,
+      this.bus,
+      this.jobs,
+      this.projects,
+      this.verification,
+      this.review,
+      config.worktreesDir,
+    );
     this.tools = registerBuiltinTools({
       memory: this.memory,
       projects: this.projects,
@@ -91,8 +102,14 @@ export class Jarvis {
     selfProject: string | null;
   }> {
     const recovered = this.jobs.recoverInterrupted();
+    const interruptedApplications = this.applications.recoverInterrupted();
     if (recovered.jobs || recovered.runs) {
       log.warn('recovered interrupted work from a previous run', recovered);
+    }
+    if (interruptedApplications) {
+      log.warn('candidate applications require inspection after restart', {
+        applications: interruptedApplications,
+      });
     }
     const expired = this.memory.expireStale();
     this.memory.trimCoreUserMemory();

@@ -60,6 +60,12 @@ export {
   type JobStatus,
 } from './jobs/machine.js';
 export { JobPipeline, candidateRejectionReason, renderProjectSnapshot } from './jobs/pipeline.js';
+export {
+  CandidateApplicationService,
+  CandidateApplicationError,
+  type CandidateApplication,
+  type CandidateApplicationStatus,
+} from './application/service.js';
 
 export { AgentRegistry } from './agents/registry.js';
 export { ClaudeProvider } from './agents/claude.js';
@@ -73,6 +79,7 @@ export {
   GitError,
   type RepoStatus,
   type Worktree,
+  type FastForwardPreflight,
 } from './git/workspace.js';
 export {
   VerificationEngine,

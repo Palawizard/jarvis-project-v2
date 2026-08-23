@@ -75,6 +75,14 @@ export interface Worktree {
   baseRef: string;
 }
 
+export interface FastForwardPreflight {
+  targetRoot: string;
+  targetBranch: string;
+  targetHead: string;
+  candidateBase: string;
+  candidateHead: string;
+}
+
 /**
  * Isolated workspace manager.
  *
@@ -209,7 +217,80 @@ export class GitWorkspace {
     if (expectedHead && changes.head !== expectedHead) {
       throw new Error(`candidate HEAD changed after review (${expectedHead} -> ${changes.head})`);
     }
+    await requireAncestor(worktreePath, baseRef, changes.head, 'candidate_base_mismatch');
     return changes;
+  }
+
+  /** Validate both repositories and prove that applying the reviewed commit is FF-only. */
+  async preflightFastForward(opts: {
+    targetRoot: string;
+    worktreePath: string;
+    baseRef: string;
+    expectedHead: string;
+  }): Promise<FastForwardPreflight> {
+    const target = await repoStatus(opts.targetRoot);
+    if (!target.isRepo || !target.root || !samePath(target.root, opts.targetRoot)) {
+      throw new GitError(
+        'target repository identity does not match the registered project',
+        'target_identity',
+      );
+    }
+    if (!target.head) throw new GitError('target repository has no HEAD', 'target_head_missing');
+    if (!target.branch || target.branch === 'HEAD') {
+      throw new GitError('target repository is in detached HEAD state', 'target_branch_unknown');
+    }
+    if (target.dirty) {
+      throw new GitError(
+        `target working tree is dirty: ${target.dirtyFiles.join(', ')}`,
+        'target_dirty',
+      );
+    }
+
+    const changes = await this.validateCandidate(
+      opts.worktreePath,
+      opts.baseRef,
+      opts.expectedHead,
+    );
+    if ((await repositoryIdentity(target.root)) !== (await repositoryIdentity(opts.worktreePath))) {
+      throw new GitError(
+        'candidate does not belong to the target repository',
+        'repository_mismatch',
+      );
+    }
+    await requireAncestor(target.root, target.head, changes.head, 'target_diverged');
+
+    return {
+      targetRoot: target.root,
+      targetBranch: target.branch,
+      targetHead: target.head,
+      candidateBase: opts.baseRef,
+      candidateHead: changes.head,
+    };
+  }
+
+  /** Re-runs preflight immediately before the only target mutation. */
+  async fastForward(opts: {
+    targetRoot: string;
+    worktreePath: string;
+    baseRef: string;
+    expectedHead: string;
+  }): Promise<FastForwardPreflight & { targetHeadAfter: string }> {
+    const preflight = await this.preflightFastForward(opts);
+    if (preflight.targetHead !== preflight.candidateHead) {
+      await git(preflight.targetRoot, ['merge', '--ff-only', preflight.candidateHead]);
+    }
+    const after = await repoStatus(preflight.targetRoot);
+    if (
+      after.head !== preflight.candidateHead ||
+      after.dirty ||
+      after.branch !== preflight.targetBranch
+    ) {
+      throw new GitError(
+        'target state did not match the reviewed candidate after fast-forward',
+        'target_postcondition_failed',
+      );
+    }
+    return { ...preflight, targetHeadAfter: after.head };
   }
 
   /** Commit whatever the worker left uncommitted, so the candidate is a real ref. */
@@ -236,4 +317,31 @@ export class GitWorkspace {
       .filter((l) => l.startsWith('worktree '))
       .map((l) => l.slice('worktree '.length));
   }
+}
+
+async function repositoryIdentity(dir: string): Promise<string> {
+  const common = await git(dir, ['rev-parse', '--git-common-dir']);
+  return canonicalPath(path.isAbsolute(common) ? common : path.resolve(dir, common));
+}
+
+async function requireAncestor(
+  cwd: string,
+  ancestor: string,
+  descendant: string,
+  code: string,
+): Promise<void> {
+  try {
+    await git(cwd, ['merge-base', '--is-ancestor', ancestor, descendant]);
+  } catch {
+    throw new GitError(`${ancestor} is not an ancestor of ${descendant}`, code);
+  }
+}
+
+function samePath(a: string, b: string): boolean {
+  return canonicalPath(a) === canonicalPath(b);
+}
+
+function canonicalPath(value: string): string {
+  const resolved = fs.realpathSync.native(path.resolve(value));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }

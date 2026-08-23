@@ -137,7 +137,11 @@ export class AgentRegistry {
       ...this.health.get(provider),
       lastFailureAt: at.toISOString(),
     };
-    if (/rate[ -]?limit|too many requests|quota/i.test(result.error ?? '')) {
+    if (
+      /rate[ -]?limit|usage limit|spend limit|session limit|too many requests|quota/i.test(
+        result.error ?? '',
+      )
+    ) {
       next.cooldownUntil = new Date(at.getTime() + this.config.agents.cooldownMs).toISOString();
       this.deps.bus?.emit({
         type: 'agent.rate_limited',

@@ -107,7 +107,10 @@ describe('AgentRegistry v2', () => {
       now: () => now,
       cooldownMs: 60_000,
     });
-    router.recordResult('claude', { status: 'failed', error: 'rate limit exceeded' });
+    router.recordResult('claude', {
+      status: 'failed',
+      error: "You've hit your monthly spend limit; your session limit resets later",
+    });
     expect((await router.route('implementer')).provider?.id).toBe('codex');
     expect(
       (await router.capabilities()).find((c) => c.id === 'claude')?.cooldownUntil,

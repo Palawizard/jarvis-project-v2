@@ -149,7 +149,9 @@ async function smoke(
 }
 
 function classifyFailure(error: string): LiveResult['outcome'] {
-  if (/rate.?limit|usage limit|too many requests/i.test(error)) return 'rate_limited';
+  if (/rate.?limit|usage limit|spend limit|session limit|too many requests/i.test(error)) {
+    return 'rate_limited';
+  }
   if (/not logged in|unauthenticated|authentication|\b401\b|\b403\b/i.test(error)) {
     return 'unauthenticated';
   }

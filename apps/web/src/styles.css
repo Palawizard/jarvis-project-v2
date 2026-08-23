@@ -133,7 +133,7 @@ select {
   margin-top: auto;
   padding-top: 16px;
   font-size: 11px;
-  color: var(--text-faint);
+  color: var(--text-dim);
 }
 .sidebar-foot div {
   display: flex;
@@ -197,6 +197,7 @@ select {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px;
+  min-width: 0;
 }
 .card + .card {
   margin-top: 12px;
@@ -357,6 +358,12 @@ textarea {
   color: var(--text-faint);
 }
 
+/* Wide tables scroll inside their own box; cards stay non-clipping so
+   dropdowns and popovers can still overflow them. */
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
 table {
   width: 100%;
   border-collapse: collapse;
@@ -617,19 +624,26 @@ code {
 }
 
 @media (max-width: 760px) {
+  /* The nav bar is sized by its content; only the main column absorbs the
+     leftover height. Without this the auto rows share the free space and the
+     nav pills stretch to fill a half-viewport-tall bar. */
   .app {
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
   }
   .sidebar {
     flex-direction: row;
+    align-items: center;
     overflow-x: auto;
-    padding: 8px;
+    overflow-y: hidden;
+    padding: 8px 12px;
+    scroll-padding-inline: 12px;
     gap: 2px;
     border-right: 0;
     border-bottom: 1px solid var(--border);
   }
   .brand {
-    padding: 4px 8px;
+    padding: 4px 8px 4px 0;
     flex: 0 0 auto;
   }
   .sidebar .nav-item {
@@ -637,30 +651,40 @@ code {
     width: auto;
     gap: 6px;
   }
+  /* Scroll containers drop their inline-end padding, so the trailing gutter
+     has to be a real box the nav can scroll to. */
+  .sidebar::after {
+    content: '';
+    flex: 0 0 12px;
+    align-self: stretch;
+  }
   .sidebar-foot {
     display: none;
   }
   .page {
     padding: 16px;
   }
+  /* Title owns the first row; the project selector and theme toggle share the
+     second, so the toggle is never orphaned on a row of its own. */
   .topbar {
     flex-wrap: wrap;
     padding: 12px 16px;
   }
   .topbar h1 {
-    flex: 1 1 auto;
+    flex: 1 0 100%;
   }
   .topbar .spacer {
     display: none;
   }
   .topbar-project {
-    order: 1;
-    flex: 1 1 240px;
+    order: 2;
+    flex: 1 1 140px;
     min-width: 0;
     width: auto;
   }
   .theme-toggle {
-    order: 1;
+    order: 3;
+    flex: 0 0 auto;
   }
   .api-error {
     margin: 12px 16px 0;

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -96,6 +96,11 @@ export async function startCandidateRuntime(opts: {
   child.stderr?.on('data', capture);
   const stop = () => killTree(child);
 
+  // One budget covers the whole startup: health identity first, then the web
+  // listener Visual QA actually opens. The API can be healthy minutes before
+  // the frontend binds, so returning on health alone hands out a dead baseUrl.
+  const deadline = Date.now() + (opts.timeoutMs ?? 90_000);
+
   try {
     await new Promise<void>((resolve, reject) => {
       child.once('spawn', resolve);
@@ -105,14 +110,29 @@ export async function startCandidateRuntime(opts: {
     if (opts.project.isSelf && !expectedCommit) {
       throw new Error('candidate runtime commit identity is unavailable');
     }
-    await waitForHealth(
-      child,
-      healthUrl,
+    const waiting = {
       logs,
-      opts.signal,
-      opts.timeoutMs ?? 90_000,
-      opts.project.isSelf ? { runtimeNonce, commit: expectedCommit as string } : undefined,
-    );
+      deadline,
+      exited: () =>
+        child.exitCode !== null || child.signalCode !== null
+          ? { code: child.exitCode, signal: child.signalCode }
+          : null,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    };
+    await waitUntilReady({
+      ...waiting,
+      probe: () =>
+        probeHealth(
+          healthUrl,
+          opts.project.isSelf ? { runtimeNonce, commit: expectedCommit as string } : undefined,
+        ),
+      failure: `candidate runtime did not pass healthcheck at ${healthUrl}`,
+    });
+    await waitUntilReady({
+      ...waiting,
+      probe: () => probeWeb(baseUrl),
+      failure: `candidate API is healthy but web frontend did not become ready at ${baseUrl}`,
+    });
     return {
       baseUrl,
       healthUrl,
@@ -147,47 +167,68 @@ async function reservePort(): Promise<{ port: number; release(): Promise<void> }
   };
 }
 
-async function waitForHealth(
-  child: ChildProcess,
-  url: string,
-  logs: string[],
-  signal: AbortSignal | undefined,
-  timeoutMs: number,
-  identity?: { runtimeNonce: string; commit: string },
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  let exitCode: number | null = null;
-  child.once('exit', (code) => {
-    exitCode = code;
-  });
-  while (Date.now() < deadline) {
-    if (signal?.aborted) throw new Error('candidate runtime start cancelled');
-    if (exitCode !== null) {
-      throw new Error(`candidate runtime exited (${exitCode}):\n${logs.join('').slice(-2000)}`);
+/** Poll a readiness probe until it passes, the child dies, or the budget ends. */
+async function waitUntilReady(opts: {
+  probe: () => Promise<boolean>;
+  failure: string;
+  logs: string[];
+  deadline: number;
+  exited: () => { code: number | null; signal: NodeJS.Signals | null } | null;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const tail = () => opts.logs.join('').slice(-2000);
+  const assertActive = () => {
+    if (opts.signal?.aborted) throw new Error('candidate runtime start cancelled');
+    const exit = opts.exited();
+    if (exit) {
+      throw new Error(`candidate runtime exited (${exit.code ?? exit.signal}):\n${tail()}`);
     }
-    try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
-      if (response.ok) {
-        const body = (await response.json().catch(() => null)) as {
-          status?: string;
-          ok?: boolean;
-          runtimeNonce?: string;
-          commit?: string;
-        };
-        const healthy = body?.status === 'ok' || body?.ok === true;
-        const identified =
-          !identity ||
-          (body?.runtimeNonce === identity.runtimeNonce && body?.commit === identity.commit);
-        if (healthy && identified) return;
-      }
-    } catch {
-      // Still starting.
+  };
+  while (Date.now() < opts.deadline) {
+    assertActive();
+    if (await opts.probe()) {
+      assertActive();
+      if (Date.now() < opts.deadline) return;
+      break;
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error(
-    `candidate runtime did not pass healthcheck at ${url}:\n${logs.join('').slice(-2000)}`,
-  );
+  assertActive();
+  throw new Error(`${opts.failure}:\n${tail()}`);
+}
+
+async function probeHealth(
+  url: string,
+  identity?: { runtimeNonce: string; commit: string },
+): Promise<boolean> {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
+    if (!response.ok) return false;
+    const body = (await response.json().catch(() => null)) as {
+      status?: string;
+      ok?: boolean;
+      runtimeNonce?: string;
+      commit?: string;
+    };
+    const healthy = body?.status === 'ok' || body?.ok === true;
+    const identified =
+      !identity ||
+      (body?.runtimeNonce === identity.runtimeNonce && body?.commit === identity.commit);
+    return healthy && identified;
+  } catch {
+    return false; // Still starting.
+  }
+}
+
+/** The frontend only has to answer: any normal response means it is listening. */
+async function probeWeb(baseUrl: string): Promise<boolean> {
+  try {
+    const response = await fetch(baseUrl, { signal: AbortSignal.timeout(2000) });
+    await response.body?.cancel();
+    return response.status < 500;
+  } catch {
+    return false; // Still starting.
+  }
 }
 
 function validateRuntimeConfig(executable: string, args: string[]): void {

@@ -76,6 +76,20 @@ export interface JarvisConfig {
     /** Retention for raw history rows, in days. 0 = keep forever. */
     rawHistoryRetentionDays: number;
   };
+
+  tools: {
+    /** Hard ceiling on one tool invocation, unless the tool declares its own. */
+    defaultTimeoutMs: number;
+    /** How long an unanswered permission request stays answerable. */
+    approvalTtlMs: number;
+    /** Retention for finished tool audit rows, in days. 0 = keep forever. */
+    auditRetentionDays: number;
+    /**
+     * Ceiling on the JSON kept per input/result. Arguments above it are refused
+     * rather than truncated, because a truncated payload must never be replayed.
+     */
+    maxRecordChars: number;
+  };
 }
 
 function envInt(name: string, fallback: number): number {
@@ -152,6 +166,12 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
     pipeline: {
       maxFixCycles: envInt('JARVIS_MAX_FIX_CYCLES', 1),
       rawHistoryRetentionDays: envInt('JARVIS_RAW_HISTORY_RETENTION_DAYS', 90),
+    },
+    tools: {
+      defaultTimeoutMs: envInt('JARVIS_TOOL_TIMEOUT_MS', 60_000),
+      approvalTtlMs: envInt('JARVIS_TOOL_APPROVAL_TTL_MS', 24 * 60 * 60_000),
+      auditRetentionDays: envInt('JARVIS_TOOL_AUDIT_RETENTION_DAYS', 90),
+      maxRecordChars: envInt('JARVIS_TOOL_MAX_RECORD_CHARS', 4000),
     },
     ...overrides,
   };

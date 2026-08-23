@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, type Health, type Job, type JarvisEvent, type Project, type Session } from './api.ts';
+import {
+  api,
+  type Health,
+  type Job,
+  type JarvisEvent,
+  type Project,
+  type Session,
+  type ToolExecution,
+} from './api.ts';
 import { useAsync, useEventStream, useTheme } from './hooks.ts';
 import { Badge, StageBadge } from './components.tsx';
 import { CommandView } from './views/Command.tsx';
@@ -7,13 +15,15 @@ import { ProjectsView } from './views/Projects.tsx';
 import { JobsView } from './views/Jobs.tsx';
 import { JobDetailView } from './views/JobDetail.tsx';
 import { MemoryView } from './views/Memory.tsx';
+import { ToolsView } from './views/Tools.tsx';
 
 export type Route =
   | { name: 'command' }
   | { name: 'projects'; id?: string }
   | { name: 'jobs' }
   | { name: 'job'; id: string }
-  | { name: 'memory' };
+  | { name: 'memory' }
+  | { name: 'tools' };
 
 export function App() {
   const [route, setRoute] = useState<Route>({ name: 'command' });
@@ -27,6 +37,7 @@ export function App() {
     [],
   );
   const jobs = useAsync<Job[]>(() => api.jobs(), []);
+  const toolRequests = useAsync<{ pending: ToolExecution[] }>(() => api.toolExecutions(), []);
 
   // A single stream feeds every view; each view re-reads what it needs.
   const { connected } = useEventStream(
@@ -40,6 +51,9 @@ export function App() {
     if (lastEvent && (lastEvent.type.startsWith('job.') || lastEvent.type === 'system.recovery')) {
       jobs.reload();
     }
+    // A permission request the user never sees is a permission request that
+    // silently blocks work, so the badge tracks the stream everywhere.
+    if (lastEvent?.type.startsWith('tool.')) toolRequests.reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent]);
 
@@ -51,9 +65,14 @@ export function App() {
     () => (jobs.data ?? []).filter((j) => j.status === 'awaiting_user'),
     [jobs.data],
   );
-  const apiErrors = [health.error, projects.error, sessionData.error, jobs.error].filter(
-    (error): error is string => !!error,
-  );
+  const pendingTools = toolRequests.data?.pending ?? [];
+  const apiErrors = [
+    health.error,
+    projects.error,
+    sessionData.error,
+    jobs.error,
+    toolRequests.error,
+  ].filter((error): error is string => !!error);
 
   const session = sessionData.data?.session ?? null;
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -78,7 +97,9 @@ export function App() {
           ? 'Jobs'
           : route.name === 'job'
             ? 'Job'
-            : 'Memory';
+            : route.name === 'tools'
+              ? 'Tools and permissions'
+              : 'Memory';
 
   return (
     <div className="app">
@@ -109,6 +130,13 @@ export function App() {
           onClick={() => setRoute({ name: 'memory' })}
           label="Memory"
           count={health.data?.memory.active}
+        />
+        <NavItem
+          active={route.name === 'tools'}
+          onClick={() => setRoute({ name: 'tools' })}
+          label="Tools"
+          count={pendingTools.length || undefined}
+          testId="nav-tools"
         />
 
         <div className="sidebar-foot">
@@ -159,6 +187,14 @@ export function App() {
           {awaiting.length > 0 && (
             <button className="btn sm" onClick={() => setRoute({ name: 'jobs' })}>
               <Badge tone="warn">{awaiting.length} awaiting you</Badge>
+            </button>
+          )}
+          {pendingTools.length > 0 && (
+            <button className="btn sm" onClick={() => setRoute({ name: 'tools' })}>
+              <Badge tone="warn">
+                {pendingTools.length} permission{' '}
+                {pendingTools.length === 1 ? 'request' : 'requests'}
+              </Badge>
             </button>
           )}
           <span className="spacer" />
@@ -224,6 +260,9 @@ export function App() {
         {route.name === 'memory' && (
           <MemoryView projects={projects.data ?? []} lastEvent={lastEvent} />
         )}
+        {route.name === 'tools' && (
+          <ToolsView projects={projects.data ?? []} projectId={projectId} lastEvent={lastEvent} />
+        )}
       </main>
     </div>
   );
@@ -234,14 +273,16 @@ function NavItem({
   onClick,
   label,
   count,
+  testId,
 }: {
   active: boolean;
   onClick: () => void;
   label: string;
   count?: number;
+  testId?: string;
 }) {
   return (
-    <button className={`nav-item ${active ? 'active' : ''}`} onClick={onClick}>
+    <button className={`nav-item ${active ? 'active' : ''}`} onClick={onClick} data-testid={testId}>
       <span>{label}</span>
       {count !== undefined && count > 0 && <span className="nav-count">{count}</span>}
     </button>

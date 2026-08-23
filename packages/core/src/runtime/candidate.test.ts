@@ -43,6 +43,26 @@ function project(root: string, configured = true): Project {
   };
 }
 
+/** API on its own port, web listener gated on a file so ordering is explicit. */
+function splitPortProject(root: string, gate: string, apiHit: string): Project {
+  const base = project(root);
+  base.config.candidateRuntime = {
+    command: {
+      executable: process.execPath,
+      args: [
+        '-e',
+        `const fs=require('node:fs'),http=require('node:http');` +
+          `http.createServer((_,r)=>{fs.writeFileSync(${JSON.stringify(apiHit)},String(process.env.TEST_API_PORT));r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok'}))}).listen(Number(process.env.TEST_API_PORT),'127.0.0.1');` +
+          `const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)})){clearInterval(t);http.createServer((_,r)=>{r.setHeader('content-type','text/html');r.end('<!doctype html><h1>candidate</h1>')}).listen(Number(process.env.TEST_PORT),'127.0.0.1')}},25);`,
+      ],
+    },
+    portEnvironment: 'TEST_PORT',
+    apiPortEnvironment: 'TEST_API_PORT',
+    healthPath: '/health',
+  };
+  return base;
+}
+
 describe('candidate runtime isolation', () => {
   it('uses a dynamic port and an isolated JARVIS_HOME', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
@@ -154,7 +174,133 @@ describe('candidate runtime isolation', () => {
       }),
     ).rejects.toThrow('did not pass healthcheck');
   });
+
+  it('waits for the web frontend when the API port becomes healthy first', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
+    roots.push(root);
+    const gate = path.join(root, 'start-web');
+    const apiHit = path.join(root, 'api-probed');
+    let runtime: Awaited<ReturnType<typeof startCandidateRuntime>> | undefined;
+    let resolved = false;
+    try {
+      const starting = startCandidateRuntime({
+        project: splitPortProject(root, gate, apiHit),
+        cwd: root,
+        jobId: 'job_split_port',
+        config: loadConfig({ home: path.join(root, 'home') }),
+        timeoutMs: 30_000,
+      }).then((started) => {
+        resolved = true;
+        return started;
+      });
+      starting.catch(() => undefined);
+
+      // The API answered a real health probe; the web listener is still gated,
+      // so startCandidateRuntime must not have handed out a dead baseUrl yet.
+      await until(() => fs.existsSync(apiHit));
+      expect(resolved).toBe(false);
+
+      fs.writeFileSync(gate, 'go');
+      runtime = await starting;
+      expect(runtime.ports.api).toBeGreaterThan(0);
+      expect(runtime.ports.api).not.toBe(runtime.ports.web);
+      expect(runtime.baseUrl).toBe(`http://127.0.0.1:${runtime.ports.web}`);
+      const page = await fetch(runtime.baseUrl);
+      expect(page.ok).toBe(true);
+      expect(await page.text()).toContain('candidate');
+    } finally {
+      await runtime?.stop();
+    }
+  });
+
+  it('fails closed when the API is healthy but the web frontend never starts', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
+    roots.push(root);
+    const apiHit = path.join(root, 'api-probed');
+    await expect(
+      startCandidateRuntime({
+        project: splitPortProject(root, path.join(root, 'never'), apiHit),
+        cwd: root,
+        jobId: 'job_no_web',
+        config: loadConfig({ home: path.join(root, 'home') }),
+        timeoutMs: 3_000,
+      }),
+    ).rejects.toThrow('candidate API is healthy but web frontend did not become ready at');
+    // The API really was up, and the failure path still tore the child down.
+    const apiUrl = `http://127.0.0.1:${fs.readFileSync(apiHit, 'utf8')}/health`;
+    await until(async () => {
+      const reachable = await fetch(apiUrl, { signal: AbortSignal.timeout(1000) }).then(
+        () => true,
+        () => false,
+      );
+      return !reachable;
+    });
+  });
+
+  it('fails closed when startup is cancelled during the final web probe', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
+    roots.push(root);
+    const webHit = path.join(root, 'web-probed');
+    const release = path.join(root, 'release-web');
+    const candidate = splitPortProject(root, path.join(root, 'start-web'), path.join(root, 'api'));
+    if (!candidate.config.candidateRuntime) throw new Error('fixture runtime missing');
+    candidate.config.candidateRuntime.command.args = [
+      '-e',
+      `const fs=require('node:fs'),http=require('node:http');` +
+        `http.createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok'}))}).listen(Number(process.env.TEST_API_PORT),'127.0.0.1');` +
+        `http.createServer((_,r)=>{fs.writeFileSync(${JSON.stringify(webHit)},process.env.TEST_API_PORT+','+process.env.TEST_PORT);const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(t);r.end('ready')}},10)}).listen(Number(process.env.TEST_PORT),'127.0.0.1');`,
+    ];
+    const controller = new AbortController();
+    const starting = startCandidateRuntime({
+      project: candidate,
+      cwd: root,
+      jobId: 'job_cancelled_web_probe',
+      config: loadConfig({ home: path.join(root, 'home') }),
+      signal: controller.signal,
+      timeoutMs: 10_000,
+    });
+    starting.catch(() => undefined);
+
+    await until(() => fs.existsSync(webHit));
+    controller.abort();
+    fs.writeFileSync(release, 'go');
+    await expect(starting).rejects.toThrow('candidate runtime start cancelled');
+    for (const port of fs.readFileSync(webHit, 'utf8').split(',')) {
+      await until(() =>
+        fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(1000) }).then(
+          () => false,
+          () => true,
+        ),
+      );
+    }
+  });
+
+  it('reports a candidate terminated by a signal instead of waiting for timeout', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
+    roots.push(root);
+    const candidate = splitPortProject(root, path.join(root, 'never'), path.join(root, 'api'));
+    if (!candidate.config.candidateRuntime) throw new Error('fixture runtime missing');
+    candidate.config.candidateRuntime.command.args = [
+      '-e',
+      `require('node:http').createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok'}),()=>process.kill(process.pid,'SIGTERM'))}).listen(Number(process.env.TEST_API_PORT),'127.0.0.1')`,
+    ];
+
+    await expect(
+      startCandidateRuntime({
+        project: candidate,
+        cwd: root,
+        jobId: 'job_signal_exit',
+        config: loadConfig({ home: path.join(root, 'home') }),
+        timeoutMs: 10_000,
+      }),
+    ).rejects.toThrow(/candidate runtime exited \((?:SIGTERM|1)\)/);
+  });
 });
+
+/** Poll until a condition holds; the suite timeout is the only failure mode. */
+async function until(condition: () => boolean | Promise<boolean>): Promise<void> {
+  while (!(await condition())) await new Promise((resolve) => setTimeout(resolve, 25));
+}
 
 function restoreEnv(name: string, value: string | undefined): void {
   if (value === undefined) delete process.env[name];

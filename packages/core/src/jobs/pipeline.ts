@@ -163,7 +163,7 @@ export class JobPipeline {
       role: 'implementer',
       cwd: worktree.path,
       contextPackId: pack.id,
-      model: routed.decision.model ?? undefined,
+      model: routed.decision?.model ?? undefined,
       prompt: buildImplementerPrompt({ job, project, contextPack: pack.rendered }),
       signal,
     });
@@ -499,7 +499,7 @@ export class JobPipeline {
       };
     }
 
-    agents.recordResult(opts.provider, result);
+    agents.recordResult?.(opts.provider, result);
 
     jobs.finishRun(run.id, {
       status: result.status === 'completed' ? 'completed' : result.status,

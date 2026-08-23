@@ -192,6 +192,7 @@ export interface JobDetail {
   acceptanceEligible: boolean;
   acceptanceError: string | null;
   application: CandidateApplication | null;
+  upgrade: UpgradeTransaction | null;
   routingDecisions: RoutingDecision[];
   runs: AgentRun[];
   candidate: CandidateChanges | null;
@@ -225,6 +226,17 @@ export interface RoutingDecision {
   model: string | null;
   reason: string;
   createdAt: string;
+}
+
+export interface UpgradeTransaction {
+  id: string;
+  status: string;
+  previousSha: string;
+  candidateSha: string;
+  rollbackRef: string | null;
+  healthcheckResult: Record<string, unknown> | null;
+  rollbackSha: string | null;
+  failure: string | null;
 }
 
 export interface ProviderCapability {
@@ -350,6 +362,10 @@ export const api = {
     request<CandidateApplication>(`/api/jobs/${id}/approve`, { method: 'POST' }),
   applyJob: (id: string) =>
     request<CandidateApplication>(`/api/jobs/${id}/apply`, { method: 'POST' }),
+  prepareUpgrade: (id: string) =>
+    request<UpgradeTransaction>(`/api/jobs/${id}/upgrade/prepare`, { method: 'POST' }),
+  activateUpgrade: (id: string) =>
+    request<UpgradeTransaction>(`/api/jobs/${id}/upgrade/activate`, { method: 'POST' }),
 
   memory: (params: Record<string, string>) =>
     request<{ items: Memory[]; total: number }>(`/api/memory?${new URLSearchParams(params)}`),

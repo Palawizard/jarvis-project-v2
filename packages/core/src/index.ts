@@ -66,6 +66,7 @@ export {
   type CandidateApplication,
   type CandidateApplicationStatus,
 } from './application/service.js';
+export { UpgradeManager, type UpgradeTransaction, type UpgradeStatus } from './upgrade/manager.js';
 
 export { AgentRegistry } from './agents/registry.js';
 export { ClaudeProvider } from './agents/claude.js';

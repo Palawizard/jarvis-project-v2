@@ -103,7 +103,7 @@ export class ReviewEngine {
         runId,
         opts.jobId,
         routed.provider.id,
-        routed.decision.model,
+        routed.decision?.model ?? null,
         'reviewer',
         opts.cwd,
         'running',
@@ -118,7 +118,7 @@ export class ReviewEngine {
           cwd: opts.cwd,
           prompt,
           role: 'reviewer',
-          ...(routed.decision.model ? { model: routed.decision.model } : {}),
+          ...(routed.decision?.model ? { model: routed.decision.model } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
         },
         (event) => {
@@ -141,7 +141,7 @@ export class ReviewEngine {
       };
     }
 
-    this.agents.recordResult(routed.provider.id, result);
+    this.agents.recordResult?.(routed.provider.id, result);
 
     this.db
       .prepare(

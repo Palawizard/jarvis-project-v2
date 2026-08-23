@@ -374,6 +374,7 @@ export function createRoutes(jarvis: Jarvis): Hono {
       acceptanceEligible: job.stage === 'awaiting_user' && !acceptanceError,
       acceptanceError,
       application: jarvis.applications.getForJob(job.id),
+      upgrade: jarvis.upgrades.getForJob(job.id),
       routingDecisions: jarvis.agents.decisions(job.id),
       runs,
       candidate,
@@ -422,6 +423,22 @@ export function createRoutes(jarvis: Jarvis): Hono {
   app.post('/api/jobs/:id/apply', async (c) => {
     try {
       return c.json(await jarvis.applications.apply(c.req.param('id')));
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
+    }
+  });
+
+  app.post('/api/jobs/:id/upgrade/prepare', async (c) => {
+    try {
+      return c.json(await jarvis.upgrades.prepare(c.req.param('id')));
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
+    }
+  });
+
+  app.post('/api/jobs/:id/upgrade/activate', async (c) => {
+    try {
+      return c.json(await jarvis.upgrades.requestActivation(c.req.param('id')));
     } catch (error) {
       return fail(error instanceof Error ? error.message : String(error), 409);
     }

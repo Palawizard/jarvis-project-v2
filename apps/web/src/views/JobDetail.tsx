@@ -58,6 +58,7 @@ export function JobDetailView({
     project,
     application,
     routingDecisions,
+    upgrade,
   } = detail.data;
   const review = reviews[reviews.length - 1];
   const implementationRun = runs.findLast(
@@ -128,6 +129,43 @@ export function JobDetailView({
             }
           >
             Apply to Project
+          </button>
+        )}
+        {application?.status === 'approved' && project?.isSelf && !upgrade && (
+          <button
+            className="btn sm primary"
+            onClick={() =>
+              void api
+                .prepareUpgrade(job.id)
+                .then(() => {
+                  setActionError(null);
+                  detail.reload();
+                })
+                .catch((error: unknown) =>
+                  setActionError(error instanceof Error ? error.message : String(error)),
+                )
+            }
+          >
+            Prepare Self-Upgrade
+          </button>
+        )}
+        {upgrade?.status === 'preflight_passed' && (
+          <button
+            className="btn sm danger"
+            onClick={() => {
+              if (!confirm('Activate this exact Jarvis candidate through the supervisor?')) return;
+              void api
+                .activateUpgrade(job.id)
+                .then(() => {
+                  setActionError(null);
+                  detail.reload();
+                })
+                .catch((error: unknown) =>
+                  setActionError(error instanceof Error ? error.message : String(error)),
+                );
+            }}
+          >
+            Activate Self-Upgrade
           </button>
         )}
       </div>
@@ -205,6 +243,24 @@ export function JobDetailView({
                   <div className="small dim">
                     This is a self-upgrade. Activation requires the external supervisor and a
                     separate explicit confirmation.
+                  </div>
+                )}
+                {upgrade && (
+                  <div className="grid" style={{ gap: 5 }}>
+                    <div className="small">
+                      upgrade: <Badge>{upgrade.status.replaceAll('_', ' ')}</Badge>
+                    </div>
+                    <div className="mono tiny">current {upgrade.previousSha}</div>
+                    <div className="mono tiny">candidate {upgrade.candidateSha}</div>
+                    <div className="mono tiny">rollback {upgrade.rollbackRef ?? 'not created'}</div>
+                    {upgrade.healthcheckResult && (
+                      <pre>{JSON.stringify(upgrade.healthcheckResult, null, 2)}</pre>
+                    )}
+                    {upgrade.failure && (
+                      <div className="small" style={{ color: 'var(--err)' }}>
+                        {upgrade.failure}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

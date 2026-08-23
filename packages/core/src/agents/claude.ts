@@ -29,6 +29,7 @@ const exec = promisify(execFile);
 export class ClaudeProvider implements AgentProvider {
   readonly id = 'claude' as const;
   private cached: ProviderCapabilities | undefined;
+  private cachedAt = 0;
   private cli: ResolvedCli | null | undefined;
 
   constructor(private readonly config: JarvisConfig = getConfig()) {}
@@ -45,7 +46,7 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   async capabilities(): Promise<ProviderCapabilities> {
-    if (this.cached) return this.cached;
+    if (this.cached && Date.now() - this.cachedAt < 30_000) return this.cached;
     const base: ProviderCapabilities = {
       id: 'claude',
       available: false,
@@ -58,11 +59,10 @@ export class ClaudeProvider implements AgentProvider {
 
     const cli = this.resolve();
     if (!cli) {
-      this.cached = {
+      return this.cache({
         ...base,
         reason: 'Claude Code CLI not found. Install it with `npm i -g @anthropic-ai/claude-code`.',
-      };
-      return this.cached;
+      });
     }
 
     try {
@@ -71,11 +71,10 @@ export class ClaudeProvider implements AgentProvider {
       });
       base.version = stdout.trim();
     } catch (error) {
-      this.cached = {
+      return this.cache({
         ...base,
         reason: `Claude Code CLI could not be executed: ${(error as Error).message}`,
-      };
-      return this.cached;
+      });
     }
 
     try {
@@ -97,8 +96,13 @@ export class ClaudeProvider implements AgentProvider {
     } catch (error) {
       base.reason = `could not read Claude auth status: ${(error as Error).message}`;
     }
-    this.cached = base;
-    return base;
+    return this.cache(base);
+  }
+
+  private cache(capabilities: ProviderCapabilities): ProviderCapabilities {
+    this.cached = capabilities;
+    this.cachedAt = Date.now();
+    return capabilities;
   }
 
   async run(

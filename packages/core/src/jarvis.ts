@@ -16,6 +16,7 @@ import { ReviewEngine } from './review/engine.js';
 import { VisualQaEngine } from './visualqa/engine.js';
 import { VisualReviewer } from './visualqa/reviewer.js';
 import { CandidateApplicationService } from './application/service.js';
+import { UpgradeManager } from './upgrade/manager.js';
 import { registerBuiltinTools } from './tools/builtin.js';
 import type { ToolRegistry } from './tools/registry.js';
 import { createLogger } from './logger.js';
@@ -44,6 +45,7 @@ export class Jarvis {
   readonly visualReviewer: VisualReviewer;
   readonly pipeline: JobPipeline;
   readonly applications: CandidateApplicationService;
+  readonly upgrades: UpgradeManager;
   readonly tools: ToolRegistry;
 
   constructor(config: JarvisConfig = getConfig()) {
@@ -76,6 +78,14 @@ export class Jarvis {
       this.verification,
       this.review,
       config.worktreesDir,
+    );
+    this.upgrades = new UpgradeManager(
+      this.db,
+      this.bus,
+      this.jobs,
+      this.projects,
+      this.applications,
+      config,
     );
     this.tools = registerBuiltinTools({
       memory: this.memory,

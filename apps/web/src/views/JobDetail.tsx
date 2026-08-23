@@ -131,24 +131,26 @@ export function JobDetailView({
             Apply to Project
           </button>
         )}
-        {application?.status === 'approved' && project?.isSelf && !upgrade && (
-          <button
-            className="btn sm primary"
-            onClick={() =>
-              void api
-                .prepareUpgrade(job.id)
-                .then(() => {
-                  setActionError(null);
-                  detail.reload();
-                })
-                .catch((error: unknown) =>
-                  setActionError(error instanceof Error ? error.message : String(error)),
-                )
-            }
-          >
-            Prepare Self-Upgrade
-          </button>
-        )}
+        {application?.status === 'approved' &&
+          project?.isSelf &&
+          (!upgrade || ['activation_failed', 'rollback_completed'].includes(upgrade.status)) && (
+            <button
+              className="btn sm primary"
+              onClick={() =>
+                void api
+                  .prepareUpgrade(job.id)
+                  .then(() => {
+                    setActionError(null);
+                    detail.reload();
+                  })
+                  .catch((error: unknown) =>
+                    setActionError(error instanceof Error ? error.message : String(error)),
+                  )
+              }
+            >
+              Prepare Self-Upgrade
+            </button>
+          )}
         {upgrade?.status === 'preflight_passed' && (
           <button
             className="btn sm danger"

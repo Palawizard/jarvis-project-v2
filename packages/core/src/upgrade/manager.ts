@@ -181,7 +181,8 @@ export class UpgradeManager {
     fs.mkdirSync(path.dirname(resultPath), { recursive: true, mode: 0o700 });
     const request = {
       transactionId: transaction.id,
-      jobId,
+      approved: true,
+      approvedBy: 'user',
       repository: transaction.repository,
       branch: transaction.branch,
       previousSha: transaction.previousSha,
@@ -211,8 +212,10 @@ export class UpgradeManager {
     let result: {
       status?: string;
       healthcheck?: Record<string, unknown>;
+      rollbackHealthcheck?: Record<string, unknown>;
       rollbackSha?: string;
       error?: string;
+      activationError?: string;
     };
     try {
       result = JSON.parse(fs.readFileSync(resultPath, 'utf8')) as typeof result;
@@ -224,7 +227,7 @@ export class UpgradeManager {
         this.db.prepare('SELECT * FROM upgrade_transactions WHERE id=?').get(transaction.id) as Row,
       );
     }
-    if (result.status === 'activation_succeeded') {
+    if (result.status === 'activated') {
       this.setStatus(transaction.id, 'activation_succeeded', {
         healthcheckResult: result.healthcheck ?? { status: 'ok' },
         completedAt: nowIso(),
@@ -248,17 +251,22 @@ export class UpgradeManager {
         jobId: transaction.jobId,
         payload: { transactionId: transaction.id },
       });
-    } else if (result.status === 'rollback_completed') {
+    } else if (result.status === 'rolled_back') {
       this.setStatus(transaction.id, 'rollback_completed', {
-        healthcheckResult: result.healthcheck ?? null,
+        healthcheckResult: result.rollbackHealthcheck ?? result.healthcheck ?? null,
         rollbackSha: result.rollbackSha ?? transaction.previousSha,
-        failure: result.error ?? 'new version failed healthcheck',
+        failure: result.activationError ?? result.error ?? 'new version failed healthcheck',
         completedAt: nowIso(),
       });
       this.bus.emit({
         type: 'upgrade.healthcheck.failed',
         jobId: transaction.jobId,
-        payload: { transactionId: transaction.id, error: result.error },
+        payload: { transactionId: transaction.id, error: result.activationError ?? result.error },
+      });
+      this.bus.emit({
+        type: 'upgrade.rollback.started',
+        jobId: transaction.jobId,
+        payload: { transactionId: transaction.id },
       });
       this.bus.emit({
         type: 'upgrade.rollback.completed',
@@ -267,7 +275,10 @@ export class UpgradeManager {
       });
     } else {
       this.setStatus(transaction.id, 'inspection_required', {
-        failure: result.error ?? 'supervisor reported an ambiguous activation result',
+        failure:
+          result.error ??
+          result.activationError ??
+          `supervisor reported ${result.status ?? 'an ambiguous activation result'}`,
       });
     }
     return rowToUpgrade(

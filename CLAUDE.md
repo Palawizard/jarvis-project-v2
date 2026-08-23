@@ -9,12 +9,14 @@ Critical invariants:
 - Raw history is audit/recovery data, never default prompt context.
 - Retrieval is local and hard-budgeted. Never add a cloud call solely for memory.
 - Never persist secrets or copy provider credentials.
-- Coding jobs use isolated Git worktrees and never destroy dirty user work.
+- Coding jobs and candidate runtimes never bypass worktree/state/port isolation.
 - Verification is executed by Jarvis; an agent's claim is not evidence.
-- Review is independent/read-only. Self-development stops for human approval and never auto-merges.
-- Provider and visual-review availability must be reported honestly; fail explicitly rather than fake success.
+- Application transactions fail closed: exact reviewed HEAD, clean target, FF-only, no stash/push/conflict AI.
+- Self-activation requires explicit approval and the external supervisor; rollback never overwrites dirty work.
+- Database migrations preserve existing memories/jobs/projects and reject unknown versions.
+- Provider and visual-review availability must be reported honestly; `reviewedBy` is never faked.
+- Provider children use official subscription auth and never inherit paid API keys.
 
-Commands: `pnpm dev`, `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm test:integration`, `pnpm build`, `pnpm test:e2e`.
+Commands: `pnpm dev`, `pnpm supervisor <config.json>`, `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm test:integration`, `pnpm build`, `pnpm test:e2e`. Live agents require explicit `JARVIS_LIVE_AGENT_TESTS=1`.
 
 Keep changes narrow. Reuse existing services and event types before adding abstractions. Update the relevant documentation when an implemented/planned boundary changes.
-

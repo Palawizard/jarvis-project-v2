@@ -62,9 +62,10 @@ export function createRoutes(jarvis: Jarvis): Hono {
   app.get('/health', async (c) => c.json(await health()));
   app.get('/api/health', async (c) => {
     const capabilities = await jarvis.agents.capabilities();
+    const state = await health();
     return c.json({
-      ok: true,
-      ...(await health()),
+      ...state,
+      ok: state.status === 'ok',
       home: jarvis.config.home,
       artifactsDir: jarvis.config.artifactsDir,
       providers: capabilities,

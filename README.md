@@ -1,6 +1,6 @@
 # Jarvis
 
-Jarvis is a local-first desktop-assistant foundation that can remember durable context, run coding jobs in isolated Git worktrees, verify the result, request an independent review, and present the candidate for human approval.
+Jarvis is a local-first assistant foundation that can remember durable context, run coding jobs in isolated Git worktrees, verify and independently review them, present a candidate for explicit approval, and safely fast-forward it into a clean target repository.
 
 The bootstrap intentionally implements one complete development workflow instead of speculative desktop, mail, calendar, or voice features. Claude Code and Codex use their existing subscription-backed CLI authentication; Jarvis never reads their credentials and requires no paid API key.
 
@@ -39,6 +39,15 @@ pnpm test:e2e
 
 `pnpm verify` runs format, lint, typecheck, all Vitest projects, and build. E2E is separate because it starts a real local server and browser.
 
+Real subscription-provider tests are separate and never run through `test`, `verify`, or CI:
+
+```powershell
+$env:JARVIS_LIVE_AGENT_TESTS='1'
+pnpm test:live-agents
+```
+
+The suite performs one tiny real edit per available CLI, strips API-key variables from provider children, and writes `.jarvis/live-agent-smoke.json`.
+
 ## Working vertical slice
 
 1. Select or register a local Git project.
@@ -46,9 +55,11 @@ pnpm test:e2e
 3. Jarvis creates `jarvis/<job-id>` in an isolated worktree based on committed `HEAD`; dirty user files stay untouched and are excluded.
 4. A real Claude/Codex worker receives a bounded, inspectable Context Pack.
 5. Jarvis observes structured CLI events, runs configured verification commands, and performs an independent review.
-6. Web projects receive Playwright desktop/mobile evidence.
+6. Configured web projects run on isolated dynamic ports and receive deterministic Playwright desktop/mobile evidence and subscription-backed visual review.
 7. Jarvis stores one compact project episode and validated memory proposals.
-8. The candidate remains isolated until the user accepts it. Acceptance records the decision; V1 never merges automatically.
+8. The user approves the exact reviewed candidate, then separately applies it. Application is clean-target, exact-ancestry, FF-only, idempotent, persisted, and never pushes.
+
+For Jarvis itself, normal application is disabled. Run Jarvis through `pnpm supervisor <config.json>`; an approved candidate must pass isolated preflight, then a second explicit activation request lets the external supervisor apply, rebuild, restart, healthcheck, and roll back on failure.
 
 Failure, cancellation, review, verification, provider capability, and restart-recovery states are persisted and visible. Raw messages/events are audit history, not default model context.
 
@@ -66,6 +77,6 @@ Failure, cancellation, review, verification, provider capability, and restart-re
 - Local storage by default; runtime DB, models, logs, worktrees, screenshots, and `.env` are Git-ignored.
 - Memory writes reject credential-like content, including explicit remember requests.
 - Provider authentication remains inside official CLIs.
-- Jobs never stash, reset, or checkout the user's working tree.
-- Reviews are read-only and self-development never auto-merges.
-- Visual QA images are evidence only unless a compatible reviewer actually ran.
+- Jobs never stash, force refs, resolve conflicts, push, or overwrite dirty user work.
+- Self-activation requires explicit user action and the external supervisor boundary.
+- Visual QA images remain evidence-only unless a real CLI reviewer successfully inspected them.

@@ -13,7 +13,9 @@ queued -> planning -> implementing -> verifying
                                           |
                                     awaiting_user
                                           |
-                                      completed
+                                      approved
+                                          |
+                                  FF-only applied
 ```
 
 Any active stage may become `failed` or `cancelled`. `awaiting_user` means a candidate passed configured gates and remains isolated. State transitions are validated centrally and persisted as events.
@@ -26,7 +28,9 @@ Planning is deterministic: inspect the committed base, create an isolated worktr
 
 - Claude Code uses official non-interactive `--print --output-format stream-json`, retains the session ID, and resumes fix work when possible.
 - Codex uses official `codex exec --json` JSONL and retains the thread ID. The installed app-server is currently experimental, so V1 deliberately uses the stable CLI surface.
-- Capability checks inspect CLI version and official login status; unavailable providers remain explicit and do not crash startup.
+- Capability checks inspect CLI version and official login status and refresh periodically. Runtime rate limits enter a temporary cooldown.
+- Every deterministic routing decision records role, provider, model, reason, overrides, availability, avoidance, task profile, and time.
+- Model profiles are cheap rules: mechanical work uses economy, ordinary work balanced, and high-risk/self-development quality. Explicit provider environment overrides remain authoritative when usable.
 
 Authentication is always delegated to the installed CLI. Jarvis never reads OAuth tokens or requires API credits.
 
@@ -36,4 +40,6 @@ Project detection records package-manager, install, format/lint/typecheck/test/b
 
 Review runs in a fresh, read-only provider context with the original request, acceptance criteria, reviewer Context Pack, changed files/diff, implementer summary as an untrusted claim, and deterministic verification evidence. Unparseable or failed review output is an error, never approval.
 
-The candidate branch/worktree, implementation result, verification, structured findings, Context Pack selections, screenshots, and episode remain inspectable. The reviewed Git HEAD must remain clean and unchanged through acceptance. V1 records acceptance but does not merge or push.
+The candidate branch/worktree, implementation result, verification, structured findings, routing decisions, Context Pack selections, screenshots, and episode remain inspectable. Approval binds the exact clean reviewed HEAD. A separate application transaction requires a clean registered target at the candidate base and performs only `git merge --ff-only`; divergence fails closed, repeat apply is idempotent, candidate provenance is retained, and no remote push occurs.
+
+`test:live-agents` is opt-in, quota-conscious, one-attempt proof of the real Claude/Codex CLI process, structured events, session/thread identity, file edit, and deterministic verification. API-key environment variables are removed from provider children so this path cannot silently prefer API billing.

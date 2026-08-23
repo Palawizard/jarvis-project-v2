@@ -15,7 +15,9 @@ Durable records include scope, kind, optional structured subject, content, impor
 
 ## Write policy
 
-Deterministic commands (`remember`, `forget`, `update`) are handled locally. Structured job completion always creates one episode. Agent `memoryProposals` piggyback on a task call that was already required, but still pass Memory Service validation.
+Deterministic commands (`remember`, `forget`, `update`) are handled locally. Explicit remember classification recognizes English/French preference, constraint, and decision markers; unmarked project statements become project knowledge and unmarked user statements facts. It never calls an agent.
+
+Forget auto-deletes only an explicit in-scope memory ID or a unique exact normalized subject/content. Fuzzy or duplicate matches return auditable candidates for user choice and delete nothing.
 
 Automatic writes are thresholded, normalized, exact/near deduplicated, scope-checked, and secret-scanned. Explicit requests bypass importance thresholds but never the secret gate. Routine transcripts, command logs, source files, and credentials do not become memories.
 
@@ -32,4 +34,3 @@ This avoids quota waste: no cloud call performs retrieval, no per-turn summarize
 ## Control and privacy
 
 The Memory view supports inspection, search/filtering, provenance, explicit addition/correction, pinning, soft forget, and active/superseded visibility. Project memory can be purged separately. Runtime data is local and Git-ignored; filesystem permissions are restricted where the OS supports them.
-

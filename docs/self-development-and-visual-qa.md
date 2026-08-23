@@ -33,7 +33,7 @@ After a successful job, one compact project episode preserves goal, outcome, fil
 
 ## Visual QA
 
-Projects opt into candidate runtime isolation with an executable/argv and port-environment mapping. Jarvis reserves dynamic local ports until launch, creates an isolated runtime home, healthchecks the exact candidate, and reports unsupported remapping instead of risking the current application's port. Arbitrary frameworks cannot inherit the reservation socket, so a narrow release-to-bind race remains and is detected by startup/health failure.
+Projects opt into candidate runtime isolation with an executable/argv and port-environment mapping. Jarvis reserves dynamic local ports until launch, creates an isolated runtime home, and reports unsupported remapping instead of risking the current application's port. Jarvis self-candidates must echo a per-launch nonce and exact commit from `/health`; generic projects rely on their configured health contract. Arbitrary frameworks cannot inherit the reservation socket, so a narrow release-to-bind race remains for generic projects.
 
 Playwright supports bounded deterministic `goto`, `click`, `fill`, `wait`, and `screenshot` actions, desktop/mobile capture, console errors, and failed requests. A router-selected subscription CLI can inspect all images with schema-constrained findings. `reviewedBy` stays null on missing evidence, unavailable reviewer, provider error, or invalid output. Required Jarvis UI review fails closed.
 

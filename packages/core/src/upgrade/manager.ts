@@ -6,7 +6,7 @@ import type { CandidateApplicationService } from '../application/service.js';
 import type { JarvisConfig } from '../config.js';
 import type { Db } from '../db/index.js';
 import type { EventBus } from '../events/bus.js';
-import { repoStatus } from '../git/workspace.js';
+import { GitWorkspace, repoStatus } from '../git/workspace.js';
 import { newId, nowIso } from '../ids.js';
 import type { JobService } from '../jobs/service.js';
 import type { ProjectService } from '../projects/service.js';
@@ -47,6 +47,8 @@ type Row = Record<string, unknown>;
 
 /** Persists self-upgrade intent; the external supervisor performs activation. */
 export class UpgradeManager {
+  private readonly git: GitWorkspace;
+
   constructor(
     private readonly db: Db,
     private readonly bus: EventBus,
@@ -54,7 +56,9 @@ export class UpgradeManager {
     private readonly projects: ProjectService,
     private readonly applications: CandidateApplicationService,
     private readonly config: JarvisConfig,
-  ) {}
+  ) {
+    this.git = new GitWorkspace(config.worktreesDir);
+  }
 
   getForJob(jobId: string): UpgradeTransaction | null {
     const row = this.db
@@ -84,6 +88,11 @@ export class UpgradeManager {
     if (!job || !project?.isSelf || !job.worktreePath) {
       throw new Error('self-upgrade is only available for the registered Jarvis project');
     }
+    await this.git.validateCandidate(
+      job.worktreePath,
+      application.candidateBase,
+      application.candidateHead,
+    );
     const target = await repoStatus(project.rootPath);
     if (!target.isRepo || !target.head || !target.branch || target.branch === 'HEAD') {
       throw new Error('Jarvis target repository or branch identity is unavailable');
@@ -130,8 +139,21 @@ export class UpgradeManager {
         jobId: `${jobId}-upgrade-preflight`,
         config: this.config,
       });
+      await this.git.validateCandidate(
+        job.worktreePath,
+        application.candidateBase,
+        application.candidateHead,
+      );
+      const healthcheck = { status: 'ok', url: runtime.healthUrl, ports: runtime.ports };
+      await runtime.stop();
+      runtime = undefined;
+      await this.git.validateCandidate(
+        job.worktreePath,
+        application.candidateBase,
+        application.candidateHead,
+      );
       this.setStatus(id, 'preflight_passed', {
-        healthcheckResult: { status: 'ok', url: runtime.healthUrl, ports: runtime.ports },
+        healthcheckResult: healthcheck,
       });
       this.bus.emit({
         type: 'upgrade.preflight.completed',
@@ -162,6 +184,13 @@ export class UpgradeManager {
     if (process.env.JARVIS_SUPERVISED !== '1' || !requestPath) {
       throw new Error('Jarvis is not running under the upgrade supervisor');
     }
+    const job = this.jobs.get(jobId);
+    if (!job?.worktreePath) throw new Error('candidate worktree is unavailable');
+    await this.git.validateCandidate(
+      job.worktreePath,
+      transaction.previousSha,
+      transaction.candidateSha,
+    );
     const target = await repoStatus(transaction.repository);
     if (
       target.dirty ||
@@ -195,8 +224,15 @@ export class UpgradeManager {
     };
     const temporary = `${requestPath}.${transaction.id}.tmp`;
     fs.writeFileSync(temporary, JSON.stringify(request), { mode: 0o600, flag: 'wx' });
-    fs.renameSync(temporary, requestPath);
     this.setStatus(transaction.id, 'activation_requested', { activationAt: nowIso() });
+    try {
+      fs.renameSync(temporary, requestPath);
+    } catch (error) {
+      this.setStatus(transaction.id, 'inspection_required', {
+        failure: `activation request publication failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      throw error;
+    }
     this.bus.emit({
       type: 'upgrade.activation.started',
       jobId,

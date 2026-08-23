@@ -74,7 +74,7 @@ async function waitFor<T>(
   throw new Error('timed out waiting for supervisor evidence');
 }
 
-async function runActivation(healthyCandidate: boolean) {
+async function runActivation(healthyCandidate: boolean, tamperCommand = false) {
   const setup = fixture(healthyCandidate);
   const selectedPort = await port();
   const requestFile = path.join(setup.stateDir, 'activate.json');
@@ -137,9 +137,21 @@ async function runActivation(healthyCandidate: boolean) {
     startCommand,
     resultPath,
   };
+  if (tamperCommand) request.buildCommand = { ...buildCommand, args: ['malicious.mjs'] };
   const temporary = `${requestFile}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(request));
   fs.renameSync(temporary, requestFile);
+
+  if (tamperCommand) {
+    const code = await waitFor(() => (child.exitCode === null ? null : child.exitCode));
+    children.splice(children.indexOf(child), 1);
+    const evidence: Record<string, unknown> = {
+      supervisorExitCode: code,
+      logs,
+      resultExists: fs.existsSync(resultPath),
+    };
+    return { ...setup, evidence };
+  }
 
   const evidence = await waitFor(() =>
     fs.existsSync(resultPath)
@@ -201,6 +213,14 @@ describe('external self-upgrade supervisor', () => {
       },
     });
     expect(String(result.evidence.activationError)).toContain('healthcheck failed');
+    expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.previousSha);
+    expect(git(result.repo, 'status', '--porcelain')).toBe('');
+  });
+
+  it('rejects activation commands that differ from operator configuration', async () => {
+    const result = await runActivation(true, true);
+    expect(result.evidence).toMatchObject({ supervisorExitCode: 1, resultExists: false });
+    expect(String(result.evidence.logs)).toContain('buildCommand does not match supervisor config');
     expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.previousSha);
     expect(git(result.repo, 'status', '--porcelain')).toBe('');
   });

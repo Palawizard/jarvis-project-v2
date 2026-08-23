@@ -19,7 +19,8 @@
 
 - Procedures share the durable record lifecycle but learned structured procedure capture is not implemented.
 - Supervisor activation requires Jarvis to have been launched through `pnpm supervisor <config.json>`; existing unsupervised processes can prepare but not activate.
-- Runtime port reservation has an unavoidable narrow handoff race for arbitrary frameworks; health verification catches collisions.
+- Runtime port reservation has an unavoidable narrow handoff race for arbitrary frameworks; Jarvis self-candidates close it with a per-launch nonce and commit check, while generic projects rely on their configured health contract.
+- Provider cooldowns are runtime-local; restarting Jarvis clears them, and a failed in-flight provider call is not automatically replayed through another subscription.
 - Route/interaction configuration is deterministic and deliberately small, not a browser agent.
 - Restart recovery preserves/marks unknown application state and reconciles supervisor evidence; supervisor crash recovery remains conservative.
 - Tool Registry contains only tools needed for the bootstrap slice.

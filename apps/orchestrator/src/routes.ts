@@ -55,6 +55,7 @@ export function createRoutes(jarvis: Jarvis): Hono {
       version: '0.1.0',
       commit: process.env.JARVIS_COMMIT ?? commit ?? 'unknown',
       db,
+      runtimeNonce: process.env.JARVIS_RUNTIME_NONCE ?? null,
     };
   };
 

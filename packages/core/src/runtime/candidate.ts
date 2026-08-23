@@ -1,9 +1,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import type { JarvisConfig } from '../config.js';
 import { killTree } from '../agents/spawn.js';
+import { repoStatus } from '../git/workspace.js';
 import type { Project } from '../projects/service.js';
 
 export class CandidateRuntimeUnsupportedError extends Error {}
@@ -38,11 +40,13 @@ export async function startCandidateRuntime(opts: {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const web = webReservation.port;
   const api = apiReservation?.port;
+  const runtimeNonce = randomUUID();
   const baseUrl = `http://127.0.0.1:${web}`;
   const healthUrl = `http://127.0.0.1:${api ?? web}${runtime.healthPath ?? '/'}`;
   const env = {
     ...process.env,
     JARVIS_HOME: home,
+    JARVIS_RUNTIME_NONCE: runtimeNonce,
     FORCE_COLOR: '0',
     BROWSER: 'none',
     [runtime.portEnvironment]: String(web),
@@ -53,6 +57,16 @@ export async function startCandidateRuntime(opts: {
         }
       : {}),
   };
+  for (const key of [
+    'JARVIS_SUPERVISED',
+    'JARVIS_UPGRADE_REQUEST_PATH',
+    'JARVIS_COMMIT',
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'CODEX_API_KEY',
+  ]) {
+    delete env[key];
+  }
 
   // Generic frameworks cannot inherit our listening socket. Hold both ports
   // until the last moment, then launch and verify the exact health URL.
@@ -83,7 +97,22 @@ export async function startCandidateRuntime(opts: {
   const stop = () => killTree(child);
 
   try {
-    await waitForHealth(child, healthUrl, logs, opts.signal, opts.timeoutMs ?? 90_000);
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', resolve);
+      child.once('error', reject);
+    });
+    const expectedCommit = opts.project.isSelf ? (await repoStatus(opts.cwd)).head : null;
+    if (opts.project.isSelf && !expectedCommit) {
+      throw new Error('candidate runtime commit identity is unavailable');
+    }
+    await waitForHealth(
+      child,
+      healthUrl,
+      logs,
+      opts.signal,
+      opts.timeoutMs ?? 90_000,
+      opts.project.isSelf ? { runtimeNonce, commit: expectedCommit as string } : undefined,
+    );
     return {
       baseUrl,
       healthUrl,
@@ -124,6 +153,7 @@ async function waitForHealth(
   logs: string[],
   signal: AbortSignal | undefined,
   timeoutMs: number,
+  identity?: { runtimeNonce: string; commit: string },
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let exitCode: number | null = null;
@@ -138,8 +168,17 @@ async function waitForHealth(
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
       if (response.ok) {
-        const body = (await response.json().catch(() => null)) as { status?: string; ok?: boolean };
-        if (body?.status === 'ok' || body?.ok === true) return;
+        const body = (await response.json().catch(() => null)) as {
+          status?: string;
+          ok?: boolean;
+          runtimeNonce?: string;
+          commit?: string;
+        };
+        const healthy = body?.status === 'ok' || body?.ok === true;
+        const identified =
+          !identity ||
+          (body?.runtimeNonce === identity.runtimeNonce && body?.commit === identity.commit);
+        if (healthy && identified) return;
       }
     } catch {
       // Still starting.

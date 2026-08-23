@@ -30,7 +30,6 @@ interface LiveResult {
   structuredEvents?: number;
   fileModified?: boolean;
   verificationPassed?: boolean;
-  apiKeysScrubbed?: boolean;
   error?: string;
 }
 
@@ -124,7 +123,6 @@ async function smoke(
     report.processLaunched = events.some((event) => event.kind === 'started');
     report.sessionCaptured = Boolean(result.sessionId);
     report.structuredEvents = events.length;
-    report.apiKeysScrubbed = true;
     const { stdout: diff } = await exec('git', ['diff', '--', 'src/math.ts'], { cwd });
     report.fileModified = diff.trim().length > 0;
 

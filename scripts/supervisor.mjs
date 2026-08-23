@@ -117,6 +117,16 @@ function validateRequest(raw, config) {
   if (typeof raw.resultPath !== 'string' || !raw.resultPath.trim()) {
     throw new Error('resultPath is required');
   }
+  const healthUrl = validateHealthUrl(raw.healthUrl);
+  const buildCommand = validateProcess('buildCommand', raw.buildCommand);
+  const startCommand = validateProcess('startCommand', raw.startCommand);
+  if (healthUrl !== config.healthUrl) throw new Error('healthUrl does not match supervisor config');
+  if (JSON.stringify(buildCommand) !== JSON.stringify(config.buildCommand)) {
+    throw new Error('buildCommand does not match supervisor config');
+  }
+  if (JSON.stringify(startCommand) !== JSON.stringify(config.startCommand)) {
+    throw new Error('startCommand does not match supervisor config');
+  }
   return {
     transactionId: raw.transactionId,
     repository: config.repository,
@@ -124,9 +134,9 @@ function validateRequest(raw, config) {
     previousSha: raw.previousSha,
     candidateSha: raw.candidateSha,
     rollbackRef: raw.rollbackRef,
-    healthUrl: validateHealthUrl(raw.healthUrl),
-    buildCommand: validateProcess('buildCommand', raw.buildCommand),
-    startCommand: validateProcess('startCommand', raw.startCommand),
+    healthUrl,
+    buildCommand,
+    startCommand,
     resultPath: outsideRepository(config.repository, raw.resultPath, 'resultPath'),
   };
 }

@@ -621,15 +621,19 @@ export function JobDetailView({
                           visual {s.reviewVerdict.replace('_', ' ')}
                         </Badge>
                       )}
-                      {s.reviewFindings.map((finding, index) => (
-                        <div key={index} className="tiny" style={{ marginTop: 4 }}>
-                          <Badge tone={finding.severity === 'high' ? 'err' : 'warn'}>
-                            {finding.severity}
-                          </Badge>{' '}
-                          {finding.description}
-                          {finding.recommendation ? ` — ${finding.recommendation}` : ''}
-                        </div>
-                      ))}
+                      {s.reviewFindings
+                        .filter(
+                          (finding) => finding.route === s.route && finding.viewport === s.viewport,
+                        )
+                        .map((finding, index) => (
+                          <div key={index} className="tiny" style={{ marginTop: 4 }}>
+                            <Badge tone={finding.severity === 'high' ? 'err' : 'warn'}>
+                              {finding.severity}
+                            </Badge>{' '}
+                            {finding.description}
+                            {finding.recommendation ? ` — ${finding.recommendation}` : ''}
+                          </div>
+                        ))}
                     </div>
                   </div>
                 ))}

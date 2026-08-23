@@ -54,7 +54,9 @@ export async function repoStatus(dir: string): Promise<RepoStatus> {
   }
   const branch = await git(root, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => 'HEAD');
   const head = await git(root, ['rev-parse', 'HEAD']).catch(() => null);
-  const porcelain = await git(root, ['status', '--porcelain']).catch(() => '');
+  // A failed status command is never evidence of a clean tree. Mutation callers
+  // must fail closed rather than risk overwriting work Git could not inspect.
+  const porcelain = await git(root, ['status', '--porcelain']);
   const dirtyFiles = porcelain
     .split('\n')
     .map((l) => l.trim())

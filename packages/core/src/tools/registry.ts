@@ -463,12 +463,15 @@ export class ToolRegistry {
    * user from asking for it again.
    */
   deny(executionId: string, reason = 'declined by the user'): ToolExecution {
+    // The reason is caller-supplied text that is persisted and broadcast, so it
+    // gets the same redaction and size bound as any other recorded tool error.
+    const recorded = this.#recordError(reason);
     const changed = this.#db
       .prepare(
         `UPDATE tool_executions SET status='denied', reason=?, error=?,
            finished_at=?, updated_at=? WHERE id=? AND status='pending_approval'`,
       )
-      .run(reason, reason, nowIso(), nowIso(), executionId);
+      .run(recorded, recorded, nowIso(), nowIso(), executionId);
     if (Number(changed.changes) !== 1) {
       throw new ToolPermissionError('execution is not awaiting approval', 'execution_not_pending');
     }
@@ -484,7 +487,7 @@ export class ToolRegistry {
    * actions are never replayed automatically — Jarvis cannot know a tool is
    * idempotent, so resuming is always the user's explicit decision.
    */
-  async retry(executionId: string, actor: ToolActor = 'user'): Promise<ToolExecutionOutcome> {
+  async retry(executionId: string): Promise<ToolExecutionOutcome> {
     const previous = this.getExecution(executionId);
     if (!previous) throw new ToolPermissionError('tool execution not found', 'execution_not_found');
     if (previous.status === 'pending_approval' || previous.status === 'running') {
@@ -501,8 +504,11 @@ export class ToolRegistry {
         'input_not_replayable',
       );
     }
+    // The re-issue keeps the original actor: replaying an agent's action as the
+    // user would hand it privilege it never had, and go through policy at the
+    // wrong level.
     return this.execute(previous.toolName, previous.input ?? {}, {
-      actor,
+      actor: previous.actor,
       sessionId: previous.sessionId,
       projectId: previous.projectId,
       jobId: previous.jobId,

@@ -364,6 +364,27 @@ describe('confirmation and approval', () => {
     await expect(reg.approve(requested.execution.id)).rejects.toThrow(/not awaiting approval/);
   });
 
+  it('redacts and bounds the denial reason it stores and emits', async () => {
+    const reg = registry({ maxRecordChars: 50 });
+    const { tool } = counter('mail.denied.secret', 'sensitive');
+    reg.register(tool);
+    const requested = await reg.execute('mail.denied.secret', { text: 'nope' }, { actor: 'user' });
+    if (requested.status !== 'pending_approval') throw new Error('expected a pending request');
+    const seen: string[] = [];
+    bus.onType('tool.execution.denied', (event) => {
+      seen.push((event.payload as { error?: string }).error ?? '');
+    });
+
+    const secret = `sk-ant-${'A'.repeat(40)}`;
+    const denied = reg.deny(requested.execution.id, `refused: ${secret} ${'x'.repeat(500)}`);
+    expect(denied.error).not.toContain(secret);
+    expect(denied.error).toContain('[redacted:anthropic_api_key]');
+    expect(denied.error?.length).toBeLessThanOrEqual(50);
+    expect(denied.reason).toBe(denied.error);
+    expect(seen).toEqual([denied.error]);
+    expect(reg.getExecution(requested.execution.id)?.error).toBe(denied.error);
+  });
+
   it('re-decides against the tool as it is now, not as it was when requested', async () => {
     const reg = registry();
     const { tool } = counter('agent.reclassified', 'reversible_modification');
@@ -729,6 +750,27 @@ describe('recovery after restart', () => {
     if (reissued.status !== 'pending_approval') return;
     expect(reissued.execution.id).not.toBe(first.execution.id);
     expect(reissued.execution.input).toEqual({ text: 'again' });
+  });
+
+  it('re-issues an interrupted agent action as the agent, not as the user', async () => {
+    const reg = registry();
+    const { tool, calls } = counter('agent.retry', 'reversible_modification');
+    reg.register(tool);
+    const first = await reg.execute('agent.retry', { text: 'again' }, { actor: 'agent' });
+    if (first.status !== 'pending_approval') throw new Error('expected a pending request');
+
+    db.prepare("UPDATE tool_executions SET status='running', started_at=? WHERE id=?").run(
+      new Date().toISOString(),
+      first.execution.id,
+    );
+    reg.recoverInterrupted();
+
+    const reissued = await reg.retry(first.execution.id);
+    // Still the agent's action, so a reversible change still needs a confirm
+    // instead of being silently promoted to the user's auto-allow.
+    expect(reissued.execution.actor).toBe('agent');
+    expect(reissued.status).toBe('pending_approval');
+    expect(calls).toEqual([]);
   });
 
   it('survives a real restart with the pending request still answerable', async () => {

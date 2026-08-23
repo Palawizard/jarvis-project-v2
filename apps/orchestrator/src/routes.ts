@@ -703,7 +703,7 @@ export function createRoutes(jarvis: Jarvis): Hono {
 
   app.post('/api/tool-executions/:id/retry', async (c) => {
     try {
-      const outcome = await jarvis.tools.retry(c.req.param('id'), 'user');
+      const outcome = await jarvis.tools.retry(c.req.param('id'));
       // A refusal is a successful policy evaluation, not an HTTP error: the
       // caller needs the recorded execution back to show why it was refused.
       return c.json(outcome);

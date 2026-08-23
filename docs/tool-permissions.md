@@ -107,7 +107,9 @@ so redaction there is lossless.
 - On boot, `recoverInterrupted()` marks every `running` row `interrupted`. Its
   effect on the outside world is unknown, so it is surfaced and **never**
   replayed automatically. Re-issuing is an explicit user action that goes back
-  through the policy from the start.
+  through the policy from the start, at the **original** execution's actor: an
+  agent's action re-issued stays an agent action, so it is decided at the
+  agent's privilege and still needs a confirmation.
 - Pending approval requests older than `JARVIS_TOOL_APPROVAL_TTL_MS` (default
   24h) expire, so an old prompt cannot be answered later against changed state.
 - Approval survives a restart: the request holds the validated payload, so

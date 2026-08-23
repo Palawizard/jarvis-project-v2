@@ -69,6 +69,7 @@ Failure, cancellation, review, verification, provider capability, and restart-re
 - [Memory architecture and policy](docs/memory.md)
 - [Jobs, providers, and verification](docs/jobs-and-providers.md)
 - [Self-development and visual QA](docs/self-development-and-visual-qa.md)
+- [Tool execution, permissions, and recovery](docs/tool-permissions.md)
 - [Roadmap and implementation status](docs/roadmap.md)
 - [Bootstrap ADR](docs/decisions/0001-bootstrap-foundation.md)
 
@@ -80,3 +81,4 @@ Failure, cancellation, review, verification, provider capability, and restart-re
 - Jobs never stash, force refs, resolve conflicts, push, or overwrite dirty user work.
 - Self-activation requires explicit user action and the external supervisor boundary.
 - Visual QA images remain evidence-only unless a real CLI reviewer successfully inspected them.
+- Tools run through one gated boundary. Risk classification plus the caller's actor decides run/confirm/refuse; privilege is never read from a request payload; agents cannot reach sensitive or destructive tools; every attempt is recorded before it runs. The loopback API is unauthenticated, so a local process running as the same user still acts as the user — see [tool permissions](docs/tool-permissions.md).

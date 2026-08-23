@@ -64,6 +64,39 @@ test('command, projects, jobs and controllable memory work in the real UI', asyn
   await expect(page.getByRole('cell', { name: 'user_explicit', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Close' }).last().click();
 
+  // The permission layer must be inspectable from the UI, not just from the API.
+  await page.getByRole('button', { name: 'Tools' }).click();
+  await expect(page.getByText('Waiting for you (0)')).toBeVisible();
+  await expect(page.getByText('memory.purge')).toBeVisible();
+  await expect(
+    page.getByRole('row', { name: /memory\.purge/ }).getByText('asks you first'),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('row', { name: /memory\.search/ }).getByText('runs immediately'),
+  ).toBeVisible();
+
+  // A request may not name its own privileges: the risk ceiling can only tighten.
+  const escalation = await request.post('/api/tools/memory.purge', {
+    data: { input: { id: 'mem_missing' }, maxRisk: 'destructive' },
+  });
+  expect(escalation.ok()).toBeTruthy();
+  const outcome = (await escalation.json()) as { status: string };
+  expect(outcome.status).toBe('pending_approval');
+  await expect(page.getByText('1 permission request')).toBeVisible();
+  await page.getByRole('button', { name: 'Refuse' }).click();
+  await expect(page.getByText('Waiting for you (0)')).toBeVisible();
+
+  await page.screenshot({ path: testInfo.outputPath('desktop-tools.png'), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() => page.locator('nav').evaluate((node) => node.scrollWidth <= node.clientWidth))
+    .toBe(true);
+  await expect
+    .poll(() => page.locator('main').evaluate((node) => node.scrollWidth <= node.clientWidth))
+    .toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('mobile-tools.png'), fullPage: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.getByRole('button', { name: 'Memory' }).click();
   await page.screenshot({ path: testInfo.outputPath('desktop-memory.png'), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole('button', { name: 'Command' }).click();

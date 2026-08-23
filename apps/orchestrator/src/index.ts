@@ -15,6 +15,8 @@ async function main(): Promise<void> {
   log.info('booted', {
     home: jarvis.config.home,
     recoveredJobs: boot.recovered.jobs,
+    interruptedTools: boot.tools.interrupted,
+    expiredToolRequests: boot.tools.expired,
     expiredMemories: boot.expired,
     selfProject: boot.selfProject,
   });

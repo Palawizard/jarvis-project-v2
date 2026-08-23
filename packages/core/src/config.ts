@@ -17,6 +17,8 @@ export interface JarvisConfig {
   port: number;
 
   agents: {
+    implementerProvider: 'claude' | 'codex' | undefined;
+    reviewerProvider: 'claude' | 'codex' | undefined;
     claudeModel: string;
     /** Permission mode handed to `claude -p`. acceptEdits keeps the worker inside file edits. */
     claudePermissionMode: 'acceptEdits' | 'bypassPermissions' | 'default' | 'plan';
@@ -94,6 +96,11 @@ function envBool(name: string, fallback: boolean): boolean {
   return !['0', 'false', 'off', 'no'].includes(raw.toLowerCase());
 }
 
+function envProvider(name: string): 'claude' | 'codex' | undefined {
+  const value = process.env[name];
+  return value === 'claude' || value === 'codex' ? value : undefined;
+}
+
 let cached: JarvisConfig | undefined;
 
 export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig {
@@ -108,6 +115,8 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
     logDir: path.join(home, 'logs'),
     port: envInt('JARVIS_PORT', 4319),
     agents: {
+      implementerProvider: envProvider('JARVIS_IMPLEMENTER_PROVIDER'),
+      reviewerProvider: envProvider('JARVIS_REVIEWER_PROVIDER'),
       claudeModel: process.env.JARVIS_CLAUDE_MODEL || 'sonnet',
       claudePermissionMode:
         (process.env

@@ -5,6 +5,7 @@ import type { EventBus } from '../events/bus.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import type { AgentRunResult, ProviderId } from '../agents/types.js';
 import type { VerificationReport } from '../verification/engine.js';
+import { getConfig, type JarvisConfig } from '../config.js';
 
 export interface ReviewFinding {
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
@@ -42,6 +43,7 @@ export class ReviewEngine {
     private readonly db: Db,
     private readonly agents: AgentRegistry,
     private readonly bus?: EventBus,
+    private readonly config: JarvisConfig = getConfig(),
   ) {}
 
   async review(opts: {
@@ -65,7 +67,10 @@ export class ReviewEngine {
       payload: { files: opts.files.length },
     });
 
-    const routed = await this.agents.route('reviewer', { avoid: opts.implementerProvider });
+    const routed = await this.agents.route('reviewer', {
+      avoid: opts.implementerProvider,
+      prefer: this.config.agents.reviewerProvider,
+    });
     if (!routed.provider) {
       const review = this.persist({
         jobId: opts.jobId,

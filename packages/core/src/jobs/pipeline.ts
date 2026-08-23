@@ -137,7 +137,9 @@ export class JobPipeline {
 
     // --------------------------------------------------------- implementing --
     job = jobs.transition(jobId, 'implementing');
-    const routed = await agents.route('implementer');
+    const routed = await agents.route('implementer', {
+      prefer: this.config.agents.implementerProvider,
+    });
     if (!routed.provider) {
       jobs.transition(jobId, 'failed', { error: `No coding agent available: ${routed.reason}` });
       return;

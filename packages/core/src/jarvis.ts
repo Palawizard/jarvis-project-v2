@@ -55,7 +55,7 @@ export class Jarvis {
     this.jobs = new JobService(this.db, this.bus);
     this.agents = new AgentRegistry(config);
     this.verification = new VerificationEngine(this.db, config.artifactsDir, this.bus);
-    this.review = new ReviewEngine(this.db, this.agents, this.bus);
+    this.review = new ReviewEngine(this.db, this.agents, this.bus, this.config);
     this.visualQa = new VisualQaEngine(this.db, config.artifactsDir, this.bus);
     this.tools = registerBuiltinTools({
       memory: this.memory,

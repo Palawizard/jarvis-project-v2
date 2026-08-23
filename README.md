@@ -21,6 +21,8 @@ pnpm dev
 
 Open <http://localhost:5199>. Runtime data defaults to `~/.jarvis`; set `JARVIS_HOME` to keep a separate instance. The API binds only to `127.0.0.1:4319`.
 
+If one subscription is temporarily quota-limited, set `JARVIS_IMPLEMENTER_PROVIDER` and `JARVIS_REVIEWER_PROVIDER` to `claude` or `codex` before launch. The default remains Claude-first, and unavailable CLIs still fail closed.
+
 On first semantic-memory use, Jarvis downloads `Xenova/multilingual-e5-small` into its local model cache. Retrieval falls back to SQLite FTS5 if the model or runtime is unavailable and works offline after the model is cached.
 
 ## Verify
@@ -67,4 +69,3 @@ Failure, cancellation, review, verification, provider capability, and restart-re
 - Jobs never stash, reset, or checkout the user's working tree.
 - Reviews are read-only and self-development never auto-merges.
 - Visual QA images are evidence only unless a compatible reviewer actually ran.
-

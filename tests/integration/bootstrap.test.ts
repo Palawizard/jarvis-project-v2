@@ -137,7 +137,7 @@ describe('bootstrap vertical slice without cloud quota', () => {
         capabilities: await (role === 'reviewer' ? codex : claude).capabilities(),
       }),
     } as unknown as AgentRegistry;
-    const review = new ReviewEngine(db, registry, bus);
+    const review = new ReviewEngine(db, registry, bus, base);
     const pipeline = new JobPipeline({
       db,
       bus,

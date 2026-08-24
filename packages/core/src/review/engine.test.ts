@@ -75,9 +75,10 @@ describe('review provider resilience', () => {
       error: "You've hit your monthly spend limit for this session",
       memoryProposals: [],
     });
+    const secret = 'Jarvis human pairing token: review-must-not-persist';
     const codex = new ReviewProvider('codex', {
       status: 'completed',
-      result: '```json\n{"verdict":"approve","summary":"looks good","findings":[]}\n```',
+      result: `\`\`\`json\n{"verdict":"approve","summary":"looks good ${secret}","findings":[]}\n\`\`\``,
       memoryProposals: [],
     });
     const agents = new AgentRegistry(config, { providers: [claude, codex], db, bus });
@@ -120,6 +121,9 @@ describe('review provider resilience', () => {
       { provider: 'codex', status: 'completed' },
     ]);
     expect(bus.list().some((event) => event.type === 'agent.rate_limited')).toBe(true);
+    const persisted = JSON.stringify({ result, runs: jobs.runs(job.id), events: bus.list() });
+    expect(persisted).not.toContain('review-must-not-persist');
+    expect(persisted).toContain('[redacted:jarvis_pairing_token]');
     db.close();
   });
 

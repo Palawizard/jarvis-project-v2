@@ -8,7 +8,7 @@ import type { AgentEvent, ProviderId } from '../agents/types.js';
 import { validateVisualEvidence, type VisualQaShot, type VisualReviewFinding } from './engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 import type { AgentRunResult } from '../agents/types.js';
-import { redactSecrets } from '../memory/secrets.js';
+import { redactSecrets, redactSecretValues } from '../memory/secrets.js';
 import { z } from 'zod';
 
 export interface VisualReview {
@@ -188,17 +188,19 @@ export class VisualReviewer {
       };
     }
     this.agents.recordResult(routed.provider.id, result);
+    const safeResult = redactSecrets(result.result);
+    const safeError = result.error ? redactSecrets(result.error) : undefined;
     if (result.status !== 'completed') {
       this.jobs.finishRun(run.id, {
         status: result.status,
-        result: result.result,
-        error: result.error ?? null,
+        result: safeResult,
+        error: safeError ?? null,
         externalSessionId: result.sessionId ?? null,
         usage: result.usage,
       });
       return this.fail(
         opts.jobId,
-        result.error ?? 'visual reviewer failed',
+        safeError ?? 'visual reviewer failed',
         routed.provider.id,
         routed.decision.model,
       );
@@ -210,7 +212,7 @@ export class VisualReviewer {
       this.agents.recordResult(routed.provider.id, { status: 'failed', error });
       this.jobs.finishRun(run.id, {
         status: 'failed',
-        result: result.result,
+        result: safeResult,
         error,
         externalSessionId: result.sessionId ?? null,
         usage: result.usage,
@@ -226,7 +228,7 @@ export class VisualReviewer {
       this.agents.recordResult(routed.provider.id, { status: 'failed', error });
       this.jobs.finishRun(run.id, {
         status: 'failed',
-        result: result.result,
+        result: safeResult,
         error,
         externalSessionId: result.sessionId ?? null,
         usage: result.usage,
@@ -235,7 +237,7 @@ export class VisualReviewer {
     }
 
     const parsed = parseVisualReview(
-      result.structuredOutput,
+      redactSecretValues(result.structuredOutput),
       opts.shots,
       this.config.pipeline.visualBlockingSeverities,
     );
@@ -244,14 +246,14 @@ export class VisualReviewer {
       this.agents.recordResult(routed.provider.id, { status: 'failed', error: protocolError });
       this.jobs.finishRun(run.id, {
         status: 'failed',
-        result: result.result,
+        result: safeResult,
         error: protocolError,
       });
       return this.fail(opts.jobId, protocolError, routed.provider.id, routed.decision.model);
     }
     this.jobs.finishRun(run.id, {
       status: result.status,
-      result: result.result,
+      result: safeResult,
       error: null,
       externalSessionId: result.sessionId ?? null,
       usage: result.usage,

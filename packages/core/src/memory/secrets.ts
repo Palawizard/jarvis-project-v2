@@ -65,3 +65,18 @@ export function redactSecrets(text: string): string {
   }
   return out;
 }
+
+/** Redact every string in provider-supplied structured JSON before persistence. */
+export function redactSecretValues(value: unknown): unknown {
+  if (typeof value === 'string') return redactSecrets(value);
+  if (Array.isArray(value)) return value.map(redactSecretValues);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        redactSecretValues(item),
+      ]),
+    );
+  }
+  return value;
+}

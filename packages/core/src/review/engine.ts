@@ -6,7 +6,7 @@ import type { AgentRegistry } from '../agents/registry.js';
 import type { AgentRunResult, ProviderId, TaskProfile } from '../agents/types.js';
 import type { VerificationReport } from '../verification/engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
-import { redactSecrets } from '../memory/secrets.js';
+import { redactSecrets, redactSecretValues } from '../memory/secrets.js';
 import { z } from 'zod';
 
 export interface ReviewFinding {
@@ -264,7 +264,8 @@ export class ReviewEngine {
   }
 
   private persist(input: Omit<Review, 'id' | 'createdAt'>): Review {
-    const review: Review = { ...input, id: newId('rev'), createdAt: nowIso() };
+    const safeInput = redactSecretValues(input) as Omit<Review, 'id' | 'createdAt'>;
+    const review: Review = { ...safeInput, id: newId('rev'), createdAt: nowIso() };
     this.db
       .prepare(
         `INSERT INTO reviews

@@ -222,10 +222,21 @@ describe('visual reviewer', () => {
             }
           : event,
       );
+      const secret = 'Jarvis human pairing token: visual-review-must-not-persist';
       const provider = fakeClaudeProvider(materializedEvents, {
         verdict: 'pass',
         reviewedEvidence: [{ shotId: shot.id, sha256 }],
-        findings: [],
+        findings: [
+          {
+            severity: 'low',
+            scenarioName: shot.scenarioName,
+            route: shot.route,
+            viewport: shot.viewport,
+            category: 'copy',
+            description: secret,
+            recommendation: 'No action required',
+          },
+        ],
       });
       const reviewer = new VisualReviewer(
         db,
@@ -243,10 +254,16 @@ describe('visual reviewer', () => {
         shots: [shot],
       });
       expect(result.verdict).toBe(verdict);
-      const row = db.prepare('SELECT reviewed_by FROM visual_qa WHERE id=?').get(shot.id) as {
+      const row = db
+        .prepare('SELECT reviewed_by,review_findings FROM visual_qa WHERE id=?')
+        .get(shot.id) as {
         reviewed_by: string | null;
+        review_findings: string | null;
       };
       expect(row.reviewed_by === null).toBe(verdict === 'error');
+      const persisted = JSON.stringify({ row, runs: jobs.runs(job.id), events: bus.list() });
+      expect(persisted).not.toContain('visual-review-must-not-persist');
+      expect(persisted).toContain('[redacted:jarvis_pairing_token]');
       db.close();
     },
   );

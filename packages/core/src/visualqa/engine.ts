@@ -55,6 +55,59 @@ export interface VisualReviewFinding {
 }
 
 /**
+ * The single dev-server artifact accepted as candidate-runtime noise: the Vite
+ * client's own HMR websocket.
+ *
+ * `server.hmr: false` does not stop it — the Vite 7 client always opens that
+ * socket to detect server restarts — and inside the QA browser it is refused by
+ * Chrome's local-network-access check. It says nothing about the product, and
+ * it distracted the visual reviewer on every candidate capture.
+ *
+ * Deliberately narrow: it matches only that socket, on the candidate's own
+ * origin. API 4xx/5xx, failed application requests, uncaught exceptions and
+ * websocket failures to anywhere else are all still recorded.
+ */
+export function isCandidateDevServerNoise(text: string, candidateOrigin: string): boolean {
+  if (/^\[vite\] failed to connect to websocket/.test(text)) return true;
+  const socket = /^WebSocket connection to '(ws{1,2}:\/\/[^']+)' failed/.exec(text)?.[1];
+  if (!socket) return false;
+  try {
+    const url = new URL(socket);
+    const candidate = new URL(candidateOrigin);
+    // Same host and port as the candidate web server, and Vite's token query.
+    return url.host === candidate.host && url.searchParams.has('token');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The SSE stream the candidate UI aborts on purpose.
+ *
+ * React StrictMode double-invokes the event-stream effect in dev, so the first
+ * `/api/events` fetch is cancelled by the page's own AbortController; Chrome
+ * reports the deliberate cancellation as a failed request. It is the app
+ * working correctly, not a failure.
+ *
+ * Narrow on all four axes: candidate origin, that exact path, that exact error,
+ * and candidate runtimes only. A 4xx/5xx on the same endpoint arrives through
+ * the response handler and is still recorded.
+ */
+export function isCandidateStreamAbort(
+  url: string,
+  errorText: string,
+  candidateOrigin: string,
+): boolean {
+  if (errorText !== 'net::ERR_ABORTED') return false;
+  try {
+    const target = new URL(url);
+    return target.origin === new URL(candidateOrigin).origin && target.pathname === '/api/events';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Marks a failed shot as "the declared surface was never reached" rather than
  * "the product looks wrong". Written only by this engine, never by a model.
  */
@@ -105,6 +158,11 @@ export class VisualQaEngine {
      * `X-Jarvis-Control` to same-origin candidate requests only.
      */
     controlCredential?: string | null;
+    /**
+     * True only for an isolated candidate runtime, where the Vite HMR socket is
+     * known noise. Never set for a real dev URL.
+     */
+    expectedDevServerNoise?: boolean;
   }): Promise<VisualQaShot[]> {
     const viewports = opts.viewports ?? ['desktop', 'mobile'];
     const scenarios: VisualQaScenario[] = opts.scenarios?.length
@@ -207,6 +265,7 @@ export class VisualQaEngine {
       headRef?: string | null;
       cycle?: number;
       controlCredential?: string | null;
+      expectedDevServerNoise?: boolean;
     },
     scenario: VisualQaScenario,
     viewport: 'desktop' | 'mobile',
@@ -223,20 +282,33 @@ export class VisualQaEngine {
       opts.controlCredential ?? null,
     );
 
+    // Once we start tearing the context down, every in-flight request aborts.
+    // Recording those would report our own teardown as a product failure.
+    let recording = true;
+    const candidateOrigin = new URL(opts.baseUrl).origin;
     page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text().slice(0, 500));
+      if (!recording || msg.type() !== 'error') return;
+      const text = msg.text().slice(0, 500);
+      if (opts.expectedDevServerNoise && isCandidateDevServerNoise(text, candidateOrigin)) return;
+      consoleErrors.push(text);
     });
-    page.on('pageerror', (error) => consoleErrors.push(`uncaught: ${error.message}`.slice(0, 500)));
+    page.on('pageerror', (error) => {
+      // An uncaught exception is always a real signal, never classified away.
+      if (recording) consoleErrors.push(`uncaught: ${error.message}`.slice(0, 500));
+    });
     page.on('requestfailed', (request) => {
-      networkFailures.push(
-        `${request.method()} ${request.url()} — ${request.failure()?.errorText ?? 'failed'}`.slice(
-          0,
-          500,
-        ),
-      );
+      if (!recording) return;
+      const errorText = request.failure()?.errorText ?? 'failed';
+      if (
+        opts.expectedDevServerNoise &&
+        isCandidateStreamAbort(request.url(), errorText, candidateOrigin)
+      ) {
+        return;
+      }
+      networkFailures.push(`${request.method()} ${request.url()} — ${errorText}`.slice(0, 500));
     });
     page.on('response', (response) => {
-      if (response.status() >= 400)
+      if (recording && response.status() >= 400)
         networkFailures.push(`${response.status()} ${response.url()}`.slice(0, 500));
     });
 
@@ -262,7 +334,12 @@ export class VisualQaEngine {
           this.captureScreenshot,
         );
         if (scenario.expectedSelector) {
-          await page.locator(scenario.expectedSelector).first().waitFor({ timeout: 15_000 });
+          await page
+            .locator(scenario.expectedSelector)
+            .first()
+            .waitFor({
+              timeout: Math.min(Math.max(scenario.expectedSelectorTimeoutMs ?? 15_000, 0), 30_000),
+            });
         }
       } catch (error) {
         navigation.assert();
@@ -282,6 +359,7 @@ export class VisualQaEngine {
       await this.captureScreenshot(page, screenshotPath);
       await navigation.settle();
       navigation.assert();
+      recording = false;
       // Closing the whole context stops page timers and popup creation. The
       // route guard remains installed until close and every in-flight callback
       // has settled, so persistence has no navigation-capable race window.

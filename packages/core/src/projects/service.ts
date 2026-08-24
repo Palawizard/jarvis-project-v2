@@ -41,6 +41,8 @@ export interface VisualQaScenario {
    * reach it is an evidence-coverage failure, never a product defect.
    */
   expectedSelector?: string;
+  /** Bound for the expected-selector wait, like any other declared wait. */
+  expectedSelectorTimeoutMs?: number;
   /** Candidate-only fixture state this scenario needs to exist at all. */
   fixture?: 'paused-job';
 }

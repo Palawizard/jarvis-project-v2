@@ -901,6 +901,7 @@ export class JobPipeline {
         signal: opts.signal,
         headRef: opts.headRef,
         cycle: opts.cycle,
+        expectedDevServerNoise: true,
       });
       await server.stop();
       server = undefined;

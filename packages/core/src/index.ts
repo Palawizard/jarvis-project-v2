@@ -105,6 +105,8 @@ export {
 export {
   VisualQaEngine,
   isEvidenceCoverageFailure,
+  isCandidateDevServerNoise,
+  isCandidateStreamAbort,
   EVIDENCE_COVERAGE_PREFIX,
   type VisualQaShot,
   type VisualReviewFinding,

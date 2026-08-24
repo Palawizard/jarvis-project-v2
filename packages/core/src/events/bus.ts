@@ -41,6 +41,7 @@ export type JarvisEventType =
   | 'verification.retry'
   | 'review.started'
   | 'review.completed'
+  | 'visual_qa.plan.resolved'
   | 'visual_qa.started'
   | 'visual_qa.captured'
   | 'visual_qa.completed'

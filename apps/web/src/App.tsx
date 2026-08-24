@@ -185,24 +185,28 @@ function AuthenticatedApp() {
           active={route.name === 'command'}
           onClick={() => setRoute({ name: 'command' })}
           label="Command"
+          testId="nav-command"
         />
         <NavItem
           active={route.name === 'projects'}
           onClick={() => setRoute({ name: 'projects' })}
           label="Projects"
           count={projects.data?.length}
+          testId="nav-projects"
         />
         <NavItem
           active={route.name === 'jobs' || route.name === 'job'}
           onClick={() => setRoute({ name: 'jobs' })}
           label="Jobs"
           count={activeJobs.length || undefined}
+          testId="nav-jobs"
         />
         <NavItem
           active={route.name === 'memory'}
           onClick={() => setRoute({ name: 'memory' })}
           label="Memory"
           count={health.data?.memory.active}
+          testId="nav-memory"
         />
         <NavItem
           active={route.name === 'tools'}

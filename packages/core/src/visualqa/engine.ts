@@ -21,7 +21,7 @@ export interface VisualQaShot {
   error: string | null;
   /** null means "evidence only" — no AI review happened. Never fake this. */
   reviewedBy: string | null;
-  reviewVerdict: 'pass' | 'needs_fix' | null;
+  reviewVerdict: 'pass' | 'needs_fix' | 'insufficient_evidence' | null;
   reviewFindings: VisualReviewFinding[];
   createdAt: string;
   headRef: string | null;
@@ -52,6 +52,16 @@ export interface VisualReviewFinding {
   category: string;
   description: string;
   recommendation: string;
+}
+
+/**
+ * Marks a failed shot as "the declared surface was never reached" rather than
+ * "the product looks wrong". Written only by this engine, never by a model.
+ */
+export const EVIDENCE_COVERAGE_PREFIX = 'evidence-coverage: ';
+
+export function isEvidenceCoverageFailure(shot: Pick<VisualQaShot, 'status' | 'error'>): boolean {
+  return shot.status === 'failed' && (shot.error ?? '').startsWith(EVIDENCE_COVERAGE_PREFIX);
 }
 
 const VIEWPORTS = {
@@ -238,16 +248,30 @@ export class VisualQaEngine {
     try {
       await gotoAndSettle(page, url);
       navigation.assert();
-      await runInteractions(
-        page,
-        opts.baseUrl,
-        scenario.interactions ?? opts.interactions ?? [],
-        outDir,
-        viewport,
-        navigation.assert,
-        screenshotPaths,
-        this.captureScreenshot,
-      );
+      // Reaching the declared surface is an evidence question, not a product
+      // question: tag those failures so no source fixer is ever invoked for one.
+      try {
+        await runInteractions(
+          page,
+          opts.baseUrl,
+          scenario.interactions ?? opts.interactions ?? [],
+          outDir,
+          viewport,
+          navigation.assert,
+          screenshotPaths,
+          this.captureScreenshot,
+        );
+        if (scenario.expectedSelector) {
+          await page.locator(scenario.expectedSelector).first().waitFor({ timeout: 15_000 });
+        }
+      } catch (error) {
+        navigation.assert();
+        throw new Error(
+          `${EVIDENCE_COVERAGE_PREFIX}scenario ${scenario.name} did not reach ` +
+            `${scenario.expectedSelector ?? 'its declared state'}: ` +
+            (error instanceof Error ? error.message : String(error)),
+        );
+      }
       await navigation.settle();
       navigation.assert();
       // Let entry animations settle so screenshots are comparable run to run.
@@ -429,7 +453,12 @@ function parseReview(raw: string | null): {
       findings?: VisualReviewFinding[];
     };
     return {
-      verdict: value.verdict === 'pass' || value.verdict === 'needs_fix' ? value.verdict : null,
+      verdict:
+        value.verdict === 'pass' ||
+        value.verdict === 'needs_fix' ||
+        value.verdict === 'insufficient_evidence'
+          ? value.verdict
+          : null,
       findings: Array.isArray(value.findings) ? value.findings : [],
     };
   } catch {

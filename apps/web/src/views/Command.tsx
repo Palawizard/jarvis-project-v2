@@ -65,7 +65,7 @@ export function CommandView({
   const messages = conversation.data?.messages ?? [];
 
   return (
-    <div className="page">
+    <div className="page" data-testid="command-view">
       <div className="grid cols-2" style={{ alignItems: 'start' }}>
         <div>
           <Card title="Conversation">

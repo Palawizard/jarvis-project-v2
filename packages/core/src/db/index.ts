@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export const MIGRATIONS = new Map<number, string>([
   [
@@ -169,6 +169,7 @@ export const MIGRATIONS = new Map<number, string>([
       updated_at      TEXT NOT NULL
     );`,
   ],
+  [6, `ALTER TABLE jobs ADD COLUMN visual_qa_plan TEXT;`],
 ]);
 
 function schemaSql(): string {

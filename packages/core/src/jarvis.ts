@@ -2,6 +2,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import { openDb, type Db } from './db/index.js';
+import { selfSurfaceScenario } from './visualqa/surfaces.js';
+import { seedCandidateFixtures } from './runtime/fixtures.js';
 import { ensureDirs, getConfig, loadConfig, setConfig, type JarvisConfig } from './config.js';
 import { EventBus } from './events/bus.js';
 import { MemoryService } from './memory/service.js';
@@ -131,6 +133,7 @@ export class Jarvis {
     tools: { interrupted: number; expired: number };
     expired: number;
     selfProject: string | null;
+    fixtures: string[];
   }> {
     const recovered = this.jobs.recoverInterrupted();
     const interruptedApplications = this.applications.recoverInterrupted();
@@ -154,7 +157,11 @@ export class Jarvis {
       log.warn('could not register Jarvis as a project', { error: String(error) });
       return null;
     });
-    return { recovered, tools, expired, selfProject: selfProject?.id ?? null };
+    // Candidate runtimes only: deterministic Visual-QA state in this isolated
+    // home. `seedCandidateFixtures` refuses outright on the real runtime.
+    const fixtures = seedCandidateFixtures(this.db, { projectId: selfProject?.id ?? null });
+    if (fixtures.length) log.info('candidate visual QA fixtures seeded', { fixtures });
+    return { recovered, tools, expired, selfProject: selfProject?.id ?? null, fixtures };
   }
 
   /**
@@ -173,21 +180,10 @@ export class Jarvis {
         apiPortEnvironment: 'JARVIS_PORT',
         healthPath: '/health',
       },
-      visualQa: {
-        required: true,
-        scenarios: [
-          { name: 'command', route: '/', viewports: ['desktop', 'mobile'] },
-          {
-            name: 'tools',
-            route: '/',
-            interactions: [
-              { action: 'click', selector: "[data-testid='nav-tools']" },
-              { action: 'wait', selector: "[data-testid='tools-view']" },
-            ],
-            viewports: ['desktop', 'mobile'],
-          },
-        ],
-      },
+      // Self visual QA is planned from the candidate diff (see
+      // visualqa/surfaces.ts). These defaults are only the last-resort fallback
+      // for a change that maps to no known surface.
+      visualQa: { required: true, scenarios: [selfSurfaceScenario('command')] },
       verification: {
         steps: [
           { name: 'format', command: 'pnpm format:check' },

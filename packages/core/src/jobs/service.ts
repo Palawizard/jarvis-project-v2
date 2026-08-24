@@ -4,6 +4,7 @@ import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { ProviderId } from '../agents/types.js';
 import type { VisualQaScenario } from '../projects/service.js';
+import type { VisualQaPlan } from '../visualqa/surfaces.js';
 import type { ReviewFinding } from '../review/engine.js';
 import type { VisualReviewFinding } from '../visualqa/engine.js';
 import { redactSecrets } from '../memory/secrets.js';
@@ -53,6 +54,8 @@ export interface Job {
   candidateSourceSha: string | null;
   validationOnly: boolean;
   visualQaConfig: { required?: boolean; scenarios: VisualQaScenario[] } | null;
+  /** The scenario plan Visual QA actually resolved for this candidate diff. */
+  visualQaPlan: VisualQaPlan | null;
   episodeId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -112,6 +115,7 @@ function rowToJob(row: Row): Job {
       row.visual_qa_config as string,
       null as { required?: boolean; scenarios: VisualQaScenario[] } | null,
     ),
+    visualQaPlan: parseJson(row.visual_qa_plan as string, null as VisualQaPlan | null),
     episodeId: (row.episode_id as string) ?? null,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
@@ -193,6 +197,7 @@ export class JobService {
       candidateSourceSha: input.candidateSource?.sourceSha ?? null,
       validationOnly: input.validationOnly ?? false,
       visualQaConfig: input.visualQa ?? null,
+      visualQaPlan: null,
       episodeId: null,
       createdAt: now,
       updatedAt: now,
@@ -275,7 +280,8 @@ export class JobService {
           fix_cycles=?, review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?,
           restart_reason=?, repair_kind=?, repair_checkpoint=?, last_provider=?, resume_session_id=?,
           reviewed_head=?, visual_head=?, candidate_base_sha=?,
-          candidate_source_sha=?, validation_only=?, visual_qa_config=?, episode_id=?, goal=?,
+          candidate_source_sha=?, validation_only=?, visual_qa_config=?, visual_qa_plan=?,
+          episode_id=?, goal=?,
           acceptance=?, updated_at=?, finished_at=? WHERE id=?`,
       )
       .run(
@@ -302,6 +308,7 @@ export class JobService {
         next.candidateSourceSha,
         next.validationOnly ? 1 : 0,
         next.visualQaConfig ? JSON.stringify(next.visualQaConfig) : null,
+        next.visualQaPlan ? JSON.stringify(next.visualQaPlan) : null,
         next.episodeId,
         next.goal,
         JSON.stringify(next.acceptance),
@@ -335,7 +342,8 @@ export class JobService {
           review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?, last_provider=?,
           restart_reason=?, repair_kind=?, repair_checkpoint=?, resume_session_id=?, reviewed_head=?,
           visual_head=?, candidate_base_sha=?,
-          candidate_source_sha=?, validation_only=?, visual_qa_config=?, episode_id=?, goal=?,
+          candidate_source_sha=?, validation_only=?, visual_qa_config=?, visual_qa_plan=?,
+          episode_id=?, goal=?,
           acceptance=?, updated_at=? WHERE id=?`,
       )
       .run(
@@ -360,6 +368,7 @@ export class JobService {
         next.candidateSourceSha,
         next.validationOnly ? 1 : 0,
         next.visualQaConfig ? JSON.stringify(next.visualQaConfig) : null,
+        next.visualQaPlan ? JSON.stringify(next.visualQaPlan) : null,
         next.episodeId,
         next.goal,
         JSON.stringify(next.acceptance),

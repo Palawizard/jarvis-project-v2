@@ -62,6 +62,11 @@ export interface Job {
   candidateBaseSha: string | null;
   candidateSourceSha: string | null;
   validationOnly: boolean;
+  visualQaPlan: {
+    source: string;
+    scenarios: Array<{ name: string; viewports?: Array<'desktop' | 'mobile'> }>;
+    reasons: string[];
+  } | null;
   episodeId: string | null;
   createdAt: string;
   updatedAt: string;

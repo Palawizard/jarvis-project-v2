@@ -83,7 +83,7 @@ export function MemoryView({
   );
 
   return (
-    <div className="page">
+    <div className="page" data-testid="memory-view">
       <AddMemory
         projects={projects}
         onAdded={() => {

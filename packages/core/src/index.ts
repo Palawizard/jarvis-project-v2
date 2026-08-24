@@ -102,13 +102,33 @@ export {
   type Review,
   type ReviewFinding,
 } from './review/engine.js';
-export { VisualQaEngine, type VisualQaShot, type VisualReviewFinding } from './visualqa/engine.js';
+export {
+  VisualQaEngine,
+  isEvidenceCoverageFailure,
+  EVIDENCE_COVERAGE_PREFIX,
+  type VisualQaShot,
+  type VisualReviewFinding,
+} from './visualqa/engine.js';
 export { VisualReviewer, parseVisualReview, type VisualReview } from './visualqa/reviewer.js';
+export {
+  resolveVisualPlan,
+  mapChangedFilesToSurfaces,
+  SELF_VISUAL_SURFACES,
+  FIXTURE_PAUSED_JOB_ID,
+  selfSurfaceScenario,
+  type VisualQaPlan,
+  type VisualFixtureProfile,
+} from './visualqa/surfaces.js';
 export {
   startCandidateRuntime,
   CandidateRuntimeUnsupportedError,
   type CandidateRuntime,
 } from './runtime/candidate.js';
+export {
+  seedCandidateFixtures,
+  requestedCandidateFixtures,
+  CANDIDATE_FIXTURE_ENV,
+} from './runtime/fixtures.js';
 
 export {
   ToolRegistry,

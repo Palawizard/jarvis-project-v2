@@ -12,7 +12,11 @@ import { redactSecrets, redactSecretValues } from '../memory/secrets.js';
 import { z } from 'zod';
 
 export interface VisualReview {
-  verdict: 'pass' | 'needs_fix' | 'error';
+  /**
+   * `insufficient_evidence` means the QA plan/evidence was inadequate, not that
+   * the product is broken. Only `needs_fix` may ever reach a source fixer.
+   */
+  verdict: 'pass' | 'needs_fix' | 'insufficient_evidence' | 'error';
   findings: VisualReviewFinding[];
   reviewedEvidence?: Array<{ shotId: string; sha256: string }>;
   provider: ProviderId | null;
@@ -26,6 +30,10 @@ interface VisualReviewOptions {
   goal: string;
   acceptance: string[];
   shots: VisualQaShot[];
+  /** Candidate diff paths, so the reviewer can attribute what it sees. */
+  changedFiles?: string[];
+  /** Deterministic `<file> -> <surface>` lines explaining the scenario plan. */
+  planReasons?: string[];
   implementerProvider?: ProviderId;
   selfDevelopment?: boolean;
   signal?: AbortSignal;
@@ -36,7 +44,7 @@ const SCHEMA = {
   additionalProperties: false,
   required: ['verdict', 'reviewedEvidence', 'findings'],
   properties: {
-    verdict: { type: 'string', enum: ['pass', 'needs_fix'] },
+    verdict: { type: 'string', enum: ['pass', 'needs_fix', 'insufficient_evidence'] },
     reviewedEvidence: {
       type: 'array',
       items: {
@@ -90,7 +98,7 @@ const VISUAL_FINDING_SCHEMA = z
   .strict();
 const VISUAL_REVIEW_SCHEMA = z
   .object({
-    verdict: z.enum(['pass', 'needs_fix']),
+    verdict: z.enum(['pass', 'needs_fix', 'insufficient_evidence']),
     reviewedEvidence: z.array(
       z.object({ shotId: z.string().min(1), sha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
     ),
@@ -258,10 +266,12 @@ export class VisualReviewer {
       externalSessionId: result.sessionId ?? null,
       usage: result.usage,
     });
-    const blocking = parsed.findings.some((finding) =>
-      this.config.pipeline.visualBlockingSeverities.includes(finding.severity),
-    );
-    parsed.verdict = blocking ? 'needs_fix' : 'pass';
+    if (parsed.verdict !== 'insufficient_evidence') {
+      const blocking = parsed.findings.some((finding) =>
+        this.config.pipeline.visualBlockingSeverities.includes(finding.severity),
+      );
+      parsed.verdict = blocking ? 'needs_fix' : 'pass';
+    }
     const reviewedBy = `${routed.provider.id}${routed.decision.model ? `:${routed.decision.model}` : ''}`;
     for (const shot of opts.shots) {
       this.db
@@ -356,6 +366,17 @@ export function parseVisualReview(
     return invalidVisual('finding references an unknown or failed visual shot');
   }
   const blocking = findings.filter((finding) => blockingSeverities.includes(finding.severity));
+  // A reviewer that could not see the target surface reports an evidence
+  // problem. That is a QA-plan defect, so it never becomes a source-fix verdict.
+  if (checked.data.verdict === 'insufficient_evidence') {
+    return {
+      verdict: 'insufficient_evidence',
+      reviewedEvidence,
+      findings,
+      provider: null,
+      model: null,
+    };
+  }
   if (checked.data.verdict === 'needs_fix' && blocking.length === 0) {
     return invalidVisual('needs_fix requires at least one configured blocking finding');
   }
@@ -372,11 +393,30 @@ function invalidVisual(error = 'invalid output'): VisualReview {
   return { verdict: 'error', findings: [], provider: null, model: null, error };
 }
 
-function buildPrompt(opts: Pick<VisualReviewOptions, 'goal' | 'acceptance' | 'shots'>): string {
+function buildPrompt(
+  opts: Pick<VisualReviewOptions, 'goal' | 'acceptance' | 'shots' | 'changedFiles' | 'planReasons'>,
+): string {
   return `Independently inspect every attached screenshot. Judge visible layout, clipping,
 readability, responsive behavior, and obvious UI error states. Do not infer hidden behavior.
 
+Verdicts:
+- "pass": the captured surfaces look correct.
+- "needs_fix": a screenshot shows a real, visible product defect on a captured
+  surface that this candidate diff could plausibly have caused. Requires at
+  least one blocking finding.
+- "insufficient_evidence": the surface the candidate diff actually changed is
+  not visible in any screenshot, or the screenshots do not let you judge it.
+  Use this instead of "needs_fix" whenever the problem is missing evidence
+  rather than a broken product. A missing screenshot is never a source defect.
+
+Findings about surfaces this candidate did not change are advisory (severity
+"low" or "info") unless the evidence shows the candidate caused the regression.
+
 Goal: ${opts.goal}
+Files changed by this candidate:
+${opts.changedFiles?.map((file) => `- ${file}`).join('\n') || '- unknown'}
+Why these scenarios were captured:
+${opts.planReasons?.map((item) => `- ${item}`).join('\n') || '- project default scenarios'}
 Acceptance criteria:\n${opts.acceptance.map((item) => `- ${item}`).join('\n') || '- none supplied'}
 Evidence (copy every exact shotId and sha256 into reviewedEvidence only after inspecting it):\n${opts.shots
     .map(

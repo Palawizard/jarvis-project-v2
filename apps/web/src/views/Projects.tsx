@@ -60,7 +60,7 @@ function ProjectList({
   };
 
   return (
-    <div className="page">
+    <div className="page" data-testid="projects-view">
       <Card title="Register a local git repository">
         <div className="row wrap">
           <input

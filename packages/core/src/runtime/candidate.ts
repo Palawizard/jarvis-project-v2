@@ -7,6 +7,7 @@ import { killTree, spawnContained, untrustedProcessEnv } from '../agents/spawn.j
 import { repoStatus } from '../git/workspace.js';
 import { redactSecrets } from '../memory/secrets.js';
 import type { Project } from '../projects/service.js';
+import { CANDIDATE_FIXTURE_ENV } from './fixtures.js';
 
 export class CandidateRuntimeUnsupportedError extends Error {}
 
@@ -34,6 +35,8 @@ export async function startCandidateRuntime(opts: {
   config: JarvisConfig;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Visual-QA fixture profiles the candidate may seed in its isolated home. */
+  fixtures?: readonly string[];
 }): Promise<CandidateRuntime> {
   const runtime = opts.project.config.candidateRuntime;
   if (!runtime) {
@@ -62,6 +65,10 @@ export async function startCandidateRuntime(opts: {
     JARVIS_RUNTIME_NONCE: runtimeNonce,
     JARVIS_CANDIDATE_RUNTIME: '1',
     JARVIS_CANDIDATE_QA_CREDENTIAL_HASH: qaCredentialHash,
+    // Deterministic QA state the candidate seeds into its own throwaway
+    // database. A request, never authority — the child re-checks it is a
+    // candidate before honouring it, and the real runtime always refuses.
+    [CANDIDATE_FIXTURE_ENV]: (opts.fixtures ?? []).join(','),
     // Candidate mutations must still present an exact Origin. Trust exactly the
     // candidate's own dynamic web origin — candidate-only config, not authority.
     JARVIS_CONTROL_ORIGINS: baseUrl,

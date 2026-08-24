@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from '../config.js';
-import { MIGRATIONS, openDb } from './index.js';
+import { MIGRATIONS, SCHEMA_VERSION, openDb } from './index.js';
 
 const homes: string[] = [];
 
@@ -33,7 +33,7 @@ describe('database migrations', () => {
     const migrated = openDb(config);
     expect(
       migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
-    ).toEqual({ value: '5' });
+    ).toEqual({ value: String(SCHEMA_VERSION) });
     expect(migrated.prepare("SELECT name FROM projects WHERE id='prj_keep'").get()).toEqual({
       name: 'preserved',
     });
@@ -74,7 +74,7 @@ describe('database migrations', () => {
     const migrated = openDb(config);
     expect(
       migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
-    ).toEqual({ value: '5' });
+    ).toEqual({ value: String(SCHEMA_VERSION) });
     expect(migrated.prepare("SELECT stage FROM jobs WHERE id='job_v2'").get()).toEqual({
       stage: 'awaiting_user',
     });
@@ -167,7 +167,7 @@ describe('database migrations', () => {
     expect(
       migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
     ).toEqual({
-      value: '5',
+      value: String(SCHEMA_VERSION),
     });
     expect(migrated.prepare("SELECT content FROM memories WHERE id='mem_v3'").get()).toEqual({
       content: 'preserved v3 memory',
@@ -242,7 +242,7 @@ describe('database migrations', () => {
     expect(
       migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
     ).toEqual({
-      value: '5',
+      value: String(SCHEMA_VERSION),
     });
     expect(
       migrated.prepare("SELECT stage,head_ref,reviewed_head FROM jobs WHERE id='job_v4'").get(),

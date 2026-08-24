@@ -36,6 +36,13 @@ export interface VisualQaScenario {
   route: string;
   interactions?: VisualInteraction[];
   viewports?: ('desktop' | 'mobile')[];
+  /**
+   * Selector that proves the intended surface actually rendered. Failing to
+   * reach it is an evidence-coverage failure, never a product defect.
+   */
+  expectedSelector?: string;
+  /** Candidate-only fixture state this scenario needs to exist at all. */
+  fixture?: 'paused-job';
 }
 
 export interface VerificationStep {

@@ -4,14 +4,15 @@ import { getConfig, type JarvisConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
 import type { JobService, Job } from './service.js';
-import type { ProjectService, Project, VisualQaScenario } from '../projects/service.js';
+import type { ProjectService, Project } from '../projects/service.js';
 import type { SessionService } from '../sessions/service.js';
 import type { MemoryService } from '../memory/service.js';
 import type { ContextPackBuilder } from '../context/pack.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import type { VerificationEngine, VerificationReport } from '../verification/engine.js';
 import type { ReviewEngine, Review, ReviewFinding } from '../review/engine.js';
-import { VisualQaEngine } from '../visualqa/engine.js';
+import { VisualQaEngine, isEvidenceCoverageFailure } from '../visualqa/engine.js';
+import { resolveVisualPlan, type VisualQaPlan } from '../visualqa/surfaces.js';
 import { VisualReviewer } from '../visualqa/reviewer.js';
 import { startCandidateRuntime } from '../runtime/candidate.js';
 import { GitWorkspace } from '../git/workspace.js';
@@ -364,36 +365,65 @@ export class JobPipeline {
       }
       job = jobs.patch(jobId, { reviewedHead: changes.head });
 
-      const visualConfig = resolveVisualConfig(job, input.project);
-      const uiChanged = changes.files.some((file) =>
-        /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i.test(file.path),
+      const changedFiles = changes.files.map((file) => file.path);
+      // The plan comes from the diff, not from a static default list. Capturing
+      // surfaces the candidate never touched is what let unrelated findings
+      // block narrow jobs and sent the visual fixer at innocent source.
+      const visualPlan = resolveVisualPlan(job, input.project, changedFiles);
+      const uiChanged = changedFiles.some((file) =>
+        /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i.test(file),
       );
       const shouldVisualQa = Boolean(
-        visualConfig && (visualConfig.required === true || uiChanged || job.visualQaConfig),
+        visualPlan && (visualPlan.required === true || uiChanged || job.visualQaConfig),
       );
-      if (shouldVisualQa && visualConfig) {
-        jobs.transition(jobId, 'visual_qa');
+      if (shouldVisualQa && visualPlan) {
+        jobs.transition(jobId, 'visual_qa', { visualQaPlan: visualPlan });
+        this.deps.bus.emit({
+          type: 'visual_qa.plan.resolved',
+          jobId,
+          payload: {
+            source: visualPlan.source,
+            scenarios: visualPlan.scenarios.map((scenario) => ({
+              name: scenario.name,
+              viewports: scenario.viewports ?? ['desktop', 'mobile'],
+            })),
+            reasons: visualPlan.reasons,
+            fixtures: visualPlan.fixtures,
+          },
+        });
         const visual = await this.runVisualQa({
           job,
           project: input.project,
           cwd: input.cwd,
           signal: input.signal,
-          config: visualConfig,
+          plan: visualPlan,
+          changedFiles,
           implementerProvider: provider,
           headRef: changes.head,
           cycle: job.visualFixCycles,
         });
         if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
-        if (visual.kind === 'infrastructure') {
+        if (visual.kind === 'infrastructure' || visual.kind === 'insufficient_evidence') {
+          // Neither a browser failure nor a missing screenshot is a product
+          // defect, and editing source cannot conjure the missing evidence.
+          // These pause for a human; the visual fixer is never invoked.
           this.pause(jobId, 'visual_qa', visual.error);
           return;
-        } else if (visual.kind === 'blocking') {
-          const blockingReview = {
-            ...visual.review,
-            findings: visual.review.findings.filter((finding) =>
-              this.config.pipeline.visualBlockingSeverities.includes(finding.severity),
-            ),
-          };
+        }
+        // Only findings on scenarios this diff actually selected may block. An
+        // incidental defect on a surface the candidate never touched is
+        // advisory: it is pre-existing, not this candidate's regression.
+        const planned = new Set(visualPlan.scenarios.map((scenario) => scenario.name));
+        const blockingFindings =
+          visual.kind === 'product_needs_fix'
+            ? visual.review.findings.filter(
+                (finding) =>
+                  this.config.pipeline.visualBlockingSeverities.includes(finding.severity) &&
+                  planned.has(finding.scenarioName),
+              )
+            : [];
+        if (visual.kind === 'product_needs_fix' && blockingFindings.length > 0) {
+          const blockingReview = { ...visual.review, findings: blockingFindings };
           if (job.validationOnly) {
             this.pause(
               jobId,
@@ -424,7 +454,13 @@ export class JobPipeline {
             role: 'visual_fixer',
             cwd: input.cwd,
             contextPackId: input.contextPackId,
-            prompt: buildVisualFixerPrompt({ job, review: blockingReview, diff: changes.diff }),
+            prompt: buildVisualFixerPrompt({
+              job,
+              review: blockingReview,
+              diff: changes.diff,
+              changedFiles,
+              plan: visualPlan,
+            }),
             imagePaths: visual.shots.flatMap((shot) =>
               shot.screenshotPath ? [shot.screenshotPath] : [],
             ),
@@ -838,31 +874,13 @@ export class JobPipeline {
     project: Project;
     cwd: string;
     signal: AbortSignal;
-    config: { required?: boolean; scenarios: VisualQaScenario[] };
+    plan: VisualQaPlan;
+    changedFiles: string[];
     implementerProvider?: ProviderId;
     headRef: string;
     cycle: number;
-  }): Promise<
-    | { kind: 'pass'; review: VisualReview; shots: Awaited<ReturnType<VisualQaEngine['capture']>> }
-    | {
-        kind: 'blocking';
-        review: VisualReview;
-        shots: Awaited<ReturnType<VisualQaEngine['capture']>>;
-      }
-    | { kind: 'infrastructure'; error: string }
-  > {
-    let outcome:
-      | {
-          kind: 'pass';
-          review: VisualReview;
-          shots: Awaited<ReturnType<VisualQaEngine['capture']>>;
-        }
-      | {
-          kind: 'blocking';
-          review: VisualReview;
-          shots: Awaited<ReturnType<VisualQaEngine['capture']>>;
-        }
-      | { kind: 'infrastructure'; error: string };
+  }): Promise<VisualQaOutcome> {
+    let outcome: VisualQaOutcome;
     let server: Awaited<ReturnType<typeof startCandidateRuntime>> | undefined;
     try {
       server = await startCandidateRuntime({
@@ -871,22 +889,27 @@ export class JobPipeline {
         jobId: opts.job.id,
         config: this.config,
         signal: opts.signal,
+        fixtures: opts.plan.fixtures,
       });
       const shots = await this.visualQa.capture({
         jobId: opts.job.id,
         projectId: opts.project.id,
         baseUrl: server.baseUrl,
         controlCredential: server.controlCredential(),
-        routes: opts.config.scenarios.map((scenario) => scenario.route),
-        scenarios: opts.config.scenarios,
+        routes: opts.plan.scenarios.map((scenario) => scenario.route),
+        scenarios: opts.plan.scenarios,
         signal: opts.signal,
         headRef: opts.headRef,
         cycle: opts.cycle,
       });
       await server.stop();
       server = undefined;
-      if (shots.some((shot) => shot.status !== 'captured')) {
-        outcome = { kind: 'infrastructure', error: 'visual QA did not capture every scenario' };
+      // Deterministic coverage first. The reviewer never gets to decide whether
+      // the evidence it was handed is complete, and no source fixer can run on
+      // the strength of evidence that was never captured.
+      const coverage = checkVisualCoverage(opts.plan, shots, opts.headRef);
+      if (coverage) {
+        outcome = coverage;
       } else {
         const review = await this.visualReviewer.review({
           jobId: opts.job.id,
@@ -894,6 +917,8 @@ export class JobPipeline {
           goal: opts.job.goal,
           acceptance: opts.job.acceptance,
           shots,
+          changedFiles: opts.changedFiles,
+          planReasons: opts.plan.reasons,
           ...(opts.implementerProvider ? { implementerProvider: opts.implementerProvider } : {}),
           selfDevelopment: opts.project.isSelf,
           signal: opts.signal,
@@ -901,9 +926,16 @@ export class JobPipeline {
         outcome =
           review.verdict === 'error'
             ? { kind: 'infrastructure', error: review.error ?? 'visual reviewer failed' }
-            : review.verdict === 'needs_fix'
-              ? { kind: 'blocking', review, shots }
-              : { kind: 'pass', review, shots };
+            : review.verdict === 'insufficient_evidence'
+              ? {
+                  kind: 'insufficient_evidence',
+                  error:
+                    'Visual review could not see the changed surface in the captured evidence. ' +
+                    'This is a QA plan problem, not a product defect; no source fix was attempted.',
+                }
+              : review.verdict === 'needs_fix'
+                ? { kind: 'product_needs_fix', review, shots }
+                : { kind: 'pass', review, shots };
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1352,28 +1384,66 @@ to make them pass. If a failure is pre-existing and unrelated to your change, sa
 so explicitly in your summary instead of papering over it.`;
 }
 
-function resolveVisualConfig(
-  job: Job,
-  project: Project,
-): { required?: boolean; scenarios: VisualQaScenario[] } | null {
-  if (job.visualQaConfig) return job.visualQaConfig;
-  const visual = project.config.visualQa;
-  if (!visual) return null;
-  const routes = visual.routes?.length
-    ? visual.routes
-    : project.stack.webRoutes?.length
-      ? project.stack.webRoutes
-      : ['/'];
-  return {
-    required: visual.required,
-    scenarios: visual.scenarios?.length
-      ? visual.scenarios
-      : routes.map((route) => ({
-          name: route === '/' ? 'default' : route,
-          route,
-          ...(visual.interactions ? { interactions: visual.interactions } : {}),
-        })),
-  };
+type VisualShots = Awaited<ReturnType<VisualQaEngine['capture']>>;
+
+/**
+ * The distinct things "visual QA did not pass" can mean. Only
+ * `product_needs_fix` describes the product; the other failure kinds describe
+ * our own evidence, and must never reach a source-editing fixer.
+ */
+type VisualQaOutcome =
+  | { kind: 'pass'; review: VisualReview; shots: VisualShots }
+  | { kind: 'product_needs_fix'; review: VisualReview; shots: VisualShots }
+  | { kind: 'insufficient_evidence'; error: string }
+  | { kind: 'infrastructure'; error: string };
+
+/**
+ * Deterministic evidence-coverage gate, run before any reviewer sees an image.
+ *
+ * Checks that every planned scenario/viewport was captured, that each declared
+ * surface selector was actually reached, and that the evidence belongs to the
+ * exact candidate HEAD. Returns null when coverage is complete.
+ */
+export function checkVisualCoverage(
+  plan: VisualQaPlan,
+  shots: VisualShots,
+  headRef: string,
+): Extract<VisualQaOutcome, { error: string }> | null {
+  const unreached = shots.filter(isEvidenceCoverageFailure);
+  if (unreached.length > 0) {
+    return {
+      kind: 'insufficient_evidence',
+      error:
+        'Visual QA could not reach the changed surface, so there is no evidence to judge. ' +
+        'This is a QA plan/fixture problem, not a product defect.\n' +
+        unreached.map((shot) => `- ${shot.error ?? 'unreached'}`).join('\n'),
+    };
+  }
+  if (shots.some((shot) => shot.status !== 'captured')) {
+    return { kind: 'infrastructure', error: 'visual QA did not capture every scenario' };
+  }
+  const captured = new Set(shots.map((shot) => `${shot.scenarioName} ${shot.viewport}`));
+  const missing = plan.scenarios.flatMap((scenario) =>
+    (scenario.viewports ?? ['desktop', 'mobile']).flatMap((viewport) =>
+      captured.has(`${scenario.name} ${viewport}`) ? [] : [`${scenario.name} - ${viewport}`],
+    ),
+  );
+  if (missing.length > 0) {
+    return {
+      kind: 'insufficient_evidence',
+      error:
+        `Visual QA plan required evidence that was never captured: ${missing.join(', ')}. ` +
+        'No source fix can create a missing screenshot.',
+    };
+  }
+  // Evidence must belong to the exact reviewed candidate, never an older cycle.
+  if (shots.some((shot) => shot.headRef !== headRef)) {
+    return {
+      kind: 'infrastructure',
+      error: 'visual evidence does not match the exact candidate HEAD',
+    };
+  }
+  return null;
 }
 
 function renderCodeBlockers(findings: ReviewFinding[]): string {
@@ -1406,7 +1476,13 @@ ${input.verification.results.map((result) => `- ${result.name}: ${result.status}
 Do not weaken checks or address advisory findings unless the blocking fix requires it. Finish with a concise summary.`;
 }
 
-function buildVisualFixerPrompt(input: { job: Job; review: VisualReview; diff: string }): string {
+function buildVisualFixerPrompt(input: {
+  job: Job;
+  review: VisualReview;
+  diff: string;
+  changedFiles?: string[];
+  plan?: VisualQaPlan;
+}): string {
   return `Fix only the visible product issues shown in the attached screenshots.
 
 ## Request
@@ -1415,11 +1491,27 @@ ${input.job.request}
 ## Acceptance criteria
 ${input.job.acceptance.map((item) => `- ${item}`).join('\n') || '- none supplied'}
 
+## Files this candidate changed
+${input.changedFiles?.map((file) => `- ${file}`).join('\n') || '- unknown'}
+
+## Why these surfaces were captured
+${input.plan?.reasons.map((reason) => `- ${reason}`).join('\n') || '- project default scenarios'}
+
 ## Blocking structured visual findings
 ${JSON.stringify(input.review.findings, null, 2)}
 
 ## Current diff summary
 ${input.diff.slice(0, 12_000)}
+
+## Scope
+Do NOT edit a surface that is not implicated by the candidate diff above, even
+if it appears in a screenshot. A pre-existing problem on an unrelated surface is
+out of scope: leave it alone and say so in your summary. The one exception is a
+cross-surface regression the evidence proves this candidate introduced - for
+example when the diff changes a global stylesheet or shared layout component.
+
+Never "fix" missing evidence. If a finding is that something is not visible or
+was not captured, that is a QA plan problem: change no source, and say so.
 
 The screenshots are evidence. Do not infer or rewrite unrelated hidden behavior. Finish with a concise summary.`;
 }

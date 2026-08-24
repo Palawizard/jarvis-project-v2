@@ -33,6 +33,7 @@ export function JobsView({
         {list.map((job) => (
           <tr
             key={job.id}
+            data-testid={`job-row-${job.id}`}
             className="clickable"
             role="link"
             tabIndex={0}
@@ -65,7 +66,7 @@ export function JobsView({
   );
 
   return (
-    <div className="page">
+    <div className="page" data-testid="jobs-view">
       {awaiting.length > 0 && (
         <Card title={`Awaiting your decision (${awaiting.length})`}>{table(awaiting)}</Card>
       )}

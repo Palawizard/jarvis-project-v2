@@ -12,6 +12,11 @@ export default defineConfig({
     host: '127.0.0.1',
     port: Number.isFinite(PORT) ? PORT : 5199,
     strictPort: true,
+    // A candidate runtime is photographed by Visual QA, never edited live. Its
+    // HMR websocket cannot reach the dev server through the local-network-access
+    // prompt, and the resulting console/network errors are pure QA noise that
+    // repeatedly distracted the visual reviewer. Normal `pnpm dev` is unchanged.
+    hmr: process.env.JARVIS_CANDIDATE_RUNTIME === '1' ? false : undefined,
     // Proxy keeps the browser on one origin: no CORS, and SSE works unchanged.
     proxy: { '/api': { target: API, changeOrigin: true, ws: false } },
   },

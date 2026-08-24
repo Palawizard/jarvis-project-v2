@@ -147,7 +147,7 @@ async function harness(options: {
   review: (call: number, opts: ReviewOptions) => Omit<Review, 'id' | 'jobId' | 'createdAt'>;
   provider?: FakeProvider;
   maxReviewFixCycles?: number;
-  visual?: 'repair' | 'infrastructure' | 'advisory';
+  visual?: 'repair' | 'infrastructure' | 'advisory' | 'insufficient_evidence' | 'unrelated';
   selfDevelopment?: boolean;
   verification?: VerificationReport[];
   realVerification?: boolean;
@@ -313,7 +313,7 @@ async function harness(options: {
     let visualCall = 0;
     const finding: VisualReviewFinding = {
       severity: options.visual === 'advisory' ? 'low' : 'high',
-      scenarioName: 'tools',
+      scenarioName: options.visual === 'unrelated' ? 'memory' : 'tools',
       route: '/',
       viewport: 'desktop',
       category: 'layout',
@@ -327,6 +327,12 @@ async function harness(options: {
       visualHeads.push(input.headRef);
       if (options.visual === 'infrastructure') {
         return { kind: 'infrastructure', error: 'Playwright launch failed' };
+      }
+      if (options.visual === 'insufficient_evidence') {
+        return {
+          kind: 'insufficient_evidence',
+          error: 'Visual QA plan required evidence that was never captured: tools - desktop.',
+        };
       }
       const screenshotPath = path.join(home, 'screens', `visual-${visualCall}.png`);
       fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
@@ -343,16 +349,16 @@ async function harness(options: {
           status: 'captured',
           error: null,
           reviewedBy: 'codex',
-          reviewVerdict: options.visual === 'repair' && visualCall === 1 ? 'needs_fix' : 'pass',
-          reviewFindings: options.visual === 'repair' && visualCall === 1 ? [finding] : [],
+          reviewVerdict: blockingVisual(options.visual) && visualCall === 1 ? 'needs_fix' : 'pass',
+          reviewFindings: blockingVisual(options.visual) && visualCall === 1 ? [finding] : [],
           headRef: input.headRef,
           cycle: visualCall - 1,
           createdAt: nowIso(),
         },
       ];
-      return options.visual === 'repair' && visualCall === 1
+      return blockingVisual(options.visual) && visualCall === 1
         ? {
-            kind: 'blocking',
+            kind: 'product_needs_fix',
             review: { verdict: 'needs_fix', findings: [finding], provider: 'codex', model: null },
             shots,
           }
@@ -808,6 +814,69 @@ describe('job repair pipeline', () => {
         encoding: 'utf8',
       }),
     ).toBe('stable');
+    h.db.close();
+  });
+
+  it('never invokes the visual fixer when required evidence was not captured', async () => {
+    const h = await harness({
+      visual: 'insufficient_evidence',
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'code approved',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('paused');
+    expect(job.resumeStage).toBe('visual_qa');
+    expect(job.pauseReason).toContain('never captured');
+    expect(job.visualFixCycles).toBe(0);
+    expect(h.provider.calls.filter((call) => call.role === 'visual_fixer')).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('never invokes the visual fixer for a blocking finding on an unplanned surface', async () => {
+    const h = await harness({
+      visual: 'unrelated',
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'code approved',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    // The finding is high severity, but it names a surface the resolved plan
+    // never selected: pre-existing, not this candidate's regression.
+    expect(job.stage).toBe('awaiting_user');
+    expect(job.visualFixCycles).toBe(0);
+    expect(h.provider.calls.filter((call) => call.role === 'visual_fixer')).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('records the resolved visual QA plan on the job', async () => {
+    const h = await harness({
+      visual: 'advisory',
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'code approved',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.visualQaPlan?.source).toBe('project_default');
+    expect(job.visualQaPlan?.scenarios.map((scenario) => scenario.name)).toEqual(['tools']);
     h.db.close();
   });
 
@@ -1304,3 +1373,7 @@ describe('job repair pipeline', () => {
     h.db.close();
   });
 });
+
+function blockingVisual(visual: string | undefined): boolean {
+  return visual === 'repair' || visual === 'unrelated';
+}

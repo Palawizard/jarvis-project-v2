@@ -67,7 +67,7 @@ export function JobDetailView({
   const skipped = project?.config.visualQa ? [] : (['visual_qa'] as const);
 
   return (
-    <div className="page wide">
+    <div className="page wide" data-testid="job-detail-view">
       <div className="row wrap" style={{ marginBottom: 14 }}>
         <button className="btn sm" onClick={onBack}>
           ← Jobs
@@ -94,6 +94,7 @@ export function JobDetailView({
         )}
         {job.stage === 'paused' && (
           <button
+            data-testid="resume-job"
             className="btn sm primary"
             onClick={() =>
               void api
@@ -199,7 +200,7 @@ export function JobDetailView({
       )}
       {actionError && <div className="alert error">{actionError}</div>}
       {job.stage === 'paused' && (
-        <div className="alert error" role="status">
+        <div className="alert error" role="status" data-testid="pause-explanation">
           Paused at {job.resumeStage ?? 'unknown stage'}: {job.pauseReason ?? job.error}
         </div>
       )}
@@ -618,6 +619,21 @@ export function JobDetailView({
           )}
 
           <Card title="Visual QA evidence">
+            {job.visualQaPlan && (
+              <div className="small dim" style={{ marginBottom: 10 }}>
+                <div>Visual QA plan ({job.visualQaPlan.source.replace(/_/g, ' ')}):</div>
+                {job.visualQaPlan.scenarios.map((scenario) => (
+                  <div key={scenario.name} className="tiny">
+                    {scenario.name} · {(scenario.viewports ?? ['desktop', 'mobile']).join(' · ')}
+                  </div>
+                ))}
+                {job.visualQaPlan.reasons.map((reason) => (
+                  <div key={reason} className="tiny faint">
+                    {reason}
+                  </div>
+                ))}
+              </div>
+            )}
             {visualQa.length === 0 ? (
               <Empty>
                 {project?.config.visualQa

@@ -13,6 +13,7 @@ import { nowIso } from '../ids.js';
 import { JobService } from '../jobs/service.js';
 import { ProjectService, type Project } from '../projects/service.js';
 import { ReviewEngine } from '../review/engine.js';
+import { serializeVisualReview } from '../visualqa/reviewer.js';
 import { VerificationEngine } from '../verification/engine.js';
 import { CandidateApplicationService } from './service.js';
 
@@ -298,7 +299,12 @@ function seedVisualEvidence(
   jobId: string,
   head: string,
   shots: { name: string; route: string; viewport: 'desktop' | 'mobile' }[],
-  options: { verdict?: 'pass' | 'needs_fix'; corrupt?: boolean } = {},
+  options: {
+    verdict?: 'pass' | 'needs_fix';
+    corrupt?: boolean;
+    /** Overrides the durable blob to reproduce legacy/hostile persisted rows. */
+    review?: (rows: { id: string; sha256: string }[]) => unknown;
+  } = {},
 ) {
   const rows = shots.map((shot, index) => {
     const bytes = Buffer.from(`pixels ${shot.name} ${shot.viewport} ${index}`);
@@ -308,11 +314,18 @@ function seedVisualEvidence(
     fs.writeFileSync(screenshotPath, bytes);
     return { ...shot, id: `shot_${index}_${shot.viewport}`, sha256, screenshotPath };
   });
-  const review = JSON.stringify({
-    verdict: options.verdict ?? 'pass',
+  // Exactly what VisualReviewer persists: the runtime review, canonicalized by
+  // the production serializer.
+  const runtime = {
+    verdict: options.verdict ?? ('pass' as const),
     reviewedEvidence: rows.map((row) => ({ shotId: row.id, sha256: row.sha256 })),
     findings: [],
-  });
+    provider: 'codex' as const,
+    model: 'gpt-5-codex',
+  };
+  const review = options.review
+    ? JSON.stringify(options.review(rows))
+    : serializeVisualReview(runtime);
   for (const row of rows) {
     db.prepare(
       `INSERT INTO visual_qa
@@ -451,5 +464,79 @@ describe('approval validates the persisted visual QA plan', () => {
     seedVisualEvidence(prepared.job.id, prepared.head, DEFAULT_SHOTS);
     const approved = await service.approve(prepared.job.id);
     expect(approved.status).toBe('approved');
+  });
+});
+
+describe('approval reads the durable visual review the pipeline actually persists', () => {
+  /** The exact object the pre-fix VisualReviewer wrote into review_findings. */
+  function legacyRuntimeReview(rows: { id: string; sha256: string }[], extras: object = {}) {
+    return {
+      verdict: 'pass',
+      reviewedEvidence: rows.map((row) => ({ shotId: row.id, sha256: row.sha256 })),
+      findings: [],
+      provider: 'codex',
+      model: 'gpt-5-codex',
+      ...extras,
+    };
+  }
+
+  async function prepareVisual() {
+    const prepared = await candidate();
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    setPlan(prepared.job.id, CHANGED_SURFACE_PLAN);
+    return prepared;
+  }
+
+  it('H: approves evidence written through the production serializer', async () => {
+    const prepared = await prepareVisual();
+    seedVisualEvidence(prepared.job.id, prepared.head, PLANNED_SHOTS);
+    const approved = await service.approve(prepared.job.id);
+    expect(approved.status).toBe('approved');
+  });
+
+  it('I: approves the legacy v6 row that carried provider/model', async () => {
+    const prepared = await prepareVisual();
+    seedVisualEvidence(prepared.job.id, prepared.head, PLANNED_SHOTS, {
+      review: (rows) => legacyRuntimeReview(rows),
+    });
+    const approved = await service.approve(prepared.job.id);
+    expect(approved.status).toBe('approved');
+  });
+
+  it.each([
+    ['unknown extra field', { randomAuthority: 'anything' }],
+    ['non-string provider identity', { provider: { id: 'codex' } }],
+    ['malformed findings', { findings: [{ severity: 'high' }] }],
+  ])('J: rejects a legacy-looking row with %s', async (_label, extras) => {
+    const prepared = await prepareVisual();
+    seedVisualEvidence(prepared.job.id, prepared.head, PLANNED_SHOTS, {
+      review: (rows) => legacyRuntimeReview(rows, extras),
+    });
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(VISUAL_REJECTED);
+  });
+
+  it.each([
+    [
+      'wrong screenshot id',
+      (rows: { id: string; sha256: string }[]) =>
+        rows.map((row, index) => ({
+          shotId: index === 0 ? 'shot_other' : row.id,
+          sha256: row.sha256,
+        })),
+    ],
+    [
+      'wrong sha',
+      (rows: { id: string; sha256: string }[]) =>
+        rows.map((row, index) => ({
+          shotId: row.id,
+          sha256: index === 0 ? 'f'.repeat(64) : row.sha256,
+        })),
+    ],
+  ])('K: rejects reviewedEvidence with a %s', async (_label, evidence) => {
+    const prepared = await prepareVisual();
+    seedVisualEvidence(prepared.job.id, prepared.head, PLANNED_SHOTS, {
+      review: (rows) => ({ ...legacyRuntimeReview(rows), reviewedEvidence: evidence(rows) }),
+    });
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(VISUAL_REJECTED);
   });
 });

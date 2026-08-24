@@ -10,7 +10,7 @@ import type { ReviewEngine } from '../review/engine.js';
 import type { VerificationEngine } from '../verification/engine.js';
 import { validateVisualEvidence } from '../visualqa/engine.js';
 import type { VisualQaPlan } from '../visualqa/surfaces.js';
-import { parseVisualReview } from '../visualqa/reviewer.js';
+import { parseDurableVisualReview } from '../visualqa/reviewer.js';
 
 export type CandidateApplicationStatus =
   'approved' | 'applying' | 'applied' | 'failed' | 'inspection_required';
@@ -462,7 +462,7 @@ export class CandidateApplicationService {
       const persistedReviews = new Set(selected.map((row) => row.review_findings));
       if (passed && persistedReviews.size === 1) {
         try {
-          const parsed = parseVisualReview(
+          const parsed = parseDurableVisualReview(
             JSON.parse(selected[0]?.review_findings ?? ''),
             selected.map((row) => ({
               id: row.id,

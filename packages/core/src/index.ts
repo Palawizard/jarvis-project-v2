@@ -111,7 +111,13 @@ export {
   type VisualQaShot,
   type VisualReviewFinding,
 } from './visualqa/engine.js';
-export { VisualReviewer, parseVisualReview, type VisualReview } from './visualqa/reviewer.js';
+export {
+  VisualReviewer,
+  parseVisualReview,
+  parseDurableVisualReview,
+  serializeVisualReview,
+  type VisualReview,
+} from './visualqa/reviewer.js';
 export {
   resolveVisualPlan,
   mapChangedFilesToSurfaces,

@@ -10,7 +10,13 @@ import { EventBus } from '../events/bus.js';
 import { JobService } from '../jobs/service.js';
 import type { VisualQaShot } from './engine.js';
 import type { AgentEvent, AgentProvider, ProviderCapabilities } from '../agents/types.js';
-import { hasCompleteClaudeImageReads, parseVisualReview, VisualReviewer } from './reviewer.js';
+import {
+  hasCompleteClaudeImageReads,
+  parseDurableVisualReview,
+  parseVisualReview,
+  serializeVisualReview,
+  VisualReviewer,
+} from './reviewer.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -261,6 +267,17 @@ describe('visual reviewer', () => {
         review_findings: string | null;
       };
       expect(row.reviewed_by === null).toBe(verdict === 'error');
+      if (row.review_findings) {
+        // The durable evidence blob is exactly what strict approval accepts.
+        expect(Object.keys(JSON.parse(row.review_findings)).sort()).toEqual([
+          'findings',
+          'reviewedEvidence',
+          'verdict',
+        ]);
+        expect(parseDurableVisualReview(JSON.parse(row.review_findings), [shot]).verdict).toBe(
+          verdict,
+        );
+      }
       const persisted = JSON.stringify({ row, runs: jobs.runs(job.id), events: bus.list() });
       expect(persisted).not.toContain('visual-review-must-not-persist');
       expect(persisted).toContain('[redacted:jarvis_pairing_token]');
@@ -382,3 +399,50 @@ function fakeClaudeProvider(events: AgentEvent[], structuredOutput: unknown): Ag
     },
   };
 }
+
+describe('durable visual review contract', () => {
+  const digest = 'b'.repeat(64);
+  const shotRef = {
+    id: 'shot-home-desktop',
+    scenarioName: 'home',
+    route: '/',
+    viewport: 'desktop' as const,
+    status: 'captured' as const,
+    screenshotPath: `visual-${digest}.png`,
+  };
+  const runtime = parseVisualReview(
+    { verdict: 'pass', reviewedEvidence: [{ shotId: shotRef.id, sha256: digest }], findings: [] },
+    [shotRef],
+  );
+
+  it('round-trips the producer serializer through the strict approval parser', () => {
+    // The runtime object carries provider/model; the durable blob must not.
+    const durable = serializeVisualReview({ ...runtime, provider: 'claude', model: 'opus' });
+    expect(Object.keys(JSON.parse(durable)).sort()).toEqual([
+      'findings',
+      'reviewedEvidence',
+      'verdict',
+    ]);
+    expect(parseVisualReview(JSON.parse(durable), [shotRef]).verdict).toBe('pass');
+  });
+
+  it.each([
+    ['null identity', { provider: null, model: null }],
+    ['named identity', { provider: 'claude', model: 'opus' }],
+  ])('accepts the exact legacy v6 envelope (%s)', (_label, extras) => {
+    const legacy = { ...runtime, ...extras };
+    // The pre-fix producer persisted the whole runtime object.
+    expect(parseVisualReview(legacy, [shotRef]).verdict).toBe('error');
+    expect(parseDurableVisualReview(legacy, [shotRef]).verdict).toBe('pass');
+  });
+
+  it.each([
+    ['unknown extra field', { ...runtime, provider: null, model: null, randomAuthority: 'any' }],
+    ['unknown field alone', { ...runtime, randomAuthority: 'any' }],
+    ['non-string provider', { ...runtime, provider: { id: 'claude' }, model: null }],
+    ['malformed findings', { ...runtime, findings: [{ severity: 'high' }], provider: null }],
+    ['malformed evidence', { ...runtime, reviewedEvidence: [{ shotId: shotRef.id }], model: null }],
+  ])('fails closed on %s', (_label, value) => {
+    expect(parseDurableVisualReview(value, [shotRef]).verdict).toBe('error');
+  });
+});

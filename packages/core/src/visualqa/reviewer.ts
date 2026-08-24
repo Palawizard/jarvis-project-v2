@@ -276,7 +276,7 @@ export class VisualReviewer {
     for (const shot of opts.shots) {
       this.db
         .prepare(`UPDATE visual_qa SET reviewed_by=?, review_findings=? WHERE id=?`)
-        .run(reviewedBy, JSON.stringify(parsed), shot.id);
+        .run(reviewedBy, serializeVisualReview(parsed), shot.id);
     }
     this.bus?.emit({
       type: 'visual_review.completed',
@@ -321,6 +321,56 @@ export class VisualReviewer {
     }
     return this.fail(opts.jobId, error);
   }
+}
+
+const DURABLE_KEYS = ['verdict', 'reviewedEvidence', 'findings'] as const;
+
+/**
+ * The canonical durable visual-review evidence payload. Provider/model identity
+ * lives in `visual_qa.reviewed_by` and agent run metadata, never inside the
+ * strict evidence blob that approval re-validates.
+ */
+export function serializeVisualReview(review: VisualReview): string {
+  return JSON.stringify({
+    verdict: review.verdict,
+    reviewedEvidence: review.reviewedEvidence ?? [],
+    findings: review.findings,
+  });
+}
+
+/**
+ * v6 rows were written from the runtime object, so they carry exactly two known
+ * extras. Drop only those, only when the rest of the envelope is the exact
+ * runtime shape; anything else is returned untouched so strict parsing rejects
+ * it. Removable once pre-fix rows have aged out.
+ */
+function canonicalizeDurableVisualReview(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (!keys.includes('provider') && !keys.includes('model')) return value;
+  if (
+    keys.some(
+      (key) =>
+        !DURABLE_KEYS.includes(key as (typeof DURABLE_KEYS)[number]) &&
+        key !== 'provider' &&
+        key !== 'model',
+    )
+  ) {
+    return value;
+  }
+  if (record.provider !== null && typeof record.provider !== 'string') return value;
+  if (record.model !== null && typeof record.model !== 'string') return value;
+  const { provider: _provider, model: _model, ...durable } = record;
+  return durable;
+}
+
+/** Approval-side reader for persisted evidence: legacy-tolerant, then strict. */
+export function parseDurableVisualReview(
+  ...args: Parameters<typeof parseVisualReview>
+): VisualReview {
+  const [value, ...rest] = args;
+  return parseVisualReview(canonicalizeDurableVisualReview(value), ...rest);
 }
 
 export function parseVisualReview(

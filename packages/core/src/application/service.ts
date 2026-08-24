@@ -9,6 +9,7 @@ import type { ProjectService, VisualQaScenario } from '../projects/service.js';
 import type { ReviewEngine } from '../review/engine.js';
 import type { VerificationEngine } from '../verification/engine.js';
 import { validateVisualEvidence } from '../visualqa/engine.js';
+import { parseVisualReview } from '../visualqa/reviewer.js';
 
 export type CandidateApplicationStatus =
   'approved' | 'applying' | 'applied' | 'failed' | 'inspection_required';
@@ -364,10 +365,11 @@ export class CandidateApplicationService {
       }
       const rows = this.db
         .prepare(
-          `SELECT scenario_name,route,viewport,screenshot_path,status,reviewed_by,review_findings FROM visual_qa
+          `SELECT id,scenario_name,route,viewport,screenshot_path,status,reviewed_by,review_findings FROM visual_qa
            WHERE job_id=? AND head_ref=? ORDER BY created_at DESC, rowid DESC`,
         )
         .all(jobId, job.headRef) as Array<{
+        id: string;
         scenario_name: string;
         route: string;
         viewport: string;
@@ -384,29 +386,51 @@ export class CandidateApplicationService {
             ? projectVisual.routes
             : (project?.stack.webRoutes ?? ['/'])
           ).map((route) => ({ name: route === '/' ? 'default' : route, route }));
-      const passed = scenarios.every((scenario) =>
-        (scenario.viewports ?? ['desktop', 'mobile']).every((viewport) => {
+      const selected = scenarios.flatMap((scenario) =>
+        (scenario.viewports ?? ['desktop', 'mobile']).flatMap((viewport) => {
           const row = rows.find(
             (candidate) =>
               candidate.scenario_name === scenario.name &&
               candidate.route === scenario.route &&
               candidate.viewport === viewport,
           );
-          if (!row) return false;
-          if (
-            row.status !== 'captured' ||
-            !row.reviewed_by ||
-            !row.review_findings ||
-            !validateVisualEvidence(row.screenshot_path)
-          )
-            return false;
-          try {
-            return (JSON.parse(row.review_findings) as { verdict?: string }).verdict === 'pass';
-          } catch {
-            return false;
-          }
+          return row ? [row] : [];
         }),
       );
+      const expectedCount = scenarios.reduce(
+        (count, scenario) => count + (scenario.viewports ?? ['desktop', 'mobile']).length,
+        0,
+      );
+      let passed =
+        selected.length === expectedCount &&
+        selected.every(
+          (row) =>
+            row.status === 'captured' &&
+            !!row.reviewed_by &&
+            !!row.review_findings &&
+            validateVisualEvidence(row.screenshot_path),
+        );
+      const persistedReviews = new Set(selected.map((row) => row.review_findings));
+      if (passed && persistedReviews.size === 1) {
+        try {
+          const parsed = parseVisualReview(
+            JSON.parse(selected[0]?.review_findings ?? ''),
+            selected.map((row) => ({
+              id: row.id,
+              scenarioName: row.scenario_name,
+              route: row.route,
+              viewport: row.viewport as 'desktop' | 'mobile',
+              status: 'captured' as const,
+              screenshotPath: row.screenshot_path,
+            })),
+          );
+          passed = parsed.verdict === 'pass';
+        } catch {
+          passed = false;
+        }
+      } else {
+        passed = false;
+      }
       if (!passed) {
         throw new CandidateApplicationError(
           'required visual review is missing, failed, or contains blocking findings',

@@ -4,7 +4,7 @@ import type { Db } from '../db/index.js';
 import type { EventBus } from '../events/bus.js';
 import type { JobService } from '../jobs/service.js';
 import type { AgentRegistry } from '../agents/registry.js';
-import type { ProviderId } from '../agents/types.js';
+import type { AgentEvent, ProviderId } from '../agents/types.js';
 import { validateVisualEvidence, type VisualQaShot, type VisualReviewFinding } from './engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 import type { AgentRunResult } from '../agents/types.js';
@@ -13,6 +13,7 @@ import { z } from 'zod';
 export interface VisualReview {
   verdict: 'pass' | 'needs_fix' | 'error';
   findings: VisualReviewFinding[];
+  reviewedEvidence?: Array<{ shotId: string; sha256: string }>;
   provider: ProviderId | null;
   model: string | null;
   error?: string;
@@ -32,9 +33,21 @@ interface VisualReviewOptions {
 const SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['verdict', 'findings'],
+  required: ['verdict', 'reviewedEvidence', 'findings'],
   properties: {
     verdict: { type: 'string', enum: ['pass', 'needs_fix'] },
+    reviewedEvidence: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['shotId', 'sha256'],
+        properties: {
+          shotId: { type: 'string' },
+          sha256: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+        },
+      },
+    },
     findings: {
       type: 'array',
       items: {
@@ -75,7 +88,13 @@ const VISUAL_FINDING_SCHEMA = z
   })
   .strict();
 const VISUAL_REVIEW_SCHEMA = z
-  .object({ verdict: z.enum(['pass', 'needs_fix']), findings: z.array(VISUAL_FINDING_SCHEMA) })
+  .object({
+    verdict: z.enum(['pass', 'needs_fix']),
+    reviewedEvidence: z.array(
+      z.object({ shotId: z.string().min(1), sha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
+    ),
+    findings: z.array(VISUAL_FINDING_SCHEMA),
+  })
   .strict();
 
 export class VisualReviewer {
@@ -143,6 +162,7 @@ export class VisualReviewer {
       cwd: opts.cwd,
     });
     let result: AgentRunResult;
+    const providerEvents: AgentEvent[] = [];
     try {
       result = await routed.provider.run(
         {
@@ -156,7 +176,7 @@ export class VisualReviewer {
           ephemeral: true,
           ...(opts.signal ? { signal: opts.signal } : {}),
         },
-        () => undefined,
+        (event) => providerEvents.push(event),
       );
     } catch (error) {
       result = {
@@ -167,14 +187,14 @@ export class VisualReviewer {
       };
     }
     this.agents.recordResult(routed.provider.id, result);
-    this.jobs.finishRun(run.id, {
-      status: result.status,
-      result: result.result,
-      error: result.error ?? null,
-      externalSessionId: result.sessionId ?? null,
-      usage: result.usage,
-    });
     if (result.status !== 'completed') {
+      this.jobs.finishRun(run.id, {
+        status: result.status,
+        result: result.result,
+        error: result.error ?? null,
+        externalSessionId: result.sessionId ?? null,
+        usage: result.usage,
+      });
       return this.fail(
         opts.jobId,
         result.error ?? 'visual reviewer failed',
@@ -185,7 +205,32 @@ export class VisualReviewer {
     if (
       opts.shots.some((shot) => !validateVisualEvidence(shot.screenshotPath, this.artifactsDir))
     ) {
-      return this.failEvidence(opts, 'visual evidence changed while it was being reviewed');
+      const error = 'visual evidence changed while it was being reviewed';
+      this.agents.recordResult(routed.provider.id, { status: 'failed', error });
+      this.jobs.finishRun(run.id, {
+        status: 'failed',
+        result: result.result,
+        error,
+        externalSessionId: result.sessionId ?? null,
+        usage: result.usage,
+      });
+      return this.failEvidence(opts, error);
+    }
+
+    if (
+      routed.provider.id === 'claude' &&
+      !hasCompleteClaudeImageReads(providerEvents, images, opts.cwd)
+    ) {
+      const error = 'protocol failure: Claude did not successfully Read every exact screenshot';
+      this.agents.recordResult(routed.provider.id, { status: 'failed', error });
+      this.jobs.finishRun(run.id, {
+        status: 'failed',
+        result: result.result,
+        error,
+        externalSessionId: result.sessionId ?? null,
+        usage: result.usage,
+      });
+      return this.fail(opts.jobId, error, routed.provider.id, routed.decision.model);
     }
 
     const parsed = parseVisualReview(
@@ -203,6 +248,13 @@ export class VisualReviewer {
       });
       return this.fail(opts.jobId, protocolError, routed.provider.id, routed.decision.model);
     }
+    this.jobs.finishRun(run.id, {
+      status: result.status,
+      result: result.result,
+      error: null,
+      externalSessionId: result.sessionId ?? null,
+      usage: result.usage,
+    });
     const blocking = parsed.findings.some((finding) =>
       this.config.pipeline.visualBlockingSeverities.includes(finding.severity),
     );
@@ -259,12 +311,33 @@ export class VisualReviewer {
 
 export function parseVisualReview(
   value: unknown,
-  shots: Pick<VisualQaShot, 'scenarioName' | 'route' | 'viewport' | 'status'>[] = [],
+  shots: Pick<
+    VisualQaShot,
+    'id' | 'scenarioName' | 'route' | 'viewport' | 'status' | 'screenshotPath'
+  >[] = [],
   blockingSeverities: readonly string[] = ['high', 'medium'],
 ): VisualReview {
   const checked = VISUAL_REVIEW_SCHEMA.safeParse(value);
   if (!checked.success) return invalidVisual(checked.error.issues[0]?.message);
   const findings = checked.data.findings as VisualReviewFinding[];
+  const reviewedEvidence = checked.data.reviewedEvidence;
+  const expectedEvidence = shots.flatMap((shot) => {
+    const sha256 = screenshotDigest(shot.screenshotPath);
+    return shot.status === 'captured' && sha256 ? [{ shotId: shot.id, sha256 }] : [];
+  });
+  if (
+    reviewedEvidence.length !== expectedEvidence.length ||
+    new Set(reviewedEvidence.map((item) => JSON.stringify([item.shotId, item.sha256]))).size !==
+      reviewedEvidence.length ||
+    expectedEvidence.some(
+      (expected) =>
+        !reviewedEvidence.some(
+          (actual) => actual.shotId === expected.shotId && actual.sha256 === expected.sha256,
+        ),
+    )
+  ) {
+    return invalidVisual('reviewedEvidence does not match every exact captured image');
+  }
   const evidence = new Set(
     shots
       .filter((shot) => shot.status === 'captured')
@@ -284,6 +357,7 @@ export function parseVisualReview(
   }
   return {
     verdict: blocking.length ? 'needs_fix' : 'pass',
+    reviewedEvidence,
     findings,
     provider: null,
     model: null,
@@ -300,10 +374,40 @@ readability, responsive behavior, and obvious UI error states. Do not infer hidd
 
 Goal: ${opts.goal}
 Acceptance criteria:\n${opts.acceptance.map((item) => `- ${item}`).join('\n') || '- none supplied'}
-Evidence:\n${opts.shots
+Evidence (copy every exact shotId and sha256 into reviewedEvidence only after inspecting it):\n${opts.shots
     .map(
       (shot) =>
-        `- scenario ${shot.scenarioName}; route ${shot.route}; ${shot.viewport}; console errors: ${shot.consoleErrors.length}; failed requests: ${shot.networkFailures.length}`,
+        `- shotId ${shot.id}; sha256 ${screenshotDigest(shot.screenshotPath) ?? 'missing'}; scenario ${shot.scenarioName}; route ${shot.route}; ${shot.viewport}; console errors: ${shot.consoleErrors.length}; failed requests: ${shot.networkFailures.length}`,
     )
     .join('\n')}`;
+}
+
+function screenshotDigest(screenshotPath: string | null): string | null {
+  return (
+    /-([0-9a-f]{64})\.png$/i.exec(path.basename(screenshotPath ?? ''))?.[1]?.toLowerCase() ?? null
+  );
+}
+
+export function hasCompleteClaudeImageReads(
+  events: AgentEvent[],
+  images: string[],
+  cwd: string,
+): boolean {
+  const key = (value: string) => {
+    const resolved = path.resolve(cwd, value);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  const reads = new Map<string, string>();
+  const completed = new Set<string>();
+  for (const event of events) {
+    if (event.kind === 'tool_started' && event.id && event.tool.toLowerCase() === 'read') {
+      const input = event.input as { file_path?: unknown; path?: unknown } | undefined;
+      const file = input?.file_path ?? input?.path;
+      if (typeof file === 'string') reads.set(event.id, key(file));
+    } else if (event.kind === 'tool_completed' && event.id && event.isError !== true) {
+      const file = reads.get(event.id);
+      if (file) completed.add(file);
+    }
+  }
+  return images.length > 0 && images.every((image) => completed.has(key(image)));
 }

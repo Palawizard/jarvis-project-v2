@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Db } from '../db/index.js';
@@ -6,7 +6,7 @@ import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { ProjectCommands, VerificationStep } from '../projects/service.js';
 import { redactSecrets } from '../memory/secrets.js';
-import { killTree, untrustedProcessEnv } from '../agents/spawn.js';
+import { killTree, spawnContained, untrustedProcessEnv } from '../agents/spawn.js';
 
 export interface VerificationResult {
   id: string;
@@ -315,13 +315,24 @@ function runCommand(
       });
       return;
     }
-    const child = spawn(command, {
+    const child = spawnContained(command, [], {
       cwd,
       shell: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...untrustedProcessEnv(), CI: '1', FORCE_COLOR: '0', NO_COLOR: '1' },
-      windowsHide: true,
     });
+    const stdout = child.stdout;
+    const stderr = child.stderr;
+    if (!stdout || !stderr) {
+      void killTree(child);
+      resolve({
+        exitCode: null,
+        output: 'could not run command: containment did not create output pipes',
+        startFailed: true,
+        failureKind: 'infrastructure',
+      });
+      return;
+    }
 
     const chunks: string[] = [];
     let size = 0;
@@ -332,8 +343,8 @@ function runCommand(
       size += text.length;
       chunks.push(text);
     };
-    child.stdout.on('data', capture);
-    child.stderr.on('data', capture);
+    stdout.on('data', capture);
+    stderr.on('data', capture);
 
     let settled = false;
     let forced: { failureKind: 'infrastructure' | 'cancelled'; suffix: string } | undefined;

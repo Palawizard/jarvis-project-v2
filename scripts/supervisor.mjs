@@ -7,6 +7,13 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clean = (value) => String(value ?? '').trim();
+const WINDOWS_JOB_RUNNER =
+  process.platform === 'win32'
+    ? Buffer.from(
+        fs.readFileSync(new URL('./windows-job-runner.ps1', import.meta.url), 'utf8'),
+        'utf16le',
+      ).toString('base64')
+    : '';
 const ENV_ALLOWLIST = [
   'PATH',
   'Path',
@@ -283,24 +290,62 @@ async function stopChild(child) {
 }
 
 async function spawnProcess(spec, repo, supervised, stdio = 'inherit') {
-  const child = spawn(spec.executable, spec.args, {
-    cwd: repo,
-    env: {
-      ...untrustedEnv(spec.env),
-      ...(supervised
-        ? {
-            JARVIS_SUPERVISED: '1',
-            JARVIS_UPGRADE_REQUEST_PATH: supervised.requestFile,
-            JARVIS_UPGRADE_SOCKET: supervised.upgradeSocket,
-            JARVIS_UPGRADE_TOKEN_HASH: supervised.activationTokenHash,
-          }
-        : {}),
-    },
-    stdio,
-    shell: false,
-    detached: process.platform !== 'win32',
-    windowsHide: true,
-  });
+  const env = {
+    ...untrustedEnv(spec.env),
+    ...(supervised
+      ? {
+          JARVIS_SUPERVISED: '1',
+          JARVIS_UPGRADE_REQUEST_PATH: supervised.requestFile,
+          JARVIS_UPGRADE_SOCKET: supervised.upgradeSocket,
+          JARVIS_UPGRADE_TOKEN_HASH: supervised.activationTokenHash,
+        }
+      : {}),
+  };
+  const child =
+    process.platform === 'win32'
+      ? spawn(
+          path.join(
+            process.env.SystemRoot ?? 'C:\\Windows',
+            'System32',
+            'WindowsPowerShell',
+            'v1.0',
+            'powershell.exe',
+          ),
+          [
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-EncodedCommand',
+            WINDOWS_JOB_RUNNER,
+          ],
+          {
+            cwd: repo,
+            env,
+            stdio: Array.isArray(stdio)
+              ? ['pipe', stdio[1] ?? 'inherit', stdio[2] ?? 'inherit']
+              : ['pipe', stdio, stdio],
+            shell: false,
+            windowsHide: true,
+          },
+        )
+      : spawn(spec.executable, spec.args, {
+          cwd: repo,
+          env,
+          stdio,
+          shell: false,
+          detached: true,
+          windowsHide: true,
+        });
+  if (process.platform === 'win32') {
+    child.stdin.on('error', () => {
+      /* spawn/early-exit errors are reported on the child itself */
+    });
+    child.stdin.end(
+      JSON.stringify({ executable: spec.executable, args: spec.args, cwd: repo, shell: false }),
+    );
+  }
   await new Promise((resolve, reject) => {
     child.once('spawn', resolve);
     child.once('error', reject);
@@ -310,43 +355,29 @@ async function spawnProcess(spec, repo, supervised, stdio = 'inherit') {
 
 async function runBuild(config) {
   const started = Date.now();
-  const helperSource = `
-    const {spawn}=require('node:child_process');
-    const spec=JSON.parse(process.env.JARVIS_CONTAINED_SPEC); delete process.env.JARVIS_CONTAINED_SPEC;
-    const child=spawn(spec.executable,spec.args,{cwd:process.cwd(),env:spec.env,stdio:['ignore','pipe','pipe'],shell:false,windowsHide:true});
-    child.stdout.pipe(process.stdout); child.stderr.pipe(process.stderr);
-    child.once('error',error=>process.send({error:error.message}));
-    child.once('exit',code=>process.send({code}));
-    setInterval(()=>{},1000);
-  `;
-  const child = spawn(process.execPath, ['-e', helperSource], {
-    cwd: config.repository,
-    env: {
-      ...untrustedEnv(),
-      JARVIS_CONTAINED_SPEC: JSON.stringify({
-        ...config.buildCommand,
-        env: untrustedEnv(config.buildCommand.env),
-      }),
-    },
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    shell: false,
-    detached: process.platform !== 'win32',
-    windowsHide: true,
-  });
+  const child = await spawnProcess(config.buildCommand, config.repository, null, [
+    'ignore',
+    'pipe',
+    'pipe',
+  ]);
   let output = '';
   const append = (chunk) => {
     output = redactSecrets(`${output}${chunk}`).slice(-8_000);
   };
   child.stdout.on('data', append);
   child.stderr.on('data', append);
-  const timeout = setTimeout(() => void stopChild(child), config.commandTimeoutMs);
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    void stopChild(child);
+  }, config.commandTimeoutMs);
   const result = await new Promise((resolve) => {
-    child.once('message', resolve);
-    child.once('error', (error) => resolve({ error: error.message }));
-    child.once('exit', (code) => resolve({ code, error: 'build containment helper exited early' }));
+    child.once('error', (error) => resolve({ code: null, error: error.message }));
+    child.once('close', (code) => resolve({ code }));
   });
   clearTimeout(timeout);
   await stopChild(child);
+  if (timedOut) throw new Error(`build timed out after ${config.commandTimeoutMs}ms`);
   if (result.error) throw new Error(`build could not start: ${result.error}`);
   if (result.code !== 0) throw new Error(`build exited with code ${result.code}: ${output.trim()}`);
   return { durationMs: Date.now() - started, output: output.trim() };

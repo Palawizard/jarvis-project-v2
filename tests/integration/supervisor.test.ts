@@ -35,10 +35,10 @@ function fixture(healthyCandidate: boolean) {
   const stateDir = path.join(root, 'state');
   fs.mkdirSync(repo);
   fs.mkdirSync(stateDir);
-  fs.writeFileSync(path.join(repo, '.gitignore'), '.built\n.observed-env\n');
+  fs.writeFileSync(path.join(repo, '.gitignore'), '.built\n.observed-env\n.daemon-pid\n');
   fs.writeFileSync(
     path.join(repo, 'build.mjs'),
-    `import {execFileSync} from 'node:child_process'; import fs from 'node:fs'; const observed=JSON.stringify({token:process.env.GITHUB_TOKEN,request:process.env.JARVIS_UPGRADE_REQUEST_PATH,socket:process.env.JARVIS_UPGRADE_SOCKET,hash:process.env.JARVIS_UPGRADE_TOKEN_HASH}); fs.writeFileSync('.observed-env',observed); console.error(process.env.GITHUB_TOKEN??'no-token'); fs.writeFileSync('.built', execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n`,
+    `import {execFileSync,spawn} from 'node:child_process'; import fs from 'node:fs'; const observed=JSON.stringify({token:process.env.GITHUB_TOKEN,request:process.env.JARVIS_UPGRADE_REQUEST_PATH,socket:process.env.JARVIS_UPGRADE_SOCKET,hash:process.env.JARVIS_UPGRADE_TOKEN_HASH}); fs.writeFileSync('.observed-env',observed); console.error(process.env.GITHUB_TOKEN??'no-token'); if(process.env.DAEMONIZE_BUILD==='1'){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});fs.writeFileSync('.daemon-pid',String(c.pid));c.unref();} fs.writeFileSync('.built', execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n`,
   );
   fs.writeFileSync(
     path.join(repo, 'server.mjs'),
@@ -106,6 +106,7 @@ async function runActivation(
   healthyCandidate: boolean,
   tamperCommand = false,
   activationToken = ACTIVATION_TOKEN,
+  daemonizeBuild = false,
 ) {
   const setup = fixture(healthyCandidate);
   const selectedPort = await port();
@@ -118,7 +119,11 @@ async function runActivation(
     args: ['server.mjs'],
     env: { PORT: String(selectedPort) },
   };
-  const buildCommand = { executable: process.execPath, args: ['build.mjs'] };
+  const buildCommand = {
+    executable: process.execPath,
+    args: ['build.mjs'],
+    ...(daemonizeBuild ? { env: { DAEMONIZE_BUILD: '1' } } : {}),
+  };
   const configFile = path.join(setup.stateDir, 'supervisor.json');
   fs.writeFileSync(
     configFile,
@@ -276,6 +281,14 @@ describe('external self-upgrade supervisor', () => {
     expect(git(result.repo, 'status', '--porcelain')).toBe('');
   });
 
+  it('contains a detached Windows build descendant before activation completes', async () => {
+    if (process.platform !== 'win32') return;
+    const result = await runActivation(true, false, ACTIVATION_TOKEN, true);
+    expect(result.evidence).toMatchObject({ status: 'activated' });
+    const pid = Number(fs.readFileSync(path.join(result.repo, '.daemon-pid'), 'utf8'));
+    await waitFor(() => (processAlive(pid) ? null : true));
+  });
+
   it('rejects activation commands that differ from operator configuration', async () => {
     const result = await runActivation(true, true);
     expect(result.evidence).toMatchObject({
@@ -308,3 +321,12 @@ describe('external self-upgrade supervisor', () => {
     ).not.toContain(attackerToken);
   });
 });
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

@@ -1,10 +1,9 @@
-import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import type { JarvisConfig } from '../config.js';
-import { killTree, untrustedProcessEnv } from '../agents/spawn.js';
+import { killTree, spawnContained, untrustedProcessEnv } from '../agents/spawn.js';
 import { repoStatus } from '../git/workspace.js';
 import { redactSecrets } from '../memory/secrets.js';
 import type { Project } from '../projects/service.js';
@@ -68,12 +67,10 @@ export async function startCandidateRuntime(opts: {
     process.platform === 'win32' && runtime.command.executable === 'pnpm'
       ? 'pnpm.cmd'
       : runtime.command.executable;
-  const child = spawn(executable, runtime.command.args, {
+  const child = spawnContained(executable, runtime.command.args, {
     cwd: opts.cwd,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-    detached: process.platform !== 'win32',
     // Windows requires a shell for .cmd shims. The executable/argv are trusted,
     // persisted project configuration; dynamic ports are never interpolated.
     shell: process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(executable),

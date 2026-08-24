@@ -177,7 +177,11 @@ describe('candidate application', () => {
       '[]',
       'captured',
       'codex',
-      JSON.stringify({ verdict: 'pass', findings: [] }),
+      JSON.stringify({
+        verdict: 'pass',
+        reviewedEvidence: [{ shotId: 'shot_integrity', sha256: digest }],
+        findings: [],
+      }),
       prepared.head,
       0,
       nowIso(),

@@ -1,9 +1,22 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess, type StdioOptions } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline';
 import { createLogger } from '../logger.js';
 import type { ResolvedCli } from './resolve.js';
 
 const log = createLogger('agent-spawn');
+
+const WINDOWS_JOB_RUNNER =
+  process.platform === 'win32'
+    ? Buffer.from(
+        fs.readFileSync(
+          path.resolve(import.meta.dirname, '../../../../scripts/windows-job-runner.ps1'),
+          'utf8',
+        ),
+        'utf16le',
+      ).toString('base64')
+    : '';
 
 /**
  * Jarvis's own control plane. An agent child has no business talking to the
@@ -71,6 +84,67 @@ export function untrustedProcessEnv(source: NodeJS.ProcessEnv = process.env): No
     if (source[key] !== undefined) env[key] = source[key];
   }
   return env;
+}
+
+/**
+ * Start untrusted work in a Windows Job Object before its first instruction.
+ * The wrapper remains alive until the leader exits and every descendant has
+ * been terminated; on other platforms the detached process group is enough.
+ */
+export function spawnContained(
+  executable: string,
+  args: string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    stdio: StdioOptions;
+    shell?: boolean;
+  },
+): ChildProcess {
+  if (process.platform !== 'win32') {
+    return spawn(executable, args, {
+      ...options,
+      shell: options.shell ?? false,
+      windowsHide: true,
+      detached: true,
+    });
+  }
+  const powershell = path.join(
+    process.env.SystemRoot ?? 'C:\\Windows',
+    'System32',
+    'WindowsPowerShell',
+    'v1.0',
+    'powershell.exe',
+  );
+  const stdio = Array.isArray(options.stdio)
+    ? (['pipe', options.stdio[1] ?? 'inherit', options.stdio[2] ?? 'inherit'] as StdioOptions)
+    : (['pipe', options.stdio, options.stdio] as StdioOptions);
+  const child = spawn(
+    powershell,
+    [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-EncodedCommand',
+      WINDOWS_JOB_RUNNER,
+    ],
+    {
+      cwd: options.cwd,
+      env: options.env,
+      stdio,
+      shell: false,
+      windowsHide: true,
+    },
+  );
+  child.stdin?.on('error', () => {
+    /* spawn/early-exit errors are reported on the child itself */
+  });
+  child.stdin?.end(
+    JSON.stringify({ executable, args, cwd: options.cwd, shell: options.shell === true }),
+  );
+  return child;
 }
 
 /** Provider runs must use the CLIs' subscription login, never inherited API billing. */
@@ -190,14 +264,27 @@ export async function killTree(child: ChildProcess): Promise<void> {
  */
 export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
   return new Promise<JsonlRunOutcome>((resolve) => {
-    const child = spawn(spec.cli.command, [...spec.cli.prefixArgs, ...spec.args], {
+    const child = spawnContained(spec.cli.command, [...spec.cli.prefixArgs, ...spec.args], {
       cwd: spec.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: subscriptionProviderEnv(),
       shell: false,
-      windowsHide: true,
-      detached: process.platform !== 'win32',
     });
+    const stdin = child.stdin;
+    const stdout = child.stdout;
+    const stderr = child.stderr;
+    if (!stdin || !stdout || !stderr) {
+      void killTree(child);
+      resolve({
+        code: null,
+        timedOut: false,
+        cancelled: false,
+        startError: 'provider containment did not create the required stdio pipes',
+        stderr: '',
+        malformedLines: 0,
+      });
+      return;
+    }
 
     const stderrChunks: string[] = [];
     let settled = false;
@@ -254,12 +341,12 @@ export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
       });
     });
 
-    child.stderr.on('data', (chunk: Buffer) => {
+    stderr.on('data', (chunk: Buffer) => {
       stderrChunks.push(chunk.toString());
       if (stderrChunks.length > 200) stderrChunks.shift();
     });
 
-    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    const rl = readline.createInterface({ input: stdout, crlfDelay: Infinity });
     rl.on('line', (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -274,10 +361,10 @@ export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
       }
     });
 
-    child.stdin.on('error', () => {
+    stdin.on('error', () => {
       /* the CLI may close stdin early; not fatal */
     });
-    child.stdin.end(spec.stdin);
+    stdin.end(spec.stdin);
 
     child.on('close', (code) => {
       finish({

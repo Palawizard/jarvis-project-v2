@@ -124,6 +124,39 @@ describe('candidate runtime isolation', () => {
     }
   });
 
+  it('rejects a launcher that exits after daemonizing its candidate server on Windows', async () => {
+    if (process.platform !== 'win32') return;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
+    roots.push(root);
+    const marker = path.join(root, 'daemon-ready');
+    const pidFile = path.join(root, 'daemon.pid');
+    const candidate = project(root);
+    if (!candidate.config.candidateRuntime) throw new Error('fixture runtime missing');
+    const server =
+      `const fs=require('node:fs'),http=require('node:http');` +
+      `const s=http.createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok'}))});` +
+      `s.listen(Number(process.env.TEST_PORT),'127.0.0.1',()=>fs.writeFileSync(${JSON.stringify(marker)},'ready'));`;
+    candidate.config.candidateRuntime.command.args = [
+      '-e',
+      `const {spawn}=require('node:child_process'),fs=require('node:fs');` +
+        `const c=spawn(process.execPath,['-e',${JSON.stringify(server)}],{detached:true,stdio:'ignore',env:process.env});` +
+        `fs.writeFileSync(${JSON.stringify(pidFile)},String(c.pid));c.unref();` +
+        `const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(marker)})){clearInterval(t);process.exit(0)}},10);`,
+    ];
+    const config = loadConfig({ home: path.join(root, 'home') });
+    await expect(
+      startCandidateRuntime({
+        project: candidate,
+        cwd: root,
+        jobId: 'job_daemonized',
+        config,
+        timeoutMs: 10_000,
+      }),
+    ).rejects.toThrow('candidate runtime exited');
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    await until(() => !processAlive(pid));
+  });
+
   it('fails closed when the project cannot remap its candidate port', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
     roots.push(root);
@@ -425,4 +458,13 @@ async function until(condition: () => boolean | Promise<boolean>): Promise<void>
 function restoreEnv(name: string, value: string | undefined): void {
   if (value === undefined) delete process.env[name];
   else process.env[name] = value;
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }

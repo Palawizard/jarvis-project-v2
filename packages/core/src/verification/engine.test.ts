@@ -46,6 +46,35 @@ describe('deterministic verification', () => {
     expect(report.results[0]?.output).toContain('verification-ran');
   });
 
+  it.each([
+    ['successful check', 0, 'none'],
+    ['failed setup', 7, 'infrastructure'],
+  ])('contains detached Windows descendants after a %s', async (_name, exitCode, failureKind) => {
+    if (process.platform !== 'win32') return;
+    const pidFile = path.join(home, `detached-${exitCode}.pid`);
+    fs.writeFileSync(
+      path.join(home, 'daemon-parent.mjs'),
+      `import {spawn} from 'node:child_process';import fs from 'node:fs';` +
+        `const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});` +
+        `fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid));child.unref();process.exit(${exitCode});`,
+    );
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: {},
+      steps: [
+        {
+          name: 'daemonizing-command',
+          command: 'node daemon-parent.mjs',
+          kind: exitCode === 0 ? 'check' : 'setup',
+        },
+      ],
+    });
+    expect(report.failureKind).toBe(failureKind);
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    await until(() => !processAlive(pid));
+  });
+
   it('does not expose ambient secrets or supervisor authority to verification commands', async () => {
     const names = [
       'JARVIS_SUPERVISED',
@@ -322,3 +351,21 @@ describe('deterministic verification', () => {
     expect(stored[0]?.output).toContain('[redacted:');
   });
 });
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function until(condition: () => boolean | Promise<boolean>): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  expect(await condition()).toBe(true);
+}

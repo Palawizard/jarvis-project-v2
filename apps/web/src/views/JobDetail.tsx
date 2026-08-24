@@ -99,9 +99,7 @@ export function JobDetailView({
             title={job.pauseReason ?? job.error ?? undefined}
             data-testid="pause-hint"
           >
-            {job.resumeStage
-              ? `Resume continues from ${job.resumeStage} in the same worktree`
-              : 'Resume continues this job in the same worktree'}
+            Paused: {firstLine(job.pauseReason ?? job.error) ?? 'reason not recorded'}
           </span>
         )}
         {job.stage === 'paused' && (
@@ -786,6 +784,12 @@ function AuthenticatedArtifact({
   ) : (
     <div className="empty small">Loading evidence…</div>
   );
+}
+
+/** First non-empty line of a recorded reason; `.nowrap` handles the visual truncation. */
+function firstLine(text: string | null | undefined): string | null {
+  const line = text?.split('\n').find((candidate) => candidate.trim().length > 0);
+  return line ? line.trim() : null;
 }
 
 function summarise(event: JarvisEvent): string {

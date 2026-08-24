@@ -9,6 +9,7 @@ import type { ProjectService, VisualQaScenario } from '../projects/service.js';
 import type { ReviewEngine } from '../review/engine.js';
 import type { VerificationEngine } from '../verification/engine.js';
 import { validateVisualEvidence } from '../visualqa/engine.js';
+import type { VisualQaPlan } from '../visualqa/surfaces.js';
 import { parseVisualReview } from '../visualqa/reviewer.js';
 
 export type CandidateApplicationStatus =
@@ -313,6 +314,46 @@ export class CandidateApplicationService {
     return rows.length;
   }
 
+  /**
+   * The persisted plan, read raw so a malformed value fails closed instead of
+   * decaying into "no plan" and re-demanding broad project defaults.
+   */
+  private persistedVisualPlan(jobId: string): VisualQaPlan | null {
+    const row = this.db.prepare('SELECT visual_qa_plan FROM jobs WHERE id=?').get(jobId) as
+      { visual_qa_plan: string | null } | undefined;
+    const raw = row?.visual_qa_plan;
+    if (!raw) return null;
+    const invalid = () =>
+      new CandidateApplicationError('persisted visual QA plan is malformed', 'visual_plan_invalid');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw invalid();
+    }
+    const plan = parsed as VisualQaPlan;
+    if (
+      !plan ||
+      typeof plan !== 'object' ||
+      !Array.isArray(plan.scenarios) ||
+      plan.scenarios.length === 0 ||
+      (plan.required !== undefined && typeof plan.required !== 'boolean') ||
+      !plan.scenarios.every(
+        (scenario) =>
+          !!scenario &&
+          typeof scenario.name === 'string' &&
+          typeof scenario.route === 'string' &&
+          (scenario.viewports === undefined ||
+            (Array.isArray(scenario.viewports) &&
+              scenario.viewports.length > 0 &&
+              scenario.viewports.every((v) => v === 'desktop' || v === 'mobile'))),
+      )
+    ) {
+      throw invalid();
+    }
+    return plan;
+  }
+
   private async approvalEvidence(jobId: string): Promise<{
     projectId: string;
     reviewId: string;
@@ -356,7 +397,9 @@ export class CandidateApplicationService {
     }
     await this.git.validateCandidate(job.worktreePath, job.baseRef, job.headRef);
     const project = this.projects.get(job.projectId);
-    const visualRequired = job.visualQaConfig?.required ?? project?.config.visualQa?.required;
+    const plan = this.persistedVisualPlan(jobId);
+    const visualRequired =
+      plan?.required ?? job.visualQaConfig?.required ?? project?.config.visualQa?.required;
     if (visualRequired || job.visualHead) {
       if (job.visualHead !== job.headRef) {
         throw new CandidateApplicationError(
@@ -379,14 +422,19 @@ export class CandidateApplicationService {
         reviewed_by: string | null;
         review_findings: string | null;
       }>;
+      // The plan the pipeline resolved is the evidence contract: it is what was
+      // captured and reviewed. Reconstructing scenarios here would demand
+      // evidence nobody was ever asked to produce. Legacy pre-plan jobs only.
       const projectVisual = project?.config.visualQa;
       const configuredScenarios = job.visualQaConfig?.scenarios ?? projectVisual?.scenarios;
-      const scenarios: VisualQaScenario[] = configuredScenarios?.length
-        ? configuredScenarios
-        : (projectVisual?.routes?.length
-            ? projectVisual.routes
-            : (project?.stack.webRoutes ?? ['/'])
-          ).map((route) => ({ name: route === '/' ? 'default' : route, route }));
+      const scenarios: VisualQaScenario[] = plan
+        ? plan.scenarios
+        : configuredScenarios?.length
+          ? configuredScenarios
+          : (projectVisual?.routes?.length
+              ? projectVisual.routes
+              : (project?.stack.webRoutes ?? ['/'])
+            ).map((route) => ({ name: route === '/' ? 'default' : route, route }));
       const selected = scenarios.flatMap((scenario) =>
         (scenario.viewports ?? ['desktop', 'mobile']).flatMap((viewport) => {
           const row = rows.find(

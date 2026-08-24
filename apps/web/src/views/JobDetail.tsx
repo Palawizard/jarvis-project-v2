@@ -93,6 +93,18 @@ export function JobDetailView({
           </button>
         )}
         {job.stage === 'paused' && (
+          <span
+            className="small dim nowrap"
+            style={{ maxWidth: 340 }}
+            title={job.pauseReason ?? job.error ?? undefined}
+            data-testid="pause-hint"
+          >
+            {job.resumeStage
+              ? `Resume continues from ${job.resumeStage} in the same worktree`
+              : 'Resume continues this job in the same worktree'}
+          </span>
+        )}
+        {job.stage === 'paused' && (
           <button
             data-testid="resume-job"
             className="btn sm primary"

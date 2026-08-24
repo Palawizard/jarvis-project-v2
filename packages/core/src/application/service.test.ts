@@ -256,3 +256,184 @@ describe('candidate application', () => {
     await expect(service.apply(prepared.job.id)).rejects.toThrow('inspect it before retrying');
   });
 });
+
+const PLANNED_SCENARIO = {
+  name: 'job-detail-paused',
+  route: '/',
+  viewports: ['desktop', 'mobile'] as ('desktop' | 'mobile')[],
+};
+
+const CHANGED_SURFACE_PLAN = {
+  source: 'changed_surface',
+  required: true,
+  scenarios: [PLANNED_SCENARIO],
+  reasons: ['apps/web/src/views/JobDetail.tsx -> job-detail-paused'],
+  fixtures: ['paused-job'],
+};
+
+/** Project defaults the reproduced job must NOT be judged against. */
+function projectDefaults() {
+  projects.update(project.id, {
+    config: {
+      visualQa: {
+        required: true,
+        scenarios: [
+          { name: 'command', route: '/', viewports: ['desktop', 'mobile'] },
+          { name: 'tools', route: '/', viewports: ['desktop', 'mobile'] },
+        ],
+      },
+    },
+  });
+}
+
+function setPlan(jobId: string, plan: unknown) {
+  db.prepare('UPDATE jobs SET visual_qa_plan=? WHERE id=?').run(
+    typeof plan === 'string' ? plan : JSON.stringify(plan),
+    jobId,
+  );
+}
+
+/** Content-addressed screenshots plus one shared strict review, as the pipeline persists them. */
+function seedVisualEvidence(
+  jobId: string,
+  head: string,
+  shots: { name: string; route: string; viewport: 'desktop' | 'mobile' }[],
+  options: { verdict?: 'pass' | 'needs_fix'; corrupt?: boolean } = {},
+) {
+  const rows = shots.map((shot, index) => {
+    const bytes = Buffer.from(`pixels ${shot.name} ${shot.viewport} ${index}`);
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const screenshotPath = path.join(config.artifactsDir, `visual-${sha256}.png`);
+    fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
+    fs.writeFileSync(screenshotPath, bytes);
+    return { ...shot, id: `shot_${index}_${shot.viewport}`, sha256, screenshotPath };
+  });
+  const review = JSON.stringify({
+    verdict: options.verdict ?? 'pass',
+    reviewedEvidence: rows.map((row) => ({ shotId: row.id, sha256: row.sha256 })),
+    findings: [],
+  });
+  for (const row of rows) {
+    db.prepare(
+      `INSERT INTO visual_qa
+        (id,job_id,project_id,scenario_name,route,viewport,screenshot_path,console_errors,
+         network_failures,status,reviewed_by,review_findings,head_ref,cycle,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      row.id,
+      jobId,
+      project.id,
+      row.name,
+      row.route,
+      row.viewport,
+      row.screenshotPath,
+      '[]',
+      '[]',
+      'captured',
+      'codex',
+      review,
+      head,
+      0,
+      nowIso(),
+    );
+    if (options.corrupt) fs.writeFileSync(row.screenshotPath, 'different pixels');
+  }
+  return rows;
+}
+
+const PLANNED_SHOTS = [
+  { name: 'job-detail-paused', route: '/', viewport: 'desktop' as const },
+  { name: 'job-detail-paused', route: '/', viewport: 'mobile' as const },
+];
+
+const DEFAULT_SHOTS = [
+  { name: 'command', route: '/', viewport: 'desktop' as const },
+  { name: 'command', route: '/', viewport: 'mobile' as const },
+  { name: 'tools', route: '/', viewport: 'desktop' as const },
+  { name: 'tools', route: '/', viewport: 'mobile' as const },
+];
+
+const VISUAL_REJECTED = 'required visual review is missing, failed, or contains blocking findings';
+
+describe('approval validates the persisted visual QA plan', () => {
+  it('approves changed-surface evidence without demanding project-default scenarios', async () => {
+    const prepared = await candidate();
+    projectDefaults();
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    setPlan(prepared.job.id, CHANGED_SURFACE_PLAN);
+    seedVisualEvidence(prepared.job.id, prepared.head, PLANNED_SHOTS);
+
+    const approved = await service.approve(prepared.job.id);
+    expect(approved.status).toBe('approved');
+    expect(approved.candidateHead).toBe(prepared.head);
+  });
+
+  it('A: rejects when only project-default evidence exists for a planned job', async () => {
+    const prepared = await candidate();
+    projectDefaults();
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    setPlan(prepared.job.id, CHANGED_SURFACE_PLAN);
+    seedVisualEvidence(prepared.job.id, prepared.head, DEFAULT_SHOTS);
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(VISUAL_REJECTED);
+  });
+
+  it('B: rejects when a planned viewport is missing', async () => {
+    const prepared = await candidate();
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    setPlan(prepared.job.id, CHANGED_SURFACE_PLAN);
+    seedVisualEvidence(prepared.job.id, prepared.head, PLANNED_SHOTS.slice(0, 1));
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(VISUAL_REJECTED);
+  });
+
+  it('C: rejects when visualHead is stale', async () => {
+    const prepared = await candidate();
+    jobs.patch(prepared.job.id, { visualHead: prepared.worktree.baseRef });
+    setPlan(prepared.job.id, CHANGED_SURFACE_PLAN);
+    seedVisualEvidence(prepared.job.id, prepared.head, PLANNED_SHOTS);
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(
+      'visual evidence identity is stale',
+    );
+  });
+
+  it('D: rejects a needs_fix visual verdict', async () => {
+    const prepared = await candidate();
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    setPlan(prepared.job.id, CHANGED_SURFACE_PLAN);
+    seedVisualEvidence(prepared.job.id, prepared.head, PLANNED_SHOTS, { verdict: 'needs_fix' });
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(VISUAL_REJECTED);
+  });
+
+  it('E: rejects an invalid content-addressed screenshot', async () => {
+    const prepared = await candidate();
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    setPlan(prepared.job.id, CHANGED_SURFACE_PLAN);
+    seedVisualEvidence(prepared.job.id, prepared.head, PLANNED_SHOTS, { corrupt: true });
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(VISUAL_REJECTED);
+  });
+
+  it.each([
+    ['unparseable', 'not json'],
+    ['wrong shape', JSON.stringify({ source: 'changed_surface', scenarios: 'all of them' })],
+    ['empty scenarios', JSON.stringify({ source: 'changed_surface', scenarios: [] })],
+  ])('F: fails closed on a malformed plan (%s)', async (_label, raw) => {
+    const prepared = await candidate();
+    projectDefaults();
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    setPlan(prepared.job.id, raw);
+    seedVisualEvidence(prepared.job.id, prepared.head, DEFAULT_SHOTS);
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(
+      'persisted visual QA plan is malformed',
+    );
+    expect(service.getForJob(prepared.job.id)).toBeNull();
+  });
+
+  it('G: legacy pre-plan jobs still use project defaults', async () => {
+    const prepared = await candidate();
+    projectDefaults();
+    expect(jobs.get(prepared.job.id)?.visualQaPlan).toBeNull();
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    seedVisualEvidence(prepared.job.id, prepared.head, DEFAULT_SHOTS);
+    const approved = await service.approve(prepared.job.id);
+    expect(approved.status).toBe('approved');
+  });
+});

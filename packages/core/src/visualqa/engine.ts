@@ -28,6 +28,22 @@ export interface VisualQaShot {
   cycle: number;
 }
 
+/** A captured image is evidence only while its content-addressed filename still matches its bytes. */
+export function validateVisualEvidence(
+  screenshotPath: string | null,
+  artifactsDir?: string,
+): boolean {
+  if (!screenshotPath || !fs.existsSync(screenshotPath)) return false;
+  const resolved = path.resolve(screenshotPath);
+  if (artifactsDir) {
+    const root = path.resolve(artifactsDir);
+    if (resolved === root || !resolved.startsWith(root + path.sep)) return false;
+  }
+  const expected = /-([0-9a-f]{64})\.png$/i.exec(path.basename(resolved))?.[1]?.toLowerCase();
+  if (!expected) return false;
+  return createHash('sha256').update(fs.readFileSync(resolved)).digest('hex') === expected;
+}
+
 export interface VisualReviewFinding {
   severity: 'high' | 'medium' | 'low' | 'info';
   scenarioName: string;
@@ -237,13 +253,15 @@ export class VisualQaEngine {
       await context.close();
       await navigation.settle();
       navigation.assert();
+      const sealedScreenshotPath = sealScreenshot(screenshotPath);
+      screenshotPaths.add(sealedScreenshotPath);
       const shot = this.persist({
         jobId: opts.jobId ?? null,
         projectId: opts.projectId ?? null,
         route,
         scenarioName: scenario.name,
         viewport,
-        screenshotPath,
+        screenshotPath: sealedScreenshotPath,
         consoleErrors,
         networkFailures,
         status: 'captured',
@@ -587,6 +605,13 @@ async function confineNavigation(
 
 function stableArtifactId(id: string): string {
   return createHash('sha256').update(id, 'utf8').digest('hex').slice(0, 32);
+}
+
+function sealScreenshot(screenshotPath: string): string {
+  const digest = createHash('sha256').update(fs.readFileSync(screenshotPath)).digest('hex');
+  const sealed = screenshotPath.replace(/\.png$/i, `-${digest}.png`);
+  fs.renameSync(screenshotPath, sealed);
+  return sealed;
 }
 
 function confinedCandidateUrl(baseUrl: string, route: string): string {

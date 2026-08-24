@@ -5,7 +5,7 @@ import type { EventBus } from '../events/bus.js';
 import type { JobService } from '../jobs/service.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import type { ProviderId } from '../agents/types.js';
-import type { VisualQaShot, VisualReviewFinding } from './engine.js';
+import { validateVisualEvidence, type VisualQaShot, type VisualReviewFinding } from './engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 import type { AgentRunResult } from '../agents/types.js';
 import { z } from 'zod';
@@ -112,12 +112,12 @@ export class VisualReviewer {
     avoidProvider?: ProviderId,
   ): Promise<VisualReview> {
     const images = opts.shots.flatMap((shot) =>
-      shot.status === 'captured' && shot.screenshotPath && fs.existsSync(shot.screenshotPath)
+      shot.status === 'captured' && validateVisualEvidence(shot.screenshotPath, this.artifactsDir)
         ? [shot.screenshotPath]
         : [],
-    );
+    ) as string[];
     if (images.length !== opts.shots.length || images.length === 0) {
-      return this.fail(opts.jobId, 'visual evidence is missing or incomplete');
+      return this.failEvidence(opts, 'visual evidence is missing, modified, or incomplete');
     }
 
     this.bus?.emit({
@@ -182,6 +182,11 @@ export class VisualReviewer {
         routed.decision.model,
       );
     }
+    if (
+      opts.shots.some((shot) => !validateVisualEvidence(shot.screenshotPath, this.artifactsDir))
+    ) {
+      return this.failEvidence(opts, 'visual evidence changed while it was being reviewed');
+    }
 
     const parsed = parseVisualReview(
       result.structuredOutput,
@@ -225,6 +230,30 @@ export class VisualReviewer {
   ): VisualReview {
     this.bus?.emit({ type: 'visual_review.failed', jobId, payload: { error } });
     return { verdict: 'error', findings: [], provider, model, error };
+  }
+
+  private failEvidence(opts: VisualReviewOptions, error: string): VisualReview {
+    for (const shot of opts.shots) {
+      try {
+        if (shot.screenshotPath) fs.rmSync(shot.screenshotPath, { force: true });
+      } catch {
+        // Evidence invalidation must still reach the database if Windows has
+        // the file temporarily locked. A locked file is never accepted again.
+      }
+      this.db
+        .prepare(
+          `UPDATE visual_qa SET status='failed', screenshot_path=NULL, error=?, reviewed_by=NULL,
+            review_findings=NULL WHERE id=?`,
+        )
+        .run(error, shot.id);
+      shot.status = 'failed';
+      shot.screenshotPath = null;
+      shot.error = error;
+      shot.reviewedBy = null;
+      shot.reviewVerdict = null;
+      shot.reviewFindings = [];
+    }
+    return this.fail(opts.jobId, error);
   }
 }
 

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from '../config.js';
 import { openDb } from '../db/index.js';
-import { VisualQaEngine } from './engine.js';
+import { validateVisualEvidence, VisualQaEngine } from './engine.js';
 
 const servers: http.Server[] = [];
 const roots: string[] = [];
@@ -84,6 +84,7 @@ describe('deterministic visual interactions', () => {
       expect(shots.map((shot) => shot.viewport)).toEqual(['desktop', 'mobile']);
       expect(shots.every((shot) => shot.scenarioName === 'tools')).toBe(true);
       expect(shots.every((shot) => shot.status === 'captured' && shot.screenshotPath)).toBe(true);
+      expect(shots.every((shot) => validateVisualEvidence(shot.screenshotPath))).toBe(true);
       expect(
         db
           .prepare('SELECT DISTINCT scenario_name,head_ref FROM visual_qa WHERE job_id=?')

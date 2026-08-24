@@ -166,15 +166,20 @@ export function detectStack(rootPath: string): { stack: ProjectStack; commands: 
 
   if (has('pyproject.toml') || has('requirements.txt')) {
     stack.languages.push('python');
+    commands.install ??= has('requirements.txt')
+      ? 'python -m pip install -r requirements.txt'
+      : 'python -m pip install -e .';
     if (has('pyproject.toml')) commands.test ??= 'pytest';
   }
   if (has('Cargo.toml')) {
     stack.languages.push('rust');
+    commands.install ??= 'cargo fetch';
     commands.build ??= 'cargo build';
     commands.test ??= 'cargo test';
   }
   if (has('go.mod')) {
     stack.languages.push('go');
+    commands.install ??= 'go mod download';
     commands.build ??= 'go build ./...';
     commands.test ??= 'go test ./...';
   }

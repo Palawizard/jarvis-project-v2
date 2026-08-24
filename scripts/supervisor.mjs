@@ -1,11 +1,68 @@
 #!/usr/bin/env node
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clean = (value) => String(value ?? '').trim();
+const ENV_ALLOWLIST = [
+  'PATH',
+  'Path',
+  'PATHEXT',
+  'SystemRoot',
+  'SYSTEMROOT',
+  'WINDIR',
+  'ComSpec',
+  'COMSPEC',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'HOME',
+  'USERPROFILE',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'PROGRAMDATA',
+  'ProgramFiles',
+  'ProgramFiles(x86)',
+  'CommonProgramFiles',
+  'CommonProgramFiles(x86)',
+  'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE',
+  'SHELL',
+  'LANG',
+  'LC_ALL',
+  'TERM',
+  'PNPM_HOME',
+  'COREPACK_HOME',
+  'NPM_CONFIG_USERCONFIG',
+];
+const SECRET_ENV_NAME =
+  /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|API_KEY|PRIVATE_KEY)(?:_|$)/i;
+const SECRET_PATTERNS = [
+  /\bJarvis human pairing token[^\r\n:]*:\s*[^\s]+/gi,
+  /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,}/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
+  /\bgithub_pat_[A-Za-z0-9_]{40,}/g,
+  /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----/g,
+  /\bBearer\s+[A-Za-z0-9._~+/-]{24,}={0,2}/gi,
+];
+
+function untrustedEnv(extra = {}) {
+  const env = {};
+  for (const key of ENV_ALLOWLIST) if (process.env[key] !== undefined) env[key] = process.env[key];
+  for (const [key, value] of Object.entries(extra)) {
+    if (!SECRET_ENV_NAME.test(key)) env[key] = value;
+  }
+  return env;
+}
+
+function redactSecrets(value) {
+  let output = String(value ?? '');
+  for (const pattern of SECRET_PATTERNS) output = output.replace(pattern, '[redacted:secret]');
+  return output;
+}
 
 function atomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -225,15 +282,19 @@ async function stopChild(child) {
   }
 }
 
-async function spawnProcess(spec, repo, requestFile, activationTokenHash, stdio = 'inherit') {
+async function spawnProcess(spec, repo, supervised, stdio = 'inherit') {
   const child = spawn(spec.executable, spec.args, {
     cwd: repo,
     env: {
-      ...process.env,
-      ...spec.env,
-      JARVIS_SUPERVISED: '1',
-      JARVIS_UPGRADE_REQUEST_PATH: requestFile,
-      JARVIS_UPGRADE_TOKEN_HASH: activationTokenHash,
+      ...untrustedEnv(spec.env),
+      ...(supervised
+        ? {
+            JARVIS_SUPERVISED: '1',
+            JARVIS_UPGRADE_REQUEST_PATH: supervised.requestFile,
+            JARVIS_UPGRADE_SOCKET: supervised.upgradeSocket,
+            JARVIS_UPGRADE_TOKEN_HASH: supervised.activationTokenHash,
+          }
+        : {}),
     },
     stdio,
     shell: false,
@@ -249,23 +310,45 @@ async function spawnProcess(spec, repo, requestFile, activationTokenHash, stdio 
 
 async function runBuild(config) {
   const started = Date.now();
-  const child = await spawnProcess(
-    config.buildCommand,
-    config.repository,
-    config.requestFile,
-    config.activationTokenHash,
-    ['ignore', 'pipe', 'pipe'],
-  );
+  const helperSource = `
+    const {spawn}=require('node:child_process');
+    const spec=JSON.parse(process.env.JARVIS_CONTAINED_SPEC); delete process.env.JARVIS_CONTAINED_SPEC;
+    const child=spawn(spec.executable,spec.args,{cwd:process.cwd(),env:spec.env,stdio:['ignore','pipe','pipe'],shell:false,windowsHide:true});
+    child.stdout.pipe(process.stdout); child.stderr.pipe(process.stderr);
+    child.once('error',error=>process.send({error:error.message}));
+    child.once('exit',code=>process.send({code}));
+    setInterval(()=>{},1000);
+  `;
+  const child = spawn(process.execPath, ['-e', helperSource], {
+    cwd: config.repository,
+    env: {
+      ...untrustedEnv(),
+      JARVIS_CONTAINED_SPEC: JSON.stringify({
+        ...config.buildCommand,
+        env: untrustedEnv(config.buildCommand.env),
+      }),
+    },
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    shell: false,
+    detached: process.platform !== 'win32',
+    windowsHide: true,
+  });
   let output = '';
   const append = (chunk) => {
-    output = `${output}${chunk}`.slice(-8_000);
+    output = redactSecrets(`${output}${chunk}`).slice(-8_000);
   };
   child.stdout.on('data', append);
   child.stderr.on('data', append);
   const timeout = setTimeout(() => void stopChild(child), config.commandTimeoutMs);
-  const code = await new Promise((resolve) => child.once('exit', resolve));
+  const result = await new Promise((resolve) => {
+    child.once('message', resolve);
+    child.once('error', (error) => resolve({ error: error.message }));
+    child.once('exit', (code) => resolve({ code, error: 'build containment helper exited early' }));
+  });
   clearTimeout(timeout);
-  if (code !== 0) throw new Error(`build exited with code ${code}: ${output.trim()}`);
+  await stopChild(child);
+  if (result.error) throw new Error(`build could not start: ${result.error}`);
+  if (result.code !== 0) throw new Error(`build exited with code ${result.code}: ${output.trim()}`);
   return { durationMs: Date.now() - started, output: output.trim() };
 }
 
@@ -306,18 +389,103 @@ function requireState(repo, head) {
 }
 
 async function startHealthy(config, sha) {
-  const child = await spawnProcess(
-    config.startCommand,
-    config.repository,
-    config.requestFile,
-    config.activationTokenHash,
-  );
+  const child = await spawnProcess(config.startCommand, config.repository, config);
   try {
     return { child, health: await waitForHealth(config, child, sha) };
   } catch (error) {
     await stopChild(child);
     throw error;
   }
+}
+
+async function createRequestInbox(config) {
+  const endpoint =
+    process.platform === 'win32'
+      ? `\\\\.\\pipe\\jarvis-upgrade-${randomUUID()}`
+      : `${config.requestFile}.${randomUUID()}.sock`;
+  const queued = [];
+  const waiting = [];
+  const sockets = new Set();
+  const deliver = (message) => {
+    const waiter = waiting.shift();
+    if (waiter) waiter(message);
+    else queued.push(message);
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    socket.setEncoding('utf8');
+    let pending = '';
+    let delivered = false;
+    let acknowledge;
+    socket.on('data', (chunk) => {
+      pending += chunk;
+      if (pending.length > 64 * 1024) {
+        socket.end(
+          `${JSON.stringify({ accepted: false, error: 'activation request is too large' })}\n`,
+        );
+        return;
+      }
+      for (;;) {
+        const newline = pending.indexOf('\n');
+        if (newline < 0) return;
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (!delivered) {
+          delivered = true;
+          deliver({
+            raw: line,
+            reject(error) {
+              socket.end(`${JSON.stringify({ accepted: false, error })}\n`);
+            },
+            accept() {
+              return new Promise((resolve, reject) => {
+                const timer = setTimeout(
+                  () => reject(new Error('activation acknowledgement timed out')),
+                  5_000,
+                );
+                acknowledge = () => {
+                  clearTimeout(timer);
+                  resolve();
+                };
+                socket.write(`${JSON.stringify({ accepted: true })}\n`);
+              });
+            },
+          });
+        } else if (line === 'ack') {
+          acknowledge?.();
+          socket.end();
+        }
+      }
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(endpoint, resolve);
+  });
+  return {
+    endpoint,
+    next(timeoutMs) {
+      if (queued.length) return Promise.resolve(queued.shift());
+      return new Promise((resolve) => {
+        const receive = (message) => {
+          clearTimeout(timer);
+          resolve(message);
+        };
+        const timer = setTimeout(() => {
+          const index = waiting.indexOf(receive);
+          if (index >= 0) waiting.splice(index, 1);
+          resolve(null);
+        }, timeoutMs);
+        waiting.push(receive);
+      });
+    },
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+      if (process.platform !== 'win32') fs.rmSync(endpoint, { force: true });
+    },
+  };
 }
 
 async function activate(config, request, currentChild) {
@@ -476,6 +644,10 @@ async function main() {
   const configPath = process.argv[2] ?? process.env.JARVIS_SUPERVISOR_CONFIG;
   if (!configPath) throw new Error('usage: node scripts/supervisor.mjs <config.json>');
   const config = loadConfig(path.resolve(configPath));
+  const processing = `${config.requestFile}.processing`;
+  if (fs.existsSync(processing)) throw new Error(`ambiguous pending request: ${processing}`);
+  const inbox = await createRequestInbox(config);
+  config.upgradeSocket = inbox.endpoint;
 
   let stopping = false;
   let child = null;
@@ -496,24 +668,26 @@ async function main() {
       if (child && (child.exitCode !== null || child.signalCode !== null)) {
         throw new Error(`Jarvis child exited unexpectedly (code ${child.exitCode})`);
       }
-      if (!fs.existsSync(config.requestFile)) {
-        await delay(config.pollMs);
-        continue;
-      }
-
-      const processing = `${config.requestFile}.processing`;
-      if (fs.existsSync(processing)) throw new Error(`ambiguous pending request: ${processing}`);
-      fs.renameSync(config.requestFile, processing);
+      const incoming = await inbox.next(config.pollMs);
+      if (!incoming) continue;
       let request;
       try {
-        request = validateRequest(JSON.parse(fs.readFileSync(processing, 'utf8')), config);
-        // Consume the human secret before any candidate-controlled build or
-        // runtime can observe the request path. The validated request returned
-        // above deliberately contains no activationToken.
+        if (fs.existsSync(processing)) throw new Error(`ambiguous pending request: ${processing}`);
+        request = validateRequest(JSON.parse(incoming.raw), config);
+        if (
+          fs.existsSync(request.resultPath) ||
+          fs.existsSync(`${config.requestFile}.${request.transactionId}.processed`)
+        ) {
+          throw new Error('activation transaction was already processed');
+        }
+        // The raw human bearer existed only in this process's memory. Persist
+        // the validated token-free request before acknowledging the caller.
         atomicJson(processing, request);
+        await incoming.accept();
       } catch (error) {
         const rejected = `${config.requestFile}.${Date.now()}.rejected`;
         fs.rmSync(processing, { force: true });
+        incoming.reject(error instanceof Error ? error.message : String(error));
         atomicJson(rejected, {
           status: 'rejected',
           error: error instanceof Error ? error.message : String(error),
@@ -540,6 +714,7 @@ async function main() {
     }
   } finally {
     await stopChild(child);
+    await inbox.close();
   }
 }
 

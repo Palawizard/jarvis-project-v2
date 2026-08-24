@@ -136,7 +136,52 @@ describe('visual reviewer', () => {
     });
     expect(result.verdict).toBe('error');
     expect(shot.reviewedBy).toBeNull();
+    expect(shot.status).toBe('failed');
+    expect(shot.screenshotPath).toBeNull();
     expect(bus.list().at(-1)?.type).toBe('visual_review.failed');
+    db.close();
+  });
+
+  it('deletes and invalidates a captured image whose content address is false', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-reviewer-'));
+    roots.push(root);
+    const config = loadConfig({ home: root, dbPath: ':memory:' });
+    const db = openDb(config);
+    const bus = new EventBus(db);
+    const screenshotPath = path.join(config.artifactsDir, `shot-${'0'.repeat(64)}.png`);
+    fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
+    fs.writeFileSync(screenshotPath, 'tampered pixels');
+    const shot: VisualQaShot = {
+      id: 'shot_tampered',
+      ...shotRef,
+      screenshotPath,
+      consoleErrors: [],
+      networkFailures: [],
+      error: null,
+      reviewedBy: null,
+      reviewVerdict: null,
+      reviewFindings: [],
+      headRef: 'abc123',
+      cycle: 0,
+      createdAt: new Date().toISOString(),
+    };
+    const reviewer = new VisualReviewer(
+      db,
+      new AgentRegistry(config, { providers: [] }),
+      new JobService(db, bus),
+      config.artifactsDir,
+      bus,
+    );
+    const result = await reviewer.review({
+      jobId: 'job_tampered',
+      cwd: root,
+      goal: 'Show a page',
+      acceptance: [],
+      shots: [shot],
+    });
+    expect(result.verdict).toBe('error');
+    expect(shot).toMatchObject({ status: 'failed', screenshotPath: null, reviewedBy: null });
+    expect(fs.existsSync(screenshotPath)).toBe(false);
     db.close();
   });
 });

@@ -8,6 +8,7 @@ import type { JobService } from '../jobs/service.js';
 import type { ProjectService, VisualQaScenario } from '../projects/service.js';
 import type { ReviewEngine } from '../review/engine.js';
 import type { VerificationEngine } from '../verification/engine.js';
+import { validateVisualEvidence } from '../visualqa/engine.js';
 
 export type CandidateApplicationStatus =
   'approved' | 'applying' | 'applied' | 'failed' | 'inspection_required';
@@ -363,13 +364,14 @@ export class CandidateApplicationService {
       }
       const rows = this.db
         .prepare(
-          `SELECT scenario_name,route,viewport,status,reviewed_by,review_findings FROM visual_qa
+          `SELECT scenario_name,route,viewport,screenshot_path,status,reviewed_by,review_findings FROM visual_qa
            WHERE job_id=? AND head_ref=? ORDER BY created_at DESC, rowid DESC`,
         )
         .all(jobId, job.headRef) as Array<{
         scenario_name: string;
         route: string;
         viewport: string;
+        screenshot_path: string | null;
         status: string;
         reviewed_by: string | null;
         review_findings: string | null;
@@ -391,7 +393,13 @@ export class CandidateApplicationService {
               candidate.viewport === viewport,
           );
           if (!row) return false;
-          if (row.status !== 'captured' || !row.reviewed_by || !row.review_findings) return false;
+          if (
+            row.status !== 'captured' ||
+            !row.reviewed_by ||
+            !row.review_findings ||
+            !validateVisualEvidence(row.screenshot_path)
+          )
+            return false;
           try {
             return (JSON.parse(row.review_findings) as { verdict?: string }).verdict === 'pass';
           } catch {

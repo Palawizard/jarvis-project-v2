@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -141,6 +142,50 @@ describe('candidate application', () => {
     expect(git(['rev-parse', 'HEAD'])).toBe(prepared.head);
     expect(fs.readFileSync(path.join(repo, 'candidate.txt'), 'utf8')).toBe('reviewed\n');
     expect(jobs.get(prepared.job.id)?.stage).toBe('completed');
+  });
+
+  it('rejects visual approval when captured pixels no longer match their identity', async () => {
+    const prepared = await candidate();
+    projects.update(project.id, {
+      config: {
+        visualQa: {
+          required: true,
+          scenarios: [{ name: 'default', route: '/', viewports: ['desktop'] }],
+        },
+      },
+    });
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    const original = Buffer.from('reviewed pixels');
+    const digest = createHash('sha256').update(original).digest('hex');
+    const screenshotPath = path.join(config.artifactsDir, `visual-${digest}.png`);
+    fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
+    fs.writeFileSync(screenshotPath, original);
+    db.prepare(
+      `INSERT INTO visual_qa
+        (id,job_id,project_id,scenario_name,route,viewport,screenshot_path,console_errors,
+         network_failures,status,reviewed_by,review_findings,head_ref,cycle,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      'shot_integrity',
+      prepared.job.id,
+      project.id,
+      'default',
+      '/',
+      'desktop',
+      screenshotPath,
+      '[]',
+      '[]',
+      'captured',
+      'codex',
+      JSON.stringify({ verdict: 'pass', findings: [] }),
+      prepared.head,
+      0,
+      nowIso(),
+    );
+    fs.writeFileSync(screenshotPath, 'different pixels');
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(
+      'required visual review is missing, failed, or contains blocking findings',
+    );
   });
 
   it('blocks a dirty target without mutating it', async () => {

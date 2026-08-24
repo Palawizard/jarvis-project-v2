@@ -10,6 +10,7 @@ const roots: string[] = [];
 const children: ChildProcess[] = [];
 const supervisor = path.resolve('scripts/supervisor.mjs');
 const ACTIVATION_TOKEN = 'human-held-supervisor-token-0123456789abcdef';
+const AMBIENT_TOKEN = 'ghp_abcdefghijklmnopqrstuvwxyz123456';
 
 function git(repo: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
@@ -34,15 +35,15 @@ function fixture(healthyCandidate: boolean) {
   const stateDir = path.join(root, 'state');
   fs.mkdirSync(repo);
   fs.mkdirSync(stateDir);
-  fs.writeFileSync(path.join(repo, '.gitignore'), '.built\n.observed-request\n');
+  fs.writeFileSync(path.join(repo, '.gitignore'), '.built\n.observed-env\n');
   fs.writeFileSync(
     path.join(repo, 'build.mjs'),
-    `import {execFileSync} from 'node:child_process'; import fs from 'node:fs'; const processing=process.env.JARVIS_UPGRADE_REQUEST_PATH+'.processing'; const observed=fs.existsSync(processing)?fs.readFileSync(processing,'utf8'):''; fs.writeFileSync('.observed-request',observed); console.error(observed); fs.writeFileSync('.built', execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n`,
+    `import {execFileSync} from 'node:child_process'; import fs from 'node:fs'; const observed=JSON.stringify({token:process.env.GITHUB_TOKEN,request:process.env.JARVIS_UPGRADE_REQUEST_PATH,socket:process.env.JARVIS_UPGRADE_SOCKET,hash:process.env.JARVIS_UPGRADE_TOKEN_HASH}); fs.writeFileSync('.observed-env',observed); console.error(process.env.GITHUB_TOKEN??'no-token'); fs.writeFileSync('.built', execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n`,
   );
   fs.writeFileSync(
     path.join(repo, 'server.mjs'),
     `import http from 'node:http'; import fs from 'node:fs'; import {execFileSync} from 'node:child_process';
-http.createServer((req,res)=>{ if(req.url!=='/health'){res.statusCode=404; return res.end();} const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(); const built=fs.readFileSync('.built','utf8').trim(); const healthy=fs.readFileSync('healthy.txt','utf8').trim()==='yes' && built===commit; res.statusCode=healthy?200:503; res.setHeader('content-type','application/json'); res.end(JSON.stringify({status:healthy?'ok':'error',commit,version:fs.readFileSync('version.txt','utf8').trim(),supervised:process.env.JARVIS_SUPERVISED,requestPath:process.env.JARVIS_UPGRADE_REQUEST_PATH})); }).listen(Number(process.env.PORT),'127.0.0.1');\n`,
+http.createServer((req,res)=>{ if(req.url!=='/health'){res.statusCode=404; return res.end();} const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(); const built=fs.readFileSync('.built','utf8').trim(); const healthy=fs.readFileSync('healthy.txt','utf8').trim()==='yes' && built===commit; res.statusCode=healthy?200:503; res.setHeader('content-type','application/json'); res.end(JSON.stringify({status:healthy?'ok':'error',commit,version:fs.readFileSync('version.txt','utf8').trim(),supervised:process.env.JARVIS_SUPERVISED,requestPath:process.env.JARVIS_UPGRADE_REQUEST_PATH,upgradeSocket:process.env.JARVIS_UPGRADE_SOCKET})); }).listen(Number(process.env.PORT),'127.0.0.1');\n`,
   );
   fs.writeFileSync(path.join(repo, 'healthy.txt'), 'yes\n');
   fs.writeFileSync(path.join(repo, 'version.txt'), 'old\n');
@@ -74,6 +75,31 @@ async function waitFor<T>(
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error('timed out waiting for supervisor evidence');
+}
+
+async function submit(
+  endpoint: string,
+  request: unknown,
+): Promise<{ accepted?: boolean; error?: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(endpoint);
+    socket.setEncoding('utf8');
+    let pending = '';
+    socket.once('connect', () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on('data', (chunk: string) => {
+      pending += chunk;
+      const newline = pending.indexOf('\n');
+      if (newline < 0) return;
+      const response = JSON.parse(pending.slice(0, newline)) as {
+        accepted?: boolean;
+        error?: string;
+      };
+      if (response.accepted) socket.end('ack\n');
+      else socket.end();
+      resolve(response);
+    });
+    socket.once('error', reject);
+  });
 }
 
 async function runActivation(
@@ -112,6 +138,7 @@ async function runActivation(
 
   const child = spawn(process.execPath, [supervisor, configFile], {
     cwd: setup.repo,
+    env: { ...process.env, GITHUB_TOKEN: AMBIENT_TOKEN },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
@@ -120,11 +147,11 @@ async function runActivation(
   child.stdout?.on('data', (chunk) => (logs += chunk));
   child.stderr?.on('data', (chunk) => (logs += chunk));
 
-  await waitFor(async () => {
+  const initialHealth = await waitFor(async () => {
     try {
       const response = await fetch(healthUrl);
-      const body = (await response.json()) as { commit?: string };
-      return response.ok && body.commit === setup.previousSha ? true : null;
+      const body = (await response.json()) as { commit?: string; upgradeSocket?: string };
+      return response.ok && body.commit === setup.previousSha && body.upgradeSocket ? body : null;
     } catch {
       return null;
     }
@@ -146,9 +173,7 @@ async function runActivation(
     resultPath,
   };
   if (tamperCommand) request.buildCommand = { ...buildCommand, args: ['malicious.mjs'] };
-  const temporary = `${requestFile}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(request));
-  fs.renameSync(temporary, requestFile);
+  const response = await submit(initialHealth.upgradeSocket as string, request);
 
   if (tamperCommand || activationToken !== ACTIVATION_TOKEN) {
     const code = await waitFor(() => (child.exitCode === null ? null : child.exitCode));
@@ -159,6 +184,7 @@ async function runActivation(
     const evidence: Record<string, unknown> = {
       supervisorExitCode: code,
       logs,
+      response,
       resultExists: fs.existsSync(resultPath),
       rejection: rejected
         ? JSON.parse(fs.readFileSync(path.join(setup.stateDir, rejected), 'utf8'))
@@ -175,7 +201,7 @@ async function runActivation(
   const code = await new Promise<number | null>((resolve) => child.once('exit', resolve));
   if (code !== 0) throw new Error(`supervisor exited ${code}: ${logs}`);
   children.splice(children.indexOf(child), 1);
-  return { ...setup, evidence, logs };
+  return { ...setup, evidence, logs, response };
 }
 
 afterEach(async () => {
@@ -217,11 +243,13 @@ describe('external self-upgrade supervisor', () => {
       'utf8',
     );
     expect(processed).not.toContain(ACTIVATION_TOKEN);
-    const observed = fs.readFileSync(path.join(result.repo, '.observed-request'), 'utf8');
-    expect(observed).not.toContain(ACTIVATION_TOKEN);
-    expect(observed).not.toContain('activationToken');
+    const observed = fs.readFileSync(path.join(result.repo, '.observed-env'), 'utf8');
+    expect(observed).not.toContain(AMBIENT_TOKEN);
+    expect(observed).not.toContain('activate.json');
+    expect(observed).not.toContain('jarvis-upgrade-');
     expect(JSON.stringify(result.evidence)).not.toContain(ACTIVATION_TOKEN);
     expect(result.logs).not.toContain(ACTIVATION_TOKEN);
+    expect(result.logs).not.toContain(AMBIENT_TOKEN);
     expect(
       fs
         .readdirSync(result.stateDir, { withFileTypes: true })
@@ -253,6 +281,7 @@ describe('external self-upgrade supervisor', () => {
     expect(result.evidence).toMatchObject({
       supervisorExitCode: 0,
       resultExists: false,
+      response: { accepted: false, error: 'buildCommand does not match supervisor config' },
       rejection: { status: 'rejected', error: 'buildCommand does not match supervisor config' },
     });
     expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.previousSha);
@@ -265,6 +294,7 @@ describe('external self-upgrade supervisor', () => {
     expect(result.evidence).toMatchObject({
       supervisorExitCode: 0,
       resultExists: false,
+      response: { accepted: false, error: 'activation request human token is invalid' },
       rejection: { status: 'rejected', error: 'activation request human token is invalid' },
     });
     expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.previousSha);

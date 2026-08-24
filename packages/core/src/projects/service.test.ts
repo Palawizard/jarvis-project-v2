@@ -16,4 +16,15 @@ describe('reproducible dependency installation', () => {
 
     expect(detectStack(dir).commands.install).toBe('pnpm install --frozen-lockfile');
   });
+
+  it.each([
+    ['pyproject.toml', 'python -m pip install -e .'],
+    ['requirements.txt', 'python -m pip install -r requirements.txt'],
+    ['Cargo.toml', 'cargo fetch'],
+    ['go.mod', 'go mod download'],
+  ])('requires an explicit setup boundary for %s', (manifest, install) => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-project-'));
+    fs.writeFileSync(path.join(dir, manifest), '');
+    expect(detectStack(dir).commands.install).toBe(install);
+  });
 });

@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
 import { promisify } from 'node:util';
 import type { CandidateApplicationService } from '../application/service.js';
 import type { JarvisConfig } from '../config.js';
@@ -182,7 +183,8 @@ export class UpgradeManager {
       throw new Error('self-upgrade preflight must pass before activation');
     }
     const requestPath = process.env.JARVIS_UPGRADE_REQUEST_PATH;
-    if (process.env.JARVIS_SUPERVISED !== '1' || !requestPath) {
+    const upgradeSocket = process.env.JARVIS_UPGRADE_SOCKET;
+    if (process.env.JARVIS_SUPERVISED !== '1' || !requestPath || !upgradeSocket) {
       throw new Error('Jarvis is not running under the upgrade supervisor');
     }
     if (activationToken.length < 32 || activationToken.length > 4096) {
@@ -222,7 +224,6 @@ export class UpgradeManager {
     if (rollbackSha !== transaction.previousSha) throw new Error('rollback reference is invalid');
 
     const resultPath = path.join(this.config.home, 'upgrades', `${transaction.id}-result.json`);
-    fs.mkdirSync(path.dirname(requestPath), { recursive: true, mode: 0o700 });
     fs.mkdirSync(path.dirname(resultPath), { recursive: true, mode: 0o700 });
     const request = {
       transactionId: transaction.id,
@@ -239,15 +240,21 @@ export class UpgradeManager {
       startCommand: { executable: 'pnpm', args: ['--filter', '@jarvis/orchestrator', 'start'] },
       resultPath,
     };
-    const temporary = `${requestPath}.${transaction.id}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(request), { mode: 0o600, flag: 'wx' });
-    this.setStatus(transaction.id, 'activation_requested', { activationAt: nowIso() });
+    const activationAt = nowIso();
+    const claimed = this.db
+      .prepare(
+        `UPDATE upgrade_transactions SET status='activation_requested', activation_at=?,
+          failure=NULL, updated_at=? WHERE id=? AND status='preflight_passed'`,
+      )
+      .run(activationAt, activationAt, transaction.id);
+    if (Number(claimed.changes) !== 1) {
+      throw new Error('self-upgrade activation is already being processed');
+    }
     try {
-      fs.renameSync(temporary, requestPath);
+      await sendActivationRequest(upgradeSocket, request);
     } catch (error) {
-      fs.rmSync(temporary, { force: true });
       this.setStatus(transaction.id, 'inspection_required', {
-        failure: `activation request publication failed: ${error instanceof Error ? error.message : String(error)}`,
+        failure: `activation request delivery failed: ${error instanceof Error ? error.message : String(error)}`,
       });
       throw error;
     }
@@ -378,6 +385,47 @@ export class UpgradeManager {
         id,
       );
   }
+}
+
+function sendActivationRequest(endpoint: string, request: Record<string, unknown>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(endpoint);
+    socket.setEncoding('utf8');
+    let pending = '';
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(
+      () => finish(new Error('upgrade supervisor did not acknowledge the request')),
+      10_000,
+    );
+    socket.once('connect', () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on('data', (chunk: string) => {
+      pending += chunk;
+      const newline = pending.indexOf('\n');
+      if (newline < 0) return;
+      try {
+        const response = JSON.parse(pending.slice(0, newline)) as {
+          accepted?: boolean;
+          error?: string;
+        };
+        if (!response.accepted) return finish(new Error(response.error ?? 'activation rejected'));
+        socket.end('ack\n', () => finish());
+      } catch {
+        finish(new Error('upgrade supervisor returned an invalid acknowledgement'));
+      }
+    });
+    socket.once('error', (error) => finish(error));
+    socket.once('close', () => {
+      if (!settled) finish(new Error('upgrade supervisor closed before acknowledgement'));
+    });
+  });
 }
 
 const ZERO_SHA = '0000000000000000000000000000000000000000';

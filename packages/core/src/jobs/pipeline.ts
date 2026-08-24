@@ -881,6 +881,8 @@ export class JobPipeline {
         headRef: opts.headRef,
         cycle: opts.cycle,
       });
+      await server.stop();
+      server = undefined;
       if (shots.some((shot) => shot.status !== 'captured')) {
         outcome = { kind: 'infrastructure', error: 'visual QA did not capture every scenario' };
       } else {

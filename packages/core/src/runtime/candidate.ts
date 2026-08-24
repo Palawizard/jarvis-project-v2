@@ -11,6 +11,18 @@ import { CANDIDATE_FIXTURE_ENV } from './fixtures.js';
 
 export class CandidateRuntimeUnsupportedError extends Error {}
 
+/** Grace for a launcher that exits right after its server started listening. */
+const READY_SETTLE_MS = 500;
+
+function exitedError(
+  exit: { code: number | null; signal: NodeJS.Signals | null },
+  logs: string[],
+): Error {
+  return new Error(
+    `candidate runtime exited (${exit.code ?? exit.signal}):\n${logs.join('').slice(-2000)}`,
+  );
+}
+
 export interface CandidateRuntime {
   baseUrl: string;
   healthUrl: string;
@@ -161,6 +173,17 @@ export async function startCandidateRuntime(opts: {
       probe: () => probeWeb(baseUrl),
       failure: `candidate API is healthy but web frontend did not become ready at ${baseUrl}`,
     });
+    // Answering a port is not proof the runtime survives. A launcher that
+    // daemonized its server exits *after* the server listens, and containment
+    // then tears the whole job down — so both probes can pass against a process
+    // that is already on its way out. Settle for that exit before handing the
+    // runtime out, instead of giving Visual QA a corpse to photograph.
+    const settled = await Promise.race([
+      terminated,
+      new Promise<null>((resolve) => setTimeout(resolve, READY_SETTLE_MS, null)),
+    ]);
+    if (settled) throw exitedError(settled, logs);
+    if (opts.signal?.aborted) throw new Error('candidate runtime start cancelled');
     return {
       baseUrl,
       healthUrl,
@@ -208,7 +231,7 @@ async function waitUntilReady(opts: {
 }): Promise<void> {
   const tail = () => opts.logs.join('').slice(-2000);
   const exited = (exit: { code: number | null; signal: NodeJS.Signals | null }) =>
-    new Error(`candidate runtime exited (${exit.code ?? exit.signal}):\n${tail()}`);
+    exitedError(exit, opts.logs);
   const assertActive = () => {
     if (opts.signal?.aborted) throw new Error('candidate runtime start cancelled');
     const exit = opts.exited();

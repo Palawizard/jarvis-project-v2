@@ -16,7 +16,7 @@ import { openDb, type Db } from '../db/index.js';
 import { EventBus } from '../events/bus.js';
 import { GitWorkspace } from '../git/workspace.js';
 import { JobService } from './service.js';
-import { ProjectService, type Project } from '../projects/service.js';
+import { ProjectService, type Project, type ProjectCommands } from '../projects/service.js';
 import type { Review, ReviewFinding, ReviewOptions } from '../review/engine.js';
 import { VerificationEngine, type VerificationReport } from '../verification/engine.js';
 import { JobPipeline } from './pipeline.js';
@@ -143,6 +143,9 @@ async function harness(options: {
   visual?: 'repair' | 'infrastructure' | 'advisory';
   selfDevelopment?: boolean;
   verification?: VerificationReport[];
+  realVerification?: boolean;
+  verificationInfraRetries?: number;
+  commands?: ProjectCommands;
 }): Promise<Harness> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-pipeline-'));
   roots.push(home);
@@ -154,6 +157,10 @@ async function harness(options: {
   git(['config', 'user.name', 'Test']);
   git(['config', 'core.autocrlf', 'false']);
   fs.writeFileSync(path.join(repo, 'README.md'), '# fixture\n');
+  if (options.commands?.install) {
+    fs.writeFileSync(path.join(repo, 'package.json'), '{"name":"pipeline-fixture"}\n');
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n');
+  }
   git(['add', '-A']);
   git(['commit', '-qm', 'base']);
 
@@ -165,6 +172,8 @@ async function harness(options: {
       maxReviewFixCycles: options.maxReviewFixCycles ?? 2,
       maxVisualFixCycles: 2,
       agentStageRetries: 1,
+      verificationInfraRetries:
+        options.verificationInfraRetries ?? baseConfig.pipeline.verificationInfraRetries,
     },
   });
   const db = openDb(config);
@@ -175,6 +184,7 @@ async function harness(options: {
     name: 'pipeline-fixture',
     rootPath: repo,
     isSelf: options.selfDevelopment ?? false,
+    commands: options.commands,
     ...(options.visual
       ? {
           config: {
@@ -198,9 +208,11 @@ async function harness(options: {
     });
   const agents = new AgentRegistry(config, { providers: [provider], db, bus });
   const verificationCalls: number[] = [];
+  const realVerification = new VerificationEngine(db, config.artifactsDir, bus);
   const verification = {
-    async run(input: { cycle: number }): Promise<VerificationReport> {
-      verificationCalls.push(input.cycle);
+    async run(input: Parameters<VerificationEngine['run']>[0]): Promise<VerificationReport> {
+      verificationCalls.push(input.cycle ?? 0);
+      if (options.realVerification) return realVerification.run(input);
       const configured = options.verification?.[verificationCalls.length - 1];
       if (configured) {
         return {
@@ -231,15 +243,11 @@ async function harness(options: {
         ],
       };
     },
-    latestReport(): VerificationReport {
-      return passedVerification();
+    latestReport(jobId: string): VerificationReport {
+      return options.realVerification ? realVerification.latestReport(jobId) : passedVerification();
     },
     reportForResults(jobId: string, resultIds: string[], failureSummary: string) {
-      return new VerificationEngine(db, config.artifactsDir, bus).reportForResults(
-        jobId,
-        resultIds,
-        failureSummary,
-      );
+      return realVerification.reportForResults(jobId, resultIds, failureSummary);
     },
   };
   const reviewHeads: string[] = [];
@@ -703,6 +711,74 @@ describe('job repair pipeline', () => {
     expect(job.resumeStage).toBe('verifying');
     expect(job.pauseReason).toContain('infrastructure attempts exhausted');
     expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('reruns a real failed install with partial residue and never calls a source fixer', async () => {
+    const install =
+      `node -e "const fs=require('node:fs');fs.mkdirSync('node_modules',{recursive:true});` +
+      `fs.appendFileSync('node_modules/attempts','x');process.exit(1)"`;
+    const h = await harness({
+      realVerification: true,
+      verificationInfraRetries: 1,
+      commands: { install, test: 'echo verification-ran' },
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'unused',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('paused');
+    expect(job.resumeStage).toBe('verifying');
+    expect(h.verificationCalls).toHaveLength(2);
+    expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(0);
+    expect(
+      fs.readFileSync(path.join(job.worktreePath as string, 'node_modules', 'attempts'), 'utf8'),
+    ).toBe('xx');
+    expect(
+      h.db.prepare("SELECT DISTINCT failure_kind FROM verifications WHERE kind='setup'").all(),
+    ).toEqual([{ failure_kind: 'infrastructure' }]);
+    h.db.close();
+  });
+
+  it('allows a real product fixer only after a setup retry succeeds', async () => {
+    const install =
+      `node -e "const fs=require('node:fs');fs.mkdirSync('node_modules',{recursive:true});` +
+      `const p='node_modules/attempts';const n=fs.existsSync(p)?fs.readFileSync(p,'utf8').length:0;` +
+      `fs.appendFileSync(p,'x');process.exit(n===0?1:0)"`;
+    const h = await harness({
+      realVerification: true,
+      verificationInfraRetries: 1,
+      commands: { install, test: 'echo boom && exit 3' },
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'unused',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('paused');
+    expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(1);
+    expect(h.verificationCalls).toHaveLength(3);
+    const reports = h.db
+      .prepare('SELECT cycle,name,status,failure_kind FROM verifications ORDER BY cycle,created_at')
+      .all();
+    expect(reports).toEqual([
+      { cycle: 0, name: 'install', status: 'failed', failure_kind: 'infrastructure' },
+      { cycle: 1, name: 'install', status: 'passed', failure_kind: 'none' },
+      { cycle: 1, name: 'test', status: 'failed', failure_kind: 'product' },
+      { cycle: 2, name: 'install', status: 'passed', failure_kind: 'none' },
+      { cycle: 2, name: 'test', status: 'failed', failure_kind: 'product' },
+    ]);
     h.db.close();
   });
 

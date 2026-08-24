@@ -70,9 +70,8 @@ export class VerificationEngine {
     const logDir = path.join(this.artifactsDir, opts.jobId, `verify-${cycle}`);
     fs.mkdirSync(logDir, { recursive: true });
 
-    // A git worktree is a fresh checkout with no node_modules, so every command
-    // below would fail with "module not found" and look like a broken change.
-    // Install once per worktree, and only when the deps are actually missing.
+    // Filesystem residue is not setup evidence. Run the configured install on
+    // every verification cycle; only its successful result authorises checks.
     const steps: Array<{
       name: string;
       command: string;
@@ -80,7 +79,7 @@ export class VerificationEngine {
       kind: NonNullable<VerificationStep['kind']>;
       required: boolean;
     }> = [];
-    if (opts.commands.install && needsInstall(opts.cwd)) {
+    if (opts.commands.install && fs.existsSync(path.join(opts.cwd, 'package.json'))) {
       steps.push({
         name: 'install',
         command: opts.commands.install,
@@ -171,7 +170,7 @@ export class VerificationEngine {
 
       // If dependencies could not be installed, every later check would fail for
       // the same reason. Stop and report the real cause instead of a cascade.
-      if (name === 'install' && result.status !== 'passed') break;
+      if (kind === 'setup' && result.status !== 'passed') break;
     }
 
     // `install` is setup, not evidence: it must not make an unverified change
@@ -276,17 +275,6 @@ function reportFromResults(
     failureSummary: persistedFailureSummary ?? summariseFailures(results),
     failureKind,
   };
-}
-
-/**
- * True when a JS project's dependencies are missing. Cheap existence check
- * rather than a full integrity check: pnpm/npm are themselves idempotent and
- * fast when everything is already present, but skipping the spawn entirely
- * keeps repeat verification cycles quick.
- */
-function needsInstall(cwd: string): boolean {
-  if (!fs.existsSync(path.join(cwd, 'package.json'))) return false;
-  return !fs.existsSync(path.join(cwd, 'node_modules'));
 }
 
 interface CommandOutcome {

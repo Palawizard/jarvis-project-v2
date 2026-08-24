@@ -118,7 +118,7 @@ describe('deterministic verification', () => {
     expect(report.passed).toBe(true);
   });
 
-  it('skips the install when dependencies are already present', async () => {
+  it('does not trust an existing dependency directory as setup evidence', async () => {
     fs.writeFileSync(path.join(home, 'package.json'), '{"name":"x"}');
     fs.mkdirSync(path.join(home, 'node_modules'), { recursive: true });
     const report = await engine.run({
@@ -126,7 +126,56 @@ describe('deterministic verification', () => {
       cwd: home,
       commands: { install: OK, test: OK },
     });
-    expect(report.results.map((r) => r.name)).toEqual(['test']);
+    expect(report.results.map((r) => r.name)).toEqual(['install', 'test']);
+  });
+
+  it('reruns failed setup across real consecutive engines despite partial residue', async () => {
+    fs.writeFileSync(path.join(home, 'package.json'), '{"name":"x"}');
+    const install =
+      `node -e "const fs=require('node:fs');fs.mkdirSync('node_modules',{recursive:true});` +
+      `fs.appendFileSync('node_modules/attempts','x');process.exit(1)"`;
+    const first = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install, test: OK },
+      cycle: 0,
+    });
+    const restarted = new VerificationEngine(db, path.join(home, 'artifacts'), bus);
+    const second = await restarted.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install, test: OK },
+      cycle: 1,
+    });
+    expect(first.failureKind).toBe('infrastructure');
+    expect(second.failureKind).toBe('infrastructure');
+    expect(first.results.map((result) => result.name)).toEqual(['install']);
+    expect(second.results.map((result) => result.name)).toEqual(['install']);
+    expect(fs.readFileSync(path.join(home, 'node_modules', 'attempts'), 'utf8')).toBe('xx');
+  });
+
+  it('classifies check evidence only after a later setup retry succeeds', async () => {
+    fs.writeFileSync(path.join(home, 'package.json'), '{"name":"x"}');
+    const install =
+      `node -e "const fs=require('node:fs');fs.mkdirSync('node_modules',{recursive:true});` +
+      `const p='node_modules/attempts';const n=fs.existsSync(p)?fs.readFileSync(p,'utf8').length:0;` +
+      `fs.appendFileSync(p,'x');process.exit(n===0?1:0)"`;
+    const first = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install, test: FAIL },
+      cycle: 0,
+    });
+    const second = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install, test: FAIL },
+      cycle: 1,
+    });
+    expect(first.failureKind).toBe('infrastructure');
+    expect(first.results.map((result) => result.name)).toEqual(['install']);
+    expect(second.failureKind).toBe('product');
+    expect(second.results.map((result) => result.name)).toEqual(['install', 'test']);
   });
 
   it('stops after a failed install instead of cascading bogus failures', async () => {
@@ -198,6 +247,20 @@ describe('deterministic verification', () => {
     });
     expect(report.failureKind).toBe('infrastructure');
     expect(report.failureSummary).toContain('timed out');
+  });
+
+  it('stops after any failed setup step, regardless of its name', async () => {
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: {},
+      steps: [
+        { name: 'prepare', command: FAIL, kind: 'setup' },
+        { name: 'test', command: OK, kind: 'check' },
+      ],
+    });
+    expect(report.failureKind).toBe('infrastructure');
+    expect(report.results.map((result) => result.name)).toEqual(['prepare']);
   });
 
   it('redacts credential-like strings from stored output', async () => {

@@ -144,6 +144,161 @@ describe('deterministic visual interactions', () => {
     }
   });
 
+  it.each([
+    ['delayed redirect', `location.href='/bounce'`],
+    ['delayed JavaScript navigation', `location.href=ESCAPED`],
+    [
+      'delayed form navigation',
+      `const f=document.createElement('form');f.action=ESCAPED;document.body.append(f);f.requestSubmit()`,
+    ],
+    ['delayed popup', `window.open(ESCAPED)`],
+  ])('permanently rejects a %s before the foreign document is dispatched', async (name, action) => {
+    let foreignRequests = 0;
+    const target = http.createServer((_request, response) => {
+      foreignRequests++;
+      response.end('<h1>escaped</h1>');
+    });
+    servers.push(target);
+    await new Promise<void>((resolve) => target.listen(0, '127.0.0.1', resolve));
+    const targetAddress = target.address();
+    if (!targetAddress || typeof targetAddress === 'string') throw new Error('target did not bind');
+    const escaped = `http://127.0.0.1:${targetAddress.port}/escaped`;
+    const candidate = http.createServer((request, response) => {
+      if (request.url === '/bounce')
+        return void response.writeHead(302, { location: escaped }).end();
+      const handler =
+        name === 'delayed popup'
+          ? `const popup=window.open('about:blank');setTimeout(()=>popup.location.href=ESCAPED,10)`
+          : `setTimeout(()=>{${action}},${name === 'delayed JavaScript navigation' ? 100 : 10})`;
+      response.end(
+        `<button id="go">go</button><script>const ESCAPED=${JSON.stringify(escaped)};` +
+          `go.onclick=()=>{${handler}}</script>`,
+      );
+    });
+    servers.push(candidate);
+    await new Promise<void>((resolve) => candidate.listen(0, '127.0.0.1', resolve));
+    const address = candidate.address();
+    if (!address || typeof address === 'string') throw new Error('candidate did not bind');
+    const { engine, db, artifactsDir } = visualFixture();
+    try {
+      const shots = await engine.capture({
+        jobId: 'job-tools',
+        projectId: 'project-tools',
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        routes: ['/'],
+        scenarios: [
+          {
+            name,
+            route: '/',
+            interactions: [
+              { action: 'click', selector: '#go' },
+              ...(name === 'delayed JavaScript navigation'
+                ? ([{ action: 'screenshot', name: 'pre-violation' }] as const)
+                : []),
+            ],
+            viewports: ['desktop'],
+          },
+        ],
+      });
+      expect(foreignRequests).toBe(0);
+      expect(shots[0]?.status).toBe('failed');
+      expect(shots[0]?.screenshotPath).toBeNull();
+      expect(
+        db.prepare("SELECT COUNT(*) AS count FROM visual_qa WHERE status='captured'").get(),
+      ).toEqual({ count: 0 });
+      expect(findPngs(artifactsDir)).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('invalidates navigation scheduled specifically during the final screenshot window', async () => {
+    let foreignRequests = 0;
+    const target = http.createServer((_request, response) => {
+      foreignRequests++;
+      response.end('escaped');
+    });
+    servers.push(target);
+    await new Promise<void>((resolve) => target.listen(0, '127.0.0.1', resolve));
+    const targetAddress = target.address();
+    if (!targetAddress || typeof targetAddress === 'string') throw new Error('target did not bind');
+    const escaped = `http://127.0.0.1:${targetAddress.port}/escaped`;
+    const candidate = http.createServer((request, response) => {
+      if (request.url === '/slow-font') {
+        setTimeout(() => response.end('not-a-font'), 700);
+        return;
+      }
+      response.end(
+        `<style>@font-face{font-family:slow;src:url('/slow-font')} .slow{font-family:slow}</style>` +
+          `<button id="go" onclick="document.body.className='slow';setTimeout(()=>location.href='${escaped}',425)">go</button>`,
+      );
+    });
+    servers.push(candidate);
+    await new Promise<void>((resolve) => candidate.listen(0, '127.0.0.1', resolve));
+    const address = candidate.address();
+    if (!address || typeof address === 'string') throw new Error('candidate did not bind');
+    const { engine, db, artifactsDir } = visualFixture();
+    try {
+      const shots = await engine.capture({
+        jobId: 'job-tools',
+        projectId: 'project-tools',
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        routes: ['/'],
+        scenarios: [
+          {
+            name: 'screenshot-race',
+            route: '/',
+            interactions: [{ action: 'click', selector: '#go' }],
+            viewports: ['desktop'],
+          },
+        ],
+      });
+      expect(foreignRequests).toBe(0);
+      expect(shots[0]?.status).toBe('failed');
+      expect(shots[0]?.screenshotPath).toBeNull();
+      expect(findPngs(artifactsDir)).toEqual([]);
+      expect(
+        db.prepare("SELECT COUNT(*) AS count FROM visual_qa WHERE status='captured'").get(),
+      ).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('allows delayed same-origin navigation', async () => {
+    const candidate = http.createServer((request, response) => {
+      response.end(
+        request.url === '/final'
+          ? '<h1>same origin</h1>'
+          : `<button id="go" onclick="setTimeout(()=>location.href='/final',10)">go</button>`,
+      );
+    });
+    servers.push(candidate);
+    await new Promise<void>((resolve) => candidate.listen(0, '127.0.0.1', resolve));
+    const address = candidate.address();
+    if (!address || typeof address === 'string') throw new Error('candidate did not bind');
+    const { engine, db } = visualFixture();
+    try {
+      const shots = await engine.capture({
+        jobId: 'job-tools',
+        projectId: 'project-tools',
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        routes: ['/'],
+        scenarios: [
+          {
+            name: 'same-origin delayed',
+            route: '/',
+            interactions: [{ action: 'click', selector: '#go' }],
+            viewports: ['desktop'],
+          },
+        ],
+      });
+      expect(shots[0]?.status).toBe('captured');
+    } finally {
+      db.close();
+    }
+  });
+
   it('allows a same-origin redirect', async () => {
     const candidate = http.createServer((request, response) => {
       if (request.url === '/redirect-same') response.writeHead(302, { location: '/final' }).end();
@@ -235,4 +390,12 @@ function visualFixture(): {
     db,
     artifactsDir: config.artifactsDir,
   };
+}
+
+function findPngs(root: string): string[] {
+  if (!fs.existsSync(root)) return [];
+  return fs
+    .readdirSync(root, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.png'))
+    .map((entry) => entry.name);
 }

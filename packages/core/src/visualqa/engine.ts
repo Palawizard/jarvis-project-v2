@@ -97,10 +97,15 @@ export class VisualQaEngine {
 
       for (const scenario of scenarios) {
         for (const viewport of scenario.viewports ?? viewports) {
-          const context = await browser.newContext({ viewport: VIEWPORTS[viewport] });
-          if (opts.signal?.aborted) break;
+          const context = await browser.newContext({
+            viewport: VIEWPORTS[viewport],
+            serviceWorkers: 'block',
+          });
+          if (opts.signal?.aborted) {
+            await context.close();
+            break;
+          }
           shots.push(await this.captureRoute(context, opts, scenario, viewport, outDir));
-          await context.close();
         }
       }
     } catch (error) {
@@ -172,8 +177,9 @@ export class VisualQaEngine {
   ): Promise<VisualQaShot> {
     const consoleErrors: string[] = [];
     const networkFailures: string[] = [];
+    const screenshotPaths = new Set<string>();
     const page = await context.newPage();
-    const navigation = await confineNavigation(page, new URL(opts.baseUrl).origin);
+    const navigation = await confineNavigation(context, page, new URL(opts.baseUrl).origin);
 
     page.on('console', (msg) => {
       if (msg.type() === 'error') consoleErrors.push(msg.text().slice(0, 500));
@@ -207,12 +213,24 @@ export class VisualQaEngine {
         outDir,
         viewport,
         navigation.assert,
+        screenshotPaths,
       );
+      await navigation.settle();
+      navigation.assert();
       // Let entry animations settle so screenshots are comparable run to run.
       await page.waitForTimeout(400);
+      await navigation.settle();
       navigation.assert();
+      screenshotPaths.add(screenshotPath);
       await page.screenshot({ path: screenshotPath, fullPage: true });
-      await page.close();
+      await navigation.settle();
+      navigation.assert();
+      // Closing the whole context stops page timers and popup creation. The
+      // route guard remains installed until close and every in-flight callback
+      // has settled, so persistence has no navigation-capable race window.
+      await context.close();
+      await navigation.settle();
+      navigation.assert();
       const shot = this.persist({
         jobId: opts.jobId ?? null,
         projectId: opts.projectId ?? null,
@@ -241,8 +259,9 @@ export class VisualQaEngine {
       });
       return shot;
     } catch (error) {
-      await page.close().catch(() => undefined);
-      if (fs.existsSync(screenshotPath)) fs.rmSync(screenshotPath);
+      await context.close().catch(() => undefined);
+      await navigation.settle().catch(() => undefined);
+      for (const artifact of screenshotPaths) fs.rmSync(artifact, { force: true });
       return this.persist({
         jobId: opts.jobId ?? null,
         projectId: opts.projectId ?? null,
@@ -390,6 +409,7 @@ async function runInteractions(
   outDir: string,
   viewport: 'desktop' | 'mobile',
   assertConfined: () => void,
+  screenshotPaths: Set<string>,
 ): Promise<void> {
   if (interactions.length > 50) throw new Error('visual interaction script exceeds 50 actions');
   let screenshotIndex = 0;
@@ -424,8 +444,10 @@ async function runInteractions(
       case 'screenshot': {
         assertConfined();
         const safeName = (step.name ?? `step-${++screenshotIndex}`).replace(/[^a-z0-9_-]+/gi, '_');
+        const screenshotPath = path.join(outDir, `${safeName}-${viewport}-${newId('step')}.png`);
+        screenshotPaths.add(screenshotPath);
         await page.screenshot({
-          path: path.join(outDir, `${safeName}-${viewport}.png`),
+          path: screenshotPath,
           fullPage: true,
         });
         assertConfined();
@@ -436,29 +458,67 @@ async function runInteractions(
 }
 
 async function confineNavigation(
+  context: import('playwright').BrowserContext,
   page: import('playwright').Page,
   expectedOrigin: string,
-): Promise<{ assert(): void }> {
+): Promise<{ assert(): void; settle(): Promise<void> }> {
   let violation: string | null = null;
+  const pending = new Set<Promise<void>>();
   const reject = (url: string, kind: string) => {
-    violation ??= `${kind} escaped candidate origin: ${url}`;
+    violation ??= `${kind} escaped candidate origin: ${url}`.slice(0, 500);
   };
-  await page.route('**/*', async (route) => {
-    const request = route.request();
-    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
-      try {
-        if (new URL(request.url()).origin !== expectedOrigin) {
-          reject(request.url(), 'main-frame navigation');
+  await context.route('**/*', (route) => {
+    const task = (async () => {
+      const request = route.request();
+      let frame: import('playwright').Frame | null = null;
+      if (request.isNavigationRequest()) {
+        try {
+          frame = request.frame();
+        } catch {
+          // Popup navigation can be routed before Playwright creates its Frame.
+        }
+      }
+      if (request.isNavigationRequest() && (!frame || frame.parentFrame() === null)) {
+        const primaryPage = frame?.page() === page;
+        try {
+          if (new URL(request.url()).origin !== expectedOrigin) {
+            reject(request.url(), primaryPage ? 'main-frame navigation' : 'popup navigation');
+            await route.abort('blockedbyclient');
+            return;
+          }
+        } catch {
+          reject(request.url(), 'invalid navigation');
           await route.abort('blockedbyclient');
           return;
         }
-      } catch {
-        reject(request.url(), 'invalid navigation');
-        await route.abort('blockedbyclient');
+        const response = await route.fetch({ maxRedirects: 0 });
+        const location = response.headers().location;
+        if (response.status() >= 300 && response.status() < 400 && location) {
+          let target: string;
+          try {
+            target = new URL(location, request.url()).toString();
+          } catch {
+            reject(location, 'invalid redirect');
+            await route.abort('blockedbyclient');
+            return;
+          }
+          if (new URL(target).origin !== expectedOrigin) {
+            reject(target, primaryPage ? 'main-frame redirect' : 'popup redirect');
+            await route.abort('blockedbyclient');
+            return;
+          }
+        }
+        await route.fulfill({ response });
         return;
       }
-    }
-    await route.continue();
+      await route.continue();
+    })();
+    pending.add(task);
+    void task.then(
+      () => pending.delete(task),
+      () => pending.delete(task),
+    );
+    return task;
   });
   page.on('framenavigated', (frame) => {
     if (frame !== page.mainFrame() || frame.url() === 'about:blank') return;
@@ -469,8 +529,22 @@ async function confineNavigation(
     }
   });
   page.on('popup', (popup) => {
-    reject(popup.url(), 'popup');
-    void popup.close();
+    const inspect = (url: string) => {
+      if (url === 'about:blank') return;
+      try {
+        if (new URL(url).origin !== expectedOrigin) {
+          reject(url, 'popup');
+          void popup.close().catch(() => undefined);
+        }
+      } catch {
+        reject(url, 'invalid popup');
+        void popup.close().catch(() => undefined);
+      }
+    };
+    inspect(popup.url());
+    popup.on('framenavigated', (frame) => {
+      if (frame === popup.mainFrame()) inspect(frame.url());
+    });
   });
   return {
     assert() {
@@ -478,6 +552,13 @@ async function confineNavigation(
       const current = page.url();
       if (current !== 'about:blank' && new URL(current).origin !== expectedOrigin) {
         throw new Error(`page escaped candidate origin: ${current}`);
+      }
+    },
+    async settle() {
+      for (;;) {
+        await Promise.allSettled([...pending]);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (pending.size === 0) return;
       }
     },
   };

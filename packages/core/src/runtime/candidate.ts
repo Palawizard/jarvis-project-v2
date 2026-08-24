@@ -61,6 +61,8 @@ export async function startCandidateRuntime(opts: {
     'JARVIS_SUPERVISED',
     'JARVIS_UPGRADE_REQUEST_PATH',
     'JARVIS_COMMIT',
+    'JARVIS_BOOTSTRAP_TOKEN',
+    'JARVIS_CONTROL_TOKEN',
     'ANTHROPIC_API_KEY',
     'OPENAI_API_KEY',
     'CODEX_API_KEY',

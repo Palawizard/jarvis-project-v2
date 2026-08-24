@@ -15,6 +15,8 @@ export interface JarvisConfig {
   modelCacheDir: string;
   logDir: string;
   port: number;
+  /** Exact browser origins allowed to make human-authority mutations. */
+  controlOrigins: string[];
 
   agents: {
     implementerProvider: 'claude' | 'codex' | undefined;
@@ -76,6 +78,7 @@ export interface JarvisConfig {
     maxReviewFixCycles: number;
     maxVisualFixCycles: number;
     agentStageRetries: number;
+    verificationInfraRetries: number;
     codeReviewBlockingSeverities: string[];
     visualBlockingSeverities: string[];
     /** Retention for raw history rows, in days. 0 = keep forever. */
@@ -147,6 +150,10 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
     modelCacheDir: path.join(home, 'models'),
     logDir: path.join(home, 'logs'),
     port: envInt('JARVIS_PORT', 4319),
+    controlOrigins: (process.env.JARVIS_CONTROL_ORIGINS ?? '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
     agents: {
       implementerProvider: envProvider('JARVIS_IMPLEMENTER_PROVIDER'),
       reviewerProvider: envProvider('JARVIS_REVIEWER_PROVIDER'),
@@ -185,6 +192,7 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
       maxReviewFixCycles: Math.max(0, envInt('JARVIS_MAX_REVIEW_FIX_CYCLES', 2)),
       maxVisualFixCycles: Math.max(0, envInt('JARVIS_MAX_VISUAL_FIX_CYCLES', 2)),
       agentStageRetries: Math.max(0, envInt('JARVIS_AGENT_STAGE_RETRIES', 2)),
+      verificationInfraRetries: Math.max(0, envInt('JARVIS_VERIFICATION_INFRA_RETRIES', 2)),
       codeReviewBlockingSeverities: envSeverities(
         'JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES',
         ['critical', 'high'],
@@ -213,6 +221,14 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
     config.artifactsDir = path.join(config.home, 'artifacts');
     config.modelCacheDir = path.join(config.home, 'models');
     config.logDir = path.join(config.home, 'logs');
+  }
+  if (!config.controlOrigins.length) {
+    config.controlOrigins = [
+      `http://127.0.0.1:${config.port}`,
+      `http://localhost:${config.port}`,
+      `http://127.0.0.1:${process.env.JARVIS_WEB_PORT ?? '5199'}`,
+      `http://localhost:${process.env.JARVIS_WEB_PORT ?? '5199'}`,
+    ];
   }
   return config;
 }

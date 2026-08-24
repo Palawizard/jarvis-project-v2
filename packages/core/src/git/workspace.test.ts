@@ -80,6 +80,21 @@ describe('worktree isolation', () => {
     expect(second.warnings.join(' ')).toContain('Recovered');
   });
 
+  it('preserves but refuses an uncheckpointed descendant after a planning crash', async () => {
+    const first = await workspace.createWorktree({ repoRoot: repo, jobId: 'poison-planning' });
+    fs.writeFileSync(path.join(first.path, 'poison.txt'), 'untrusted descendant\n');
+    git(['add', '-A'], first.path);
+    git(
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'poison planning recovery'],
+      first.path,
+    );
+
+    await expect(
+      workspace.createWorktree({ repoRoot: repo, jobId: 'poison-planning' }),
+    ).rejects.toMatchObject({ code: 'recovery_head_mismatch' });
+    expect(fs.readFileSync(path.join(first.path, 'poison.txt'), 'utf8')).toContain('untrusted');
+  });
+
   it('NEVER destroys uncommitted user work', async () => {
     const scratch = path.join(repo, 'important-unsaved.txt');
     fs.writeFileSync(scratch, 'hours of unsaved work');

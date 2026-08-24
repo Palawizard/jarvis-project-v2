@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { JarvisEvent } from './api.ts';
+import { authenticatedFetch, type JarvisEvent } from './api.ts';
 
 /** Fetch-on-mount with a manual `reload`. Small enough not to warrant a query library. */
 export function useAsync<T>(
@@ -58,36 +58,53 @@ export function useEventStream(onEvent: (event: JarvisEvent) => void): { connect
   const lastId = useRef(0);
 
   useEffect(() => {
-    let source: EventSource | null = null;
+    let controller: AbortController | null = null;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let closed = false;
 
-    const connect = () => {
+    const connect = async () => {
       if (closed) return;
-      source = new EventSource(`/api/events?afterId=${lastId.current}`);
-      source.onopen = () => setConnected(true);
-      source.onmessage = (message) => {
-        if (!message.data) return;
-        try {
-          const event = JSON.parse(message.data as string) as JarvisEvent;
-          if (event.id) lastId.current = Math.max(lastId.current, event.id);
-          handler.current(event);
-        } catch {
-          /* ignore keepalive frames */
+      controller = new AbortController();
+      try {
+        const response = await authenticatedFetch(`/api/events?afterId=${lastId.current}`, {
+          signal: controller.signal,
+          headers: { accept: 'text/event-stream' },
+        });
+        if (!response.ok || !response.body) throw new Error(`event stream ${response.status}`);
+        setConnected(true);
+        const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+        let pending = '';
+        while (!closed) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          pending += value;
+          const frames = pending.split(/\r?\n\r?\n/);
+          pending = frames.pop() ?? '';
+          for (const frame of frames) {
+            const data = frame
+              .split(/\r?\n/)
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5).trimStart())
+              .join('\n');
+            if (!data) continue;
+            const event = JSON.parse(data) as JarvisEvent;
+            if (event.id) lastId.current = Math.max(lastId.current, event.id);
+            handler.current(event);
+          }
         }
-      };
-      source.onerror = () => {
+      } catch {
+        if (closed || controller.signal.aborted) return;
+      } finally {
         setConnected(false);
-        source?.close();
-        if (!closed) retry = setTimeout(connect, 1500);
-      };
+        if (!closed) retry = setTimeout(() => void connect(), 1500);
+      }
     };
-    connect();
+    void connect();
 
     return () => {
       closed = true;
       if (retry) clearTimeout(retry);
-      source?.close();
+      controller?.abort();
     };
   }, []);
 

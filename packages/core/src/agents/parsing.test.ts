@@ -105,12 +105,16 @@ describe('provider process protocol', () => {
       JARVIS_PORT: '4319',
       JARVIS_WEB_PORT: '5199',
       JARVIS_RUNTIME_NONCE: 'nonce',
+      JARVIS_BOOTSTRAP_TOKEN: 'bootstrap',
+      JARVIS_CONTROL_TOKEN: 'control',
     };
     expect(subscriptionProviderEnv(source)).toMatchObject({ PATH: 'kept', NO_COLOR: '1' });
     expect(subscriptionProviderEnv(source)).not.toHaveProperty('ANTHROPIC_API_KEY');
     // An agent's privileged path is the in-process tool boundary, not the API.
     expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_PORT');
     expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_RUNTIME_NONCE');
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_BOOTSTRAP_TOKEN');
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_CONTROL_TOKEN');
     expect(source).toHaveProperty('ANTHROPIC_API_KEY', 'secret');
     expect(source).toHaveProperty('JARVIS_PORT', '4319');
   });
@@ -389,9 +393,10 @@ describe('review output parsing', () => {
 \`\`\`
 And my actual review:
 \`\`\`json
-{"verdict":"request_changes","summary":"real answer","findings":[]}
+{"verdict":"approve","summary":"real answer","findings":[]}
 \`\`\``);
     expect(parsed.summary).toBe('real answer');
+    expect(parsed.verdict).toBe('approve');
   });
 
   it('refuses to approve while reporting blocking findings', () => {

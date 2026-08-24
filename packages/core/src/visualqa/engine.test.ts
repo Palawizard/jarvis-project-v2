@@ -5,47 +5,34 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from '../config.js';
 import { openDb } from '../db/index.js';
-import { startDevServer, VisualQaEngine } from './engine.js';
+import { VisualQaEngine } from './engine.js';
 
-let server: http.Server | undefined;
+const servers: http.Server[] = [];
 const roots: string[] = [];
 
 afterEach(
   () =>
     new Promise<void>((resolve) => {
-      if (!server) return resolve();
-      server.close(() => resolve());
-      server = undefined;
-      for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+      Promise.all(
+        servers
+          .splice(0)
+          .map((server) => new Promise<void>((closed) => server.close(() => closed()))),
+      ).then(() => {
+        for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+        resolve();
+      });
     }),
 );
 
-describe('candidate dev server isolation', () => {
-  it('refuses to capture an application that was already using the configured URL', async () => {
-    server = http.createServer((_request, response) => response.end('control plane'));
-    const activeServer = server;
-    await new Promise<void>((resolve) => activeServer.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    if (!address || typeof address === 'string') throw new Error('test server did not bind');
-
-    await expect(
-      startDevServer({
-        command: 'node -e "process.exit(1)"',
-        cwd: process.cwd(),
-        url: `http://127.0.0.1:${address.port}`,
-      }),
-    ).rejects.toThrow('already reachable');
-  });
-});
-
 describe('deterministic visual interactions', () => {
   it('captures desktop/mobile after goto, fill, click, wait and screenshot steps', async () => {
-    server = http.createServer((_request, response) => {
+    const server = http.createServer((_request, response) => {
       response.setHeader('content-type', 'text/html');
       response.end(
         `<!doctype html><input id="name"><button id="go" onclick="document.body.dataset.ready='yes'">Go</button>`,
       );
     });
+    servers.push(server);
     const activeServer = server;
     await new Promise<void>((resolve) => activeServer.listen(0, '127.0.0.1', resolve));
     const address = activeServer.address();
@@ -104,11 +91,148 @@ describe('deterministic visual interactions', () => {
       ).toEqual([{ scenario_name: 'tools', head_ref: 'a'.repeat(40) }]);
       expect(
         fs
-          .readdirSync(path.join(root, 'artifacts', 'job-tools', 'visual-qa'))
+          .readdirSync(path.dirname(shots[0]?.screenshotPath ?? ''))
           .filter((name) => name.startsWith('ready-')),
       ).toHaveLength(2);
     } finally {
       db.close();
     }
   });
+
+  it.each([
+    ['initial redirect', '/redirect-cross', []],
+    ['link click', '/click', [{ action: 'click', selector: '#escape' }]],
+    ['form navigation', '/form', [{ action: 'click', selector: '#submit' }]],
+    ['JavaScript navigation', '/js', [{ action: 'click', selector: '#escape' }]],
+  ] as const)('fails a scenario on cross-origin %s', async (_name, route, interactions) => {
+    const target = http.createServer((_request, response) => response.end('<h1>escaped</h1>'));
+    servers.push(target);
+    await new Promise<void>((resolve) => target.listen(0, '127.0.0.1', resolve));
+    const targetAddress = target.address();
+    if (!targetAddress || typeof targetAddress === 'string') throw new Error('target did not bind');
+    const escaped = `http://127.0.0.1:${targetAddress.port}/escaped`;
+    const candidate = http.createServer((request, response) => {
+      if (request.url === '/redirect-cross') {
+        response.writeHead(302, { location: escaped }).end();
+      } else if (request.url === '/click') {
+        response.end(`<a id="escape" href="${escaped}">escape</a>`);
+      } else if (request.url === '/form') {
+        response.end(`<form action="${escaped}"><button id="submit">submit</button></form>`);
+      } else {
+        response.end(`<button id="escape" onclick="location.href='${escaped}'">escape</button>`);
+      }
+    });
+    servers.push(candidate);
+    await new Promise<void>((resolve) => candidate.listen(0, '127.0.0.1', resolve));
+    const address = candidate.address();
+    if (!address || typeof address === 'string') throw new Error('candidate did not bind');
+    const { engine, db } = visualFixture();
+    try {
+      const shots = await engine.capture({
+        jobId: 'job-tools',
+        projectId: 'project-tools',
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        routes: [route],
+        scenarios: [
+          { name: _name, route, interactions: [...interactions], viewports: ['desktop'] },
+        ],
+      });
+      expect(shots[0]?.status).toBe('failed');
+      expect(shots[0]?.screenshotPath).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('allows a same-origin redirect', async () => {
+    const candidate = http.createServer((request, response) => {
+      if (request.url === '/redirect-same') response.writeHead(302, { location: '/final' }).end();
+      else response.end('<h1>same origin</h1>');
+    });
+    servers.push(candidate);
+    await new Promise<void>((resolve) => candidate.listen(0, '127.0.0.1', resolve));
+    const address = candidate.address();
+    if (!address || typeof address === 'string') throw new Error('candidate did not bind');
+    const { engine, db } = visualFixture();
+    try {
+      const shots = await engine.capture({
+        jobId: 'job-tools',
+        projectId: 'project-tools',
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        routes: ['/redirect-same'],
+        viewports: ['desktop'],
+      });
+      expect(shots[0]?.status).toBe('captured');
+    } finally {
+      db.close();
+    }
+  });
+
+  it.each(['..\\..\\escape', '../../escape', '..%2f..%2fescape', '..\\../escape'])(
+    'rejects an unowned artifact identity %s before browser launch',
+    async (identity) => {
+      const { engine, db, artifactsDir } = visualFixture();
+      const outside = path.resolve(artifactsDir, '..', '..', 'escape');
+      const existed = fs.existsSync(outside);
+      try {
+        await expect(
+          engine.capture({
+            jobId: identity,
+            baseUrl: 'http://127.0.0.1:1',
+            routes: ['/'],
+          }),
+        ).rejects.toThrow('job does not exist');
+        expect(fs.existsSync(outside)).toBe(existed);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it('rejects a mismatched existing job and project before creating artifacts', async () => {
+    const { engine, db, artifactsDir } = visualFixture();
+    try {
+      db.prepare(
+        `INSERT INTO projects
+          (id,name,root_path,default_branch,stack,commands,is_self,config,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      ).run('other-project', 'other', '.', 'main', '{}', '{}', 0, '{}', 'now', 'now');
+      await expect(
+        engine.capture({
+          jobId: 'job-tools',
+          projectId: 'other-project',
+          baseUrl: 'http://127.0.0.1:1',
+          routes: ['/'],
+        }),
+      ).rejects.toThrow('job/project mismatch');
+      expect(fs.existsSync(artifactsDir)).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
 });
+
+function visualFixture(): {
+  engine: VisualQaEngine;
+  db: ReturnType<typeof openDb>;
+  artifactsDir: string;
+} {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-visual-confined-'));
+  roots.push(root);
+  const config = loadConfig({ home: root, dbPath: ':memory:' });
+  const db = openDb(config);
+  db.prepare(
+    `INSERT INTO projects
+      (id,name,root_path,default_branch,stack,commands,is_self,config,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+  ).run('project-tools', 'tools-fixture', root, 'main', '{}', '{}', 0, '{}', 'now', 'now');
+  db.prepare(
+    `INSERT INTO jobs (id,project_id,request,goal,stage,status,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?)`,
+  ).run('job-tools', 'project-tools', 'capture', 'capture', 'visual_qa', 'running', 'now', 'now');
+  return {
+    engine: new VisualQaEngine(db, config.artifactsDir),
+    db,
+    artifactsDir: config.artifactsDir,
+  };
+}

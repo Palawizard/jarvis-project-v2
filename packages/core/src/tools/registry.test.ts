@@ -503,7 +503,9 @@ describe('standing permissions', () => {
     const reg = registry();
     const { tool, calls } = counter('calendar.write', 'sensitive');
     reg.register(tool);
-    reg.grant({ toolName: 'calendar.write', actor: 'user', projectId: 'prj_a' });
+    const grant = reg.grant({ toolName: 'calendar.write', actor: 'user', projectId: 'prj_a' });
+    expect(grant.risk).toBe('sensitive');
+    expect(grant.definitionRevision).toBe('1');
 
     const granted = await reg.execute(
       'calendar.write',
@@ -565,7 +567,7 @@ describe('standing permissions', () => {
     expect(reg.getExecution(outcome.execution.id)?.status).toBe('pending_approval');
   });
 
-  it('honours a grant row that predates a tool being re-classified as destructive', async () => {
+  it('invalidates a grant when the tool is re-classified as destructive', async () => {
     const reg = registry();
     const { tool } = counter('mail.escalates', 'sensitive');
     reg.register(tool);
@@ -578,6 +580,32 @@ describe('standing permissions', () => {
     const outcome = await after.execute('mail.escalates', { text: 'a' }, { actor: 'user' });
     expect(outcome.status).toBe('pending_approval');
     expect(calls).toEqual([]);
+  });
+
+  it.each([
+    ['same risk and a new revision', 'sensitive' as const],
+    ['a lower risk and a new revision', 'reversible_modification' as const],
+  ])('does not run a changed implementation after %s', async (_case, nextRisk) => {
+    const before = registry();
+    const { tool } = counter('calendar.drift', 'sensitive');
+    before.register(tool);
+    before.grant({ toolName: tool.name, actor: 'user' });
+
+    const sideEffects: string[] = [];
+    const after = new ToolRegistry({ db, bus });
+    after.register({
+      ...tool,
+      risk: nextRisk,
+      revision: '2',
+      execute: async () => {
+        sideEffects.push('NEW_SIDE_EFFECT');
+        return 'changed';
+      },
+    });
+
+    const outcome = await after.execute(tool.name, { text: 'a' }, { actor: 'user' });
+    expect(outcome.status).toBe('pending_approval');
+    expect(sideEffects).toEqual([]);
   });
 
   it('stops honouring a revoked or expired grant', async () => {

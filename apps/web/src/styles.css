@@ -623,6 +623,29 @@ code {
   color: var(--accent);
 }
 
+.pairing-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.pairing-card {
+  width: min(440px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.pairing-card .brand {
+  padding: 0;
+}
+.pairing-card h1,
+.pairing-card p {
+  margin: 0;
+}
+
 @media (max-width: 760px) {
   /* The nav bar is sized by its content; only the main column absorbs the
      leftover height. Without this the auto rows share the free space and the

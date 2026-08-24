@@ -50,11 +50,9 @@ Three rules hold regardless of configuration, grants, or call arguments:
 
 ## Standing permissions ("always allow this here")
 
-A grant is `(tool, actor, project?, session?)` with an optional expiry. A `NULL`
+A grant is `(tool, actor, approved risk, approved definition revision, project?, session?)` with an optional expiry. A `NULL`
 scope column means "any"; a set one must match exactly, so a permission granted
-for one project never applies to another. Grants are matched at decision time
-against the tool's *current* risk, so re-classifying a tool as riskier
-invalidates every existing grant for it without any migration.
+for one project never applies to another. A grant matches only when both risk and explicit definition revision equal the currently registered tool. Drift never updates a grant; it requires a fresh permission, including when a risk change would otherwise lower the base policy. Schema-v5 migration revokes legacy grants lacking either integrity field rather than inferring a safe revision.
 
 Revocation keeps the row, so a past execution can still point at the permission
 that authorised it.
@@ -133,12 +131,12 @@ so redaction there is lossless.
   so there is no object on which `.execute()` can be called behind the policy.
   A unit test asserts no such accessor reappears.
 - **Grant escalation.** Grants are re-evaluated against the live tool
-  definition, cannot lift a `deny`, and cannot cover `destructive`.
+  definition, bind risk and definition revision, cannot lift a `deny`, and cannot cover `destructive`.
 - **Approval swapping.** Approval takes an id and no payload, and replays the
   stored canonical arguments. Approving a benign request cannot be turned into
   approving a different one. Risk, required definition revision, and canonical
   payload hash must all match; legacy pending rows without them expire during
-  schema-v4 migration.
+  schema-v4 migration and legacy grants without identity are revoked by schema v5.
 - **Approval replay.** Claiming a pending row is a conditional `UPDATE ... WHERE
   status='pending_approval'`, so two concurrent approvals cannot both run it.
 - **Risk downgrade by tampering.** The decision reads risk from the registered
@@ -147,32 +145,13 @@ so redaction there is lossless.
   results are redacted.
 - **Silent replay after a crash.** Interrupted actions are never auto-resumed.
 
-### Residual, and honestly so
+### Human HTTP authority and residual OS isolation
 
-**Any local process running as this user can act as the user.** The orchestrator
-binds to `127.0.0.1` with no authentication, which is the pre-existing trust
-model for the whole API. Stripping `JARVIS_PORT` from agent child environments
-raises the cost of finding it and does not close this — the default port is
-guessable. Closing it is a blocking milestone in `docs/roadmap.md`, required
-before any `sensitive` tool is enabled for the agent actor. An agent child process launched by Jarvis inherits the
-environment and could, in principle, reach the loopback port and approve its own
-request. No token scheme fixes this: a token readable by the UI is readable by
-any process with the same uid.
+Loopback is explicitly untrusted. All private reads and human-authority mutations require the random browser control credential; mutations additionally enforce exact Origin. Pairing uses an in-memory one-use secret printed only to the human terminal. Only its control-token hash persists. The UI keeps the raw credential in origin-scoped storage and sends a custom header, never a cookie, URL, SSE query, child environment, log, event, worktree, or supervisor request. Therefore a same-user loopback client without the browser capability cannot call a route that hardcodes `actor:user`.
 
-What this layer does buy against that:
+`POST /api/auth/revoke` invalidates the persisted credential. Clear the browser's `jarvis-human-control` local-storage entry, restart Jarvis, and enter the newly printed bootstrap to pair again. An already-paired startup does not mint another bootstrap. Static UI, `/health`, `/api/auth/status`, `/api/auth/pair`, and CORS `OPTIONS` preflight are the only unauthenticated surfaces.
 
-- The *supported* agent path — the in-process one, where `actor: 'agent'` is set
-  by Jarvis code — has no route to `sensitive` or `destructive` at all.
-- An agent going around it has to make a second, differently-shaped call, and
-  both the request and the approval are recorded, attributable, and visible.
-
-The real fix is OS-level isolation of agent children (a restricted user, or a
-container without loopback access). `AgentIsolationBackend.preflight()` is the
-explicit future backend contract, and `GET /api/tools/capabilities` reports its
-state. No backend is enabled today, and there is no environment flag that can
-pretend otherwise. Sensitive agent tools therefore remain denied. Until a
-backend can verify process identity, filesystem/credential boundaries, and
-control-plane network denial, treat "an agent could reach the HTTP API" as true.
+This does not claim verified OS process isolation: same-OS-user malware that can inspect/control the human browser or read its profile is outside this browser-capability boundary. `AgentIsolationBackend.preflight()` remains false until a restricted user/container can verify process, filesystem/credential, and control-plane network separation. Sensitive agent tools therefore remain denied even though ordinary agent/candidate loopback impersonation is closed.
 
 Two smaller residual notes:
 

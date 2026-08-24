@@ -1,11 +1,10 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Db } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { killTree } from '../agents/spawn.js';
 import type { VisualInteraction, VisualQaScenario } from '../projects/service.js';
 
 const log = createLogger('visual-qa');
@@ -81,11 +80,12 @@ export class VisualQaEngine {
       payload: { baseUrl: opts.baseUrl, scenarios: scenarios.map((scenario) => scenario.name) },
     });
 
-    const outDir = path.join(
-      this.artifactsDir,
-      opts.jobId ?? opts.projectId ?? 'adhoc',
-      'visual-qa',
-    );
+    const artifactRoot = path.resolve(this.artifactsDir);
+    const identity = this.artifactIdentity(opts.jobId, opts.projectId);
+    const outDir = path.resolve(artifactRoot, identity, 'visual-qa');
+    if (outDir !== artifactRoot && !outDir.startsWith(artifactRoot + path.sep)) {
+      throw new Error('visual artifact destination escaped the artifact root');
+    }
     fs.mkdirSync(outDir, { recursive: true });
 
     const shots: VisualQaShot[] = [];
@@ -138,6 +138,24 @@ export class VisualQaEngine {
     return shots;
   }
 
+  private artifactIdentity(jobId?: string | null, projectId?: string | null): string {
+    if (jobId) {
+      const job = this.db.prepare('SELECT id, project_id FROM jobs WHERE id=?').get(jobId) as
+        { id: string; project_id: string } | undefined;
+      if (!job) throw new Error('visual QA job does not exist');
+      if (projectId && projectId !== job.project_id)
+        throw new Error('visual QA job/project mismatch');
+      return `job-${stableArtifactId(job.id)}`;
+    }
+    if (projectId) {
+      const project = this.db.prepare('SELECT id FROM projects WHERE id=?').get(projectId) as
+        { id: string } | undefined;
+      if (!project) throw new Error('visual QA project does not exist');
+      return `project-${stableArtifactId(project.id)}`;
+    }
+    return `run-${newId('visual')}`;
+  }
+
   private async captureRoute(
     context: import('playwright').BrowserContext,
     opts: {
@@ -155,6 +173,7 @@ export class VisualQaEngine {
     const consoleErrors: string[] = [];
     const networkFailures: string[] = [];
     const page = await context.newPage();
+    const navigation = await confineNavigation(page, new URL(opts.baseUrl).origin);
 
     page.on('console', (msg) => {
       if (msg.type() === 'error') consoleErrors.push(msg.text().slice(0, 500));
@@ -180,15 +199,18 @@ export class VisualQaEngine {
 
     try {
       await page.goto(url, { waitUntil: 'networkidle', timeout: 30_000 });
+      navigation.assert();
       await runInteractions(
         page,
         opts.baseUrl,
         scenario.interactions ?? opts.interactions ?? [],
         outDir,
         viewport,
+        navigation.assert,
       );
       // Let entry animations settle so screenshots are comparable run to run.
       await page.waitForTimeout(400);
+      navigation.assert();
       await page.screenshot({ path: screenshotPath, fullPage: true });
       await page.close();
       const shot = this.persist({
@@ -220,6 +242,7 @@ export class VisualQaEngine {
       return shot;
     } catch (error) {
       await page.close().catch(() => undefined);
+      if (fs.existsSync(screenshotPath)) fs.rmSync(screenshotPath);
       return this.persist({
         jobId: opts.jobId ?? null,
         projectId: opts.projectId ?? null,
@@ -366,6 +389,7 @@ async function runInteractions(
   interactions: VisualInteraction[],
   outDir: string,
   viewport: 'desktop' | 'mobile',
+  assertConfined: () => void,
 ): Promise<void> {
   if (interactions.length > 50) throw new Error('visual interaction script exceeds 50 actions');
   let screenshotIndex = 0;
@@ -376,12 +400,16 @@ async function runInteractions(
           waitUntil: 'networkidle',
           timeout: 30_000,
         });
+        assertConfined();
         break;
       case 'click':
         await page.locator(step.selector).click({ timeout: 15_000 });
+        await page.waitForTimeout(0);
+        assertConfined();
         break;
       case 'fill':
         await page.locator(step.selector).fill(step.value, { timeout: 15_000 });
+        assertConfined();
         break;
       case 'wait':
         if (step.selector) {
@@ -391,17 +419,72 @@ async function runInteractions(
         } else {
           await page.waitForTimeout(Math.min(Math.max(step.timeoutMs ?? 250, 0), 30_000));
         }
+        assertConfined();
         break;
       case 'screenshot': {
+        assertConfined();
         const safeName = (step.name ?? `step-${++screenshotIndex}`).replace(/[^a-z0-9_-]+/gi, '_');
         await page.screenshot({
           path: path.join(outDir, `${safeName}-${viewport}.png`),
           fullPage: true,
         });
+        assertConfined();
         break;
       }
     }
   }
+}
+
+async function confineNavigation(
+  page: import('playwright').Page,
+  expectedOrigin: string,
+): Promise<{ assert(): void }> {
+  let violation: string | null = null;
+  const reject = (url: string, kind: string) => {
+    violation ??= `${kind} escaped candidate origin: ${url}`;
+  };
+  await page.route('**/*', async (route) => {
+    const request = route.request();
+    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+      try {
+        if (new URL(request.url()).origin !== expectedOrigin) {
+          reject(request.url(), 'main-frame navigation');
+          await route.abort('blockedbyclient');
+          return;
+        }
+      } catch {
+        reject(request.url(), 'invalid navigation');
+        await route.abort('blockedbyclient');
+        return;
+      }
+    }
+    await route.continue();
+  });
+  page.on('framenavigated', (frame) => {
+    if (frame !== page.mainFrame() || frame.url() === 'about:blank') return;
+    try {
+      if (new URL(frame.url()).origin !== expectedOrigin) reject(frame.url(), 'main frame');
+    } catch {
+      reject(frame.url(), 'invalid main frame');
+    }
+  });
+  page.on('popup', (popup) => {
+    reject(popup.url(), 'popup');
+    void popup.close();
+  });
+  return {
+    assert() {
+      if (violation) throw new Error(violation);
+      const current = page.url();
+      if (current !== 'about:blank' && new URL(current).origin !== expectedOrigin) {
+        throw new Error(`page escaped candidate origin: ${current}`);
+      }
+    },
+  };
+}
+
+function stableArtifactId(id: string): string {
+  return createHash('sha256').update(id, 'utf8').digest('hex').slice(0, 32);
 }
 
 function confinedCandidateUrl(baseUrl: string, route: string): string {
@@ -412,78 +495,4 @@ function confinedCandidateUrl(baseUrl: string, route: string): string {
   const url = new URL(route, base);
   if (url.origin !== base.origin) throw new Error('visual QA route escaped the candidate origin');
   return url.toString();
-}
-
-/**
- * Start a project's dev server and wait until it actually answers.
- *
- * Returns a stop() that kills the whole process tree — a leaked dev server would
- * hold the port and silently break every later visual QA run.
- */
-export async function startDevServer(opts: {
-  command: string;
-  cwd: string;
-  url: string;
-  timeoutMs?: number;
-  signal?: AbortSignal;
-}): Promise<{ stop: () => Promise<void>; url: string; logs: string[] }> {
-  if (opts.signal?.aborted) throw new Error('dev server start cancelled');
-  try {
-    await fetch(opts.url, { signal: AbortSignal.timeout(1000) });
-    throw new Error(
-      `dev URL ${opts.url} was already reachable before candidate startup; refusing to capture the wrong application`,
-    );
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('already reachable')) throw error;
-    // Expected: the candidate URL must be free before its process starts.
-  }
-
-  const logs: string[] = [];
-  const child: ChildProcess = spawn(opts.command, {
-    cwd: opts.cwd,
-    shell: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, FORCE_COLOR: '0', BROWSER: 'none' },
-    windowsHide: true,
-    detached: process.platform !== 'win32',
-  });
-  const capture = (chunk: Buffer) => {
-    logs.push(chunk.toString());
-    if (logs.length > 200) logs.shift();
-  };
-  child.stdout?.on('data', capture);
-  child.stderr?.on('data', capture);
-
-  const stop = async () => {
-    await killTree(child);
-  };
-
-  const deadline = Date.now() + (opts.timeoutMs ?? 90_000);
-  let exited = false;
-  child.on('exit', () => {
-    exited = true;
-  });
-
-  while (Date.now() < deadline) {
-    if (opts.signal?.aborted) {
-      await stop();
-      throw new Error('dev server start cancelled');
-    }
-    if (exited) {
-      throw new Error(
-        `dev server exited before becoming reachable:\n${logs.join('').slice(-2000)}`,
-      );
-    }
-    try {
-      const response = await fetch(opts.url, { signal: AbortSignal.timeout(3000) });
-      if (response.status < 500) return { stop, url: opts.url, logs };
-    } catch {
-      /* not up yet */
-    }
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  await stop();
-  throw new Error(
-    `dev server did not become reachable at ${opts.url}:\n${logs.join('').slice(-2000)}`,
-  );
 }

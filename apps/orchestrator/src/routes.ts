@@ -45,6 +45,48 @@ export function createRoutes(jarvis: Jarvis): Hono {
   const git = new GitWorkspace(jarvis.config.worktreesDir);
 
   const fail = (message: string, status = 400) => Response.json({ error: message }, { status });
+  const allowedOrigin = (origin: string | undefined) =>
+    Boolean(origin && jarvis.config.controlOrigins.includes(origin));
+
+  // Loopback is not authentication. Only pairing/status and preflight bypass
+  // the browser capability; every other /api route, including reads and SSE,
+  // is private.
+  app.use('/api/*', async (c, next) => {
+    const path = c.req.path;
+    if (c.req.method === 'OPTIONS' || path === '/api/auth/status' || path === '/api/auth/pair') {
+      await next();
+      return;
+    }
+    if (!jarvis.control.authenticated(c.req.header('x-jarvis-control'))) {
+      return c.json({ error: 'human control authentication required' }, 401);
+    }
+    if (!['GET', 'HEAD'].includes(c.req.method) && !allowedOrigin(c.req.header('origin'))) {
+      return c.json({ error: 'human control origin rejected' }, 403);
+    }
+    await next();
+  });
+
+  app.get('/api/auth/status', (c) =>
+    c.json({
+      authenticated: jarvis.control.authenticated(c.req.header('x-jarvis-control')),
+      paired: jarvis.control.paired(),
+    }),
+  );
+
+  app.post('/api/auth/pair', async (c) => {
+    if (!allowedOrigin(c.req.header('origin'))) return fail('pairing origin rejected', 403);
+    const body = (await c.req.json().catch(() => ({}))) as { bootstrap?: unknown };
+    if (typeof body.bootstrap !== 'string') return fail('pairing token is required', 401);
+    const credential = jarvis.control.pair(body.bootstrap);
+    return credential
+      ? c.json({ credential })
+      : fail('pairing token is invalid, expired, or already used', 401);
+  });
+
+  app.post('/api/auth/revoke', (c) => {
+    jarvis.control.revoke();
+    return c.json({ revoked: true, restartRequired: true });
+  });
 
   const health = async () => {
     let db: 'ok' | 'error' = 'ok';
@@ -111,8 +153,8 @@ export function createRoutes(jarvis: Jarvis): Hono {
             const parsed = JSON.parse(next) as { id?: number; type: string };
             if (parsed.id && parsed.id <= lastId) continue;
             lastId = parsed.id ?? lastId;
-            // Default SSE messages are intentionally unnamed: EventSource's
-            // onmessage receives every normalized Jarvis event.
+            // Default SSE messages are intentionally unnamed: the authenticated
+            // fetch-stream consumer handles every normalized Jarvis event.
             await stream.writeSSE({ id: String(parsed.id ?? ''), data: next });
           } else {
             // Comment frames keep proxies from closing an idle connection.
@@ -678,13 +720,23 @@ export function createRoutes(jarvis: Jarvis): Hono {
       routes?: string[];
     };
     if (!body.baseUrl) return fail('baseUrl is required');
-    const shots = await jarvis.visualQa.capture({
-      ...(body.projectId ? { projectId: body.projectId } : {}),
-      ...(body.jobId ? { jobId: body.jobId } : {}),
-      baseUrl: body.baseUrl,
-      routes: body.routes?.length ? body.routes : ['/'],
-    });
-    return c.json(shots);
+    if (!body.jobId && !body.projectId) return fail('jobId or projectId is required');
+    const job = body.jobId ? jarvis.jobs.get(body.jobId) : null;
+    if (body.jobId && !job) return fail('job not found', 404);
+    const projectId = body.projectId ?? job?.projectId;
+    if (!projectId || !jarvis.projects.get(projectId)) return fail('project not found', 404);
+    if (job && job.projectId !== projectId) return fail('job/project mismatch', 409);
+    try {
+      const shots = await jarvis.visualQa.capture({
+        projectId,
+        ...(body.jobId ? { jobId: body.jobId } : {}),
+        baseUrl: body.baseUrl,
+        routes: body.routes?.length ? body.routes : ['/'],
+      });
+      return c.json(shots);
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 422);
+    }
   });
 
   /** Serve screenshots. Path-confined to the artifacts directory. */

@@ -26,6 +26,79 @@ export type Route =
   | { name: 'tools' };
 
 export function App() {
+  const [auth, setAuth] = useState<'checking' | 'locked' | 'authenticated'>('checking');
+  useEffect(() => {
+    const check = () =>
+      void api
+        .authStatus()
+        .then((status) => setAuth(status.authenticated ? 'authenticated' : 'locked'))
+        .catch(() => setAuth('locked'));
+    check();
+    window.addEventListener('jarvis-auth-failed', check);
+    return () => window.removeEventListener('jarvis-auth-failed', check);
+  }, []);
+
+  if (auth !== 'authenticated') {
+    return <PairingView checking={auth === 'checking'} onPaired={() => setAuth('authenticated')} />;
+  }
+  return <AuthenticatedApp />;
+}
+
+function PairingView({ checking, onPaired }: { checking: boolean; onPaired: () => void }) {
+  const [token, setToken] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const pair = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.pair(token.trim());
+      setToken('');
+      onPaired();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <main className="pairing-shell">
+      <section className="pairing-card" aria-labelledby="pairing-title">
+        <div className="brand">
+          <span className="brand-dot" /> Jarvis
+        </div>
+        <h1 id="pairing-title">Human control locked</h1>
+        <p>Enter the one-time pairing token shown in the terminal that started Jarvis.</p>
+        <label htmlFor="pairing-token">Pairing token</label>
+        <input
+          id="pairing-token"
+          type="password"
+          autoComplete="off"
+          value={token}
+          disabled={checking || busy}
+          onChange={(event) => setToken(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && token.trim()) void pair();
+          }}
+        />
+        <button
+          className="btn primary"
+          disabled={checking || busy || !token.trim()}
+          onClick={() => void pair()}
+        >
+          {checking ? 'Checking…' : busy ? 'Pairing…' : 'Pair this browser'}
+        </button>
+        {error && (
+          <div className="api-error" role="alert">
+            Authentication failed: {error}
+          </div>
+        )}
+      </section>
+    </main>
+  );
+}
+
+function AuthenticatedApp() {
   const [route, setRoute] = useState<Route>({ name: 'command' });
   const [theme, toggleTheme] = useTheme();
   const [lastEvent, setLastEvent] = useState<JarvisEvent | null>(null);

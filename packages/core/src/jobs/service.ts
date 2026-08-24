@@ -4,6 +4,16 @@ import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { ProviderId } from '../agents/types.js';
 import type { VisualQaScenario } from '../projects/service.js';
+import type { ReviewFinding } from '../review/engine.js';
+import type { VisualReviewFinding } from '../visualqa/engine.js';
+
+export type RepairKind = 'verification' | 'code_review' | 'visual';
+export interface RepairCheckpoint {
+  kind: RepairKind;
+  verification?: { resultIds: string[]; cycle: number; failureSummary: string };
+  review?: { id: string; findings: ReviewFinding[] };
+  visual?: { shotIds: string[]; findings: VisualReviewFinding[]; cycle: number };
+}
 import {
   assertTransition,
   isTerminal,
@@ -31,6 +41,9 @@ export interface Job {
   visualFixCycles: number;
   resumeStage: JobStage | null;
   pauseReason: string | null;
+  restartReason: string | null;
+  repairKind: RepairKind | null;
+  repairCheckpoint: RepairCheckpoint | null;
   lastProvider: ProviderId | null;
   resumeSessionId: string | null;
   reviewedHead: string | null;
@@ -84,6 +97,9 @@ function rowToJob(row: Row): Job {
     visualFixCycles: Number(row.visual_fix_cycles ?? 0),
     resumeStage: (row.resume_stage as JobStage) ?? null,
     pauseReason: (row.pause_reason as string) ?? null,
+    restartReason: (row.restart_reason as string) ?? null,
+    repairKind: (row.repair_kind as RepairKind) ?? null,
+    repairCheckpoint: parseJson(row.repair_checkpoint as string, null as RepairCheckpoint | null),
     lastProvider: (row.last_provider as ProviderId) ?? null,
     resumeSessionId: (row.resume_session_id as string) ?? null,
     reviewedHead: (row.reviewed_head as string) ?? null,
@@ -165,6 +181,9 @@ export class JobService {
       visualFixCycles: 0,
       resumeStage: null,
       pauseReason: null,
+      restartReason: null,
+      repairKind: null,
+      repairCheckpoint: null,
       lastProvider: null,
       resumeSessionId: null,
       reviewedHead: null,
@@ -253,7 +272,8 @@ export class JobService {
       .prepare(
         `UPDATE jobs SET stage=?, status=?, error=?, branch=?, worktree_path=?, base_ref=?, head_ref=?,
           fix_cycles=?, review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?,
-          last_provider=?, resume_session_id=?, reviewed_head=?, visual_head=?, candidate_base_sha=?,
+          restart_reason=?, repair_kind=?, repair_checkpoint=?, last_provider=?, resume_session_id=?,
+          reviewed_head=?, visual_head=?, candidate_base_sha=?,
           candidate_source_sha=?, validation_only=?, visual_qa_config=?, episode_id=?, goal=?,
           acceptance=?, updated_at=?, finished_at=? WHERE id=?`,
       )
@@ -270,6 +290,9 @@ export class JobService {
         next.visualFixCycles,
         next.resumeStage,
         next.pauseReason,
+        next.restartReason,
+        next.repairKind,
+        next.repairCheckpoint ? JSON.stringify(next.repairCheckpoint) : null,
         next.lastProvider,
         next.resumeSessionId,
         next.reviewedHead,
@@ -309,7 +332,8 @@ export class JobService {
       .prepare(
         `UPDATE jobs SET error=?, branch=?, worktree_path=?, base_ref=?, head_ref=?, fix_cycles=?,
           review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?, last_provider=?,
-          resume_session_id=?, reviewed_head=?, visual_head=?, candidate_base_sha=?,
+          restart_reason=?, repair_kind=?, repair_checkpoint=?, resume_session_id=?, reviewed_head=?,
+          visual_head=?, candidate_base_sha=?,
           candidate_source_sha=?, validation_only=?, visual_qa_config=?, episode_id=?, goal=?,
           acceptance=?, updated_at=? WHERE id=?`,
       )
@@ -325,6 +349,9 @@ export class JobService {
         next.resumeStage,
         next.pauseReason,
         next.lastProvider,
+        next.restartReason,
+        next.repairKind,
+        next.repairCheckpoint ? JSON.stringify(next.repairCheckpoint) : null,
         next.resumeSessionId,
         next.reviewedHead,
         next.visualHead,
@@ -453,16 +480,10 @@ export class JobService {
     for (const job of stale) {
       this.db
         .prepare(
-          `UPDATE jobs SET stage='paused', status='paused', resume_stage=?, pause_reason=?, error=?,
+          `UPDATE jobs SET stage='paused', status='paused', resume_stage=?, restart_reason=?,
              updated_at=?, finished_at=NULL WHERE id=?`,
         )
-        .run(
-          job.stage,
-          'orchestrator_restart',
-          `Orchestrator restarted during stage "${job.stage}". Worktree preserved; resume after validation.`,
-          now,
-          job.id,
-        );
+        .run(job.stage, 'orchestrator_restart', now, job.id);
       this.bus.emit({
         type: 'system.recovery',
         jobId: job.id,

@@ -23,7 +23,17 @@ function setup() {
     memory: { ...base.memory, embeddingsEnabled: false },
   });
   open.push(jarvis);
-  return { jarvis, app: createRoutes(jarvis), home };
+  const credential = jarvis.control.pair(jarvis.control.createBootstrap());
+  if (!credential) throw new Error('test pairing failed');
+  return {
+    jarvis,
+    app: createRoutes(jarvis),
+    home,
+    headers: {
+      origin: 'http://127.0.0.1:5199',
+      'x-jarvis-control': credential,
+    },
+  };
 }
 
 async function store(jarvis: Jarvis, scopeId: string | null, content: string) {
@@ -39,19 +49,27 @@ async function store(jarvis: Jarvis, scopeId: string | null, content: string) {
   return outcome.memory;
 }
 
-async function approve(app: ReturnType<typeof createRoutes>, id: string) {
-  const response = await app.request(`/api/tool-executions/${id}/approve`, { method: 'POST' });
+async function approve(
+  app: ReturnType<typeof createRoutes>,
+  id: string,
+  headers: Record<string, string>,
+) {
+  const response = await app.request(`/api/tool-executions/${id}/approve`, {
+    method: 'POST',
+    headers,
+  });
   expect(response.status).toBe(200);
   return (await response.json()) as ToolExecutionOutcome;
 }
 
 describe('destructive memory HTTP routes', () => {
   it('hard-purges one memory only after ToolRegistry approval', async () => {
-    const { jarvis, app } = setup();
+    const { jarvis, app, headers } = setup();
     const memory = await store(jarvis, null, 'permanent test memory');
 
     const response = await app.request(`/api/memory/${memory.id}?hard=true`, {
       method: 'DELETE',
+      headers,
     });
     const requested = (await response.json()) as ToolExecutionOutcome;
     expect(response.status).toBe(200);
@@ -66,7 +84,7 @@ describe('destructive memory HTTP routes', () => {
       input: { id: memory.id },
     });
 
-    const approved = await approve(app, requested.execution.id);
+    const approved = await approve(app, requested.execution.id, headers);
     expect(approved.status).toBe('succeeded');
     expect(jarvis.memory.get(memory.id)).toBeNull();
     expect(jarvis.tools.getExecution(requested.execution.id)).toMatchObject({
@@ -76,7 +94,7 @@ describe('destructive memory HTTP routes', () => {
   });
 
   it('purges only the requested project after ToolRegistry approval', async () => {
-    const { jarvis, app, home } = setup();
+    const { jarvis, app, home, headers } = setup();
     const firstRoot = path.join(home, 'first');
     const secondRoot = path.join(home, 'second');
     fs.mkdirSync(firstRoot);
@@ -91,7 +109,10 @@ describe('destructive memory HTTP routes', () => {
     ]);
     const unrelated = await store(jarvis, second.id, 'second project memory');
 
-    const response = await app.request(`/api/projects/${first.id}/memory`, { method: 'DELETE' });
+    const response = await app.request(`/api/projects/${first.id}/memory`, {
+      method: 'DELETE',
+      headers,
+    });
     const requested = (await response.json()) as ToolExecutionOutcome;
     expect(response.status).toBe(200);
     expect(requested.status).toBe('pending_approval');
@@ -107,7 +128,7 @@ describe('destructive memory HTTP routes', () => {
       input: { projectId: first.id },
     });
 
-    const approved = await approve(app, requested.execution.id);
+    const approved = await approve(app, requested.execution.id, headers);
     expect(approved.status).toBe('succeeded');
     for (const memory of target) expect(jarvis.memory.get(memory.id)).toBeNull();
     expect(jarvis.memory.get(unrelated.id)).not.toBeNull();
@@ -118,11 +139,11 @@ describe('destructive memory HTTP routes', () => {
   });
 
   it('refuses standing grants for both destructive purge tools', async () => {
-    const { app } = setup();
+    const { app, headers } = setup();
     for (const toolName of ['memory.purge', 'memory.purge_project']) {
       const response = await app.request('/api/tool-grants', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { ...headers, 'content-type': 'application/json' },
         body: JSON.stringify({ toolName }),
       });
       expect(response.status).toBe(422);

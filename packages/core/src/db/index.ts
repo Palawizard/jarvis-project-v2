@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export const MIGRATIONS = new Map<number, string>([
   [
@@ -149,6 +149,25 @@ export const MIGRATIONS = new Map<number, string>([
     CREATE INDEX idx_tool_executions_parent ON tool_executions(parent_execution_id);
     CREATE INDEX idx_reviews_head ON reviews(job_id, head_ref);
     CREATE INDEX idx_visualqa_head ON visual_qa(job_id, head_ref);`,
+  ],
+  [
+    5,
+    `ALTER TABLE tool_grants ADD COLUMN risk TEXT;
+    ALTER TABLE tool_grants ADD COLUMN definition_revision TEXT;
+    UPDATE tool_grants SET revoked_at=COALESCE(revoked_at, created_at)
+      WHERE risk IS NULL OR definition_revision IS NULL;
+
+    ALTER TABLE verifications ADD COLUMN failure_kind TEXT NOT NULL DEFAULT 'none';
+    ALTER TABLE jobs ADD COLUMN repair_kind TEXT;
+    ALTER TABLE jobs ADD COLUMN repair_checkpoint TEXT;
+    ALTER TABLE jobs ADD COLUMN restart_reason TEXT;
+
+    CREATE TABLE human_control (
+      id              TEXT PRIMARY KEY CHECK (id = 'primary'),
+      credential_hash TEXT,
+      paired_at       TEXT,
+      updated_at      TEXT NOT NULL
+    );`,
   ],
 ]);
 

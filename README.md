@@ -21,6 +21,8 @@ pnpm dev
 
 Open <http://localhost:5199>. Runtime data defaults to `~/.jarvis`; set `JARVIS_HOME` to keep a separate instance. The API binds only to `127.0.0.1:4319`.
 
+On every orchestrator start, the controlling terminal prints a one-use pairing secret valid for ten minutes. Enter it in the locked UI. The resulting high-entropy control credential stays in that exact browser origin's `localStorage`; private API and authenticated fetch-stream event requests attach it in `X-Jarvis-Control`. Jarvis stores only its SHA-256 hash. It deliberately does not use an authentication cookie: HTTP cookies are not port-scoped, while candidate runtimes share the host on other ports.
+
 If one subscription is temporarily quota-limited, set `JARVIS_IMPLEMENTER_PROVIDER` and `JARVIS_REVIEWER_PROVIDER` to `claude` or `codex` before launch. The default remains Claude-first, and unavailable CLIs still fail closed.
 
 On first semantic-memory use, Jarvis downloads `Xenova/multilingual-e5-small` into its local model cache. Retrieval falls back to SQLite FTS5 if the model or runtime is unavailable and works offline after the model is cached.
@@ -61,7 +63,7 @@ The suite performs one tiny real edit per available CLI, strips API-key variable
 
 For Jarvis itself, normal application is disabled. Run Jarvis through `pnpm supervisor <config.json>`; an approved candidate must pass isolated preflight, then a second explicit activation request lets the external supervisor apply, rebuild, restart, healthcheck, and roll back on failure.
 
-Recoverable provider exhaustion, repair-budget exhaustion, and orchestrator restart pause the same Job with its worktree and checkpoint preserved. Resume validates repository/base/HEAD/cleanliness before rerunning the appropriate gate. Raw messages/events are audit history, not default model context.
+Recoverable provider exhaustion, repair-budget exhaustion, and orchestrator restart pause the same Job with its worktree and checkpoint preserved. Resume validates repository/base/exact expected HEAD/cleanliness before rerunning the exact persisted repair kind and evidence. An uncheckpointed planning worktree is reusable only at the pinned base SHA. Raw messages/events are audit history, not default model context.
 
 ## Documentation
 
@@ -81,4 +83,5 @@ Recoverable provider exhaustion, repair-budget exhaustion, and orchestrator rest
 - Jobs never stash, force refs, resolve conflicts, push, or overwrite dirty user work.
 - Self-activation requires explicit user action and the external supervisor boundary.
 - Visual QA images remain evidence-only unless a real CLI reviewer successfully inspected them.
-- Tools run through one gated boundary. Risk classification plus the caller's actor decides run/confirm/refuse; privilege is never read from a request payload; agents cannot reach sensitive or destructive tools; every attempt is recorded before it runs. The loopback API is unauthenticated, so a local process running as the same user still acts as the user — see [tool permissions](docs/tool-permissions.md).
+- Loopback is not authentication. Agent and candidate processes are hostile to the control plane: every private `/api/*` read or mutation requires the browser-held control credential, mutations also require the configured exact UI origin, and only `/health`, auth status/pairing, and CORS preflight remain unauthenticated. Bootstrap/control secrets are removed from child environments and never enter worktrees, URLs, events, or activation files.
+- Tools run through one gated boundary. Risk classification plus the authenticated call site's actor decides run/confirm/refuse; privilege is never read from a request payload; agents cannot reach sensitive or destructive tools; every attempt is recorded before it runs. Standing grants bind the registered risk and explicit definition revision.

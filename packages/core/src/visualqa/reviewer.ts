@@ -8,6 +8,7 @@ import type { ProviderId } from '../agents/types.js';
 import type { VisualQaShot, VisualReviewFinding } from './engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 import type { AgentRunResult } from '../agents/types.js';
+import { z } from 'zod';
 
 export interface VisualReview {
   verdict: 'pass' | 'needs_fix' | 'error';
@@ -61,6 +62,21 @@ const SCHEMA = {
     },
   },
 } as const;
+
+const VISUAL_FINDING_SCHEMA = z
+  .object({
+    severity: z.enum(['high', 'medium', 'low', 'info']),
+    scenarioName: z.string().trim().min(1),
+    route: z.string().min(1),
+    viewport: z.enum(['desktop', 'mobile']),
+    category: z.string().trim().min(1),
+    description: z.string().trim().min(1),
+    recommendation: z.string().trim().min(1),
+  })
+  .strict();
+const VISUAL_REVIEW_SCHEMA = z
+  .object({ verdict: z.enum(['pass', 'needs_fix']), findings: z.array(VISUAL_FINDING_SCHEMA) })
+  .strict();
 
 export class VisualReviewer {
   constructor(
@@ -167,7 +183,11 @@ export class VisualReviewer {
       );
     }
 
-    const parsed = parseVisualReview(result.structuredOutput);
+    const parsed = parseVisualReview(
+      result.structuredOutput,
+      opts.shots,
+      this.config.pipeline.visualBlockingSeverities,
+    );
     if (parsed.verdict === 'error') {
       const protocolError = `protocol failure: ${parsed.error ?? 'invalid visual review output'}`;
       this.agents.recordResult(routed.provider.id, { status: 'failed', error: protocolError });
@@ -208,41 +228,41 @@ export class VisualReviewer {
   }
 }
 
-export function parseVisualReview(value: unknown): VisualReview {
-  if (!value || typeof value !== 'object') {
-    return { verdict: 'error', findings: [], provider: null, model: null, error: 'invalid output' };
+export function parseVisualReview(
+  value: unknown,
+  shots: Pick<VisualQaShot, 'scenarioName' | 'route' | 'viewport' | 'status'>[] = [],
+  blockingSeverities: readonly string[] = ['high', 'medium'],
+): VisualReview {
+  const checked = VISUAL_REVIEW_SCHEMA.safeParse(value);
+  if (!checked.success) return invalidVisual(checked.error.issues[0]?.message);
+  const findings = checked.data.findings as VisualReviewFinding[];
+  const evidence = new Set(
+    shots
+      .filter((shot) => shot.status === 'captured')
+      .map((shot) => JSON.stringify([shot.scenarioName, shot.route, shot.viewport])),
+  );
+  if (
+    findings.some(
+      (finding) =>
+        !evidence.has(JSON.stringify([finding.scenarioName, finding.route, finding.viewport])),
+    )
+  ) {
+    return invalidVisual('finding references an unknown or failed visual shot');
   }
-  const raw = value as { verdict?: unknown; findings?: unknown };
-  const findings = Array.isArray(raw.findings)
-    ? raw.findings.flatMap((finding) => {
-        if (!finding || typeof finding !== 'object') return [];
-        const item = finding as Record<string, unknown>;
-        if (
-          !['high', 'medium', 'low', 'info'].includes(String(item.severity)) ||
-          !['desktop', 'mobile'].includes(String(item.viewport)) ||
-          typeof item.scenarioName !== 'string' ||
-          typeof item.route !== 'string' ||
-          typeof item.category !== 'string' ||
-          typeof item.description !== 'string' ||
-          typeof item.recommendation !== 'string'
-        )
-          return [];
-        return [item as unknown as VisualReviewFinding];
-      })
-    : [];
-  const claimed =
-    raw.verdict === 'pass' ? 'pass' : raw.verdict === 'needs_fix' ? 'needs_fix' : null;
-  if (!claimed) {
-    return { verdict: 'error', findings: [], provider: null, model: null, error: 'invalid output' };
+  const blocking = findings.filter((finding) => blockingSeverities.includes(finding.severity));
+  if (checked.data.verdict === 'needs_fix' && blocking.length === 0) {
+    return invalidVisual('needs_fix requires at least one configured blocking finding');
   }
   return {
-    verdict: findings.some((finding) => ['high', 'medium'].includes(finding.severity))
-      ? 'needs_fix'
-      : 'pass',
+    verdict: blocking.length ? 'needs_fix' : 'pass',
     findings,
     provider: null,
     model: null,
   };
+}
+
+function invalidVisual(error = 'invalid output'): VisualReview {
+  return { verdict: 'error', findings: [], provider: null, model: null, error };
 }
 
 function buildPrompt(opts: Pick<VisualReviewOptions, 'goal' | 'acceptance' | 'shots'>): string {

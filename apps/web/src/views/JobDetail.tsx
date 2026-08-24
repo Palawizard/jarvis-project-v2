@@ -627,10 +627,10 @@ export function JobDetailView({
                 {visualQa.map((s) => (
                   <div key={s.id} className="shot">
                     {s.screenshotPath ? (
-                      <img
-                        src={artifactUrl(s.screenshotPath, artifactsDir)}
+                      <AuthenticatedArtifact
+                        path={s.screenshotPath}
+                        artifactsDir={artifactsDir}
                         alt={`${s.scenarioName} ${s.route} ${s.viewport}`}
-                        loading="lazy"
                       />
                     ) : (
                       <div className="empty small">{s.error ?? 'capture failed'}</div>
@@ -722,6 +722,39 @@ export function JobDetailView({
         </div>
       </div>
     </div>
+  );
+}
+
+function AuthenticatedArtifact({
+  path,
+  artifactsDir,
+  alt,
+}: {
+  path: string;
+  artifactsDir: string;
+  alt: string;
+}) {
+  const [source, setSource] = useState<string | null>(null);
+  useEffect(() => {
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    void api
+      .artifact(artifactUrl(path, artifactsDir))
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setSource(objectUrl);
+      })
+      .catch(() => setSource(null));
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [path, artifactsDir]);
+  return source ? (
+    <img src={source} alt={alt} loading="lazy" />
+  ) : (
+    <div className="empty small">Loading evidence…</div>
   );
 }
 

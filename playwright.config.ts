@@ -11,16 +11,17 @@ export default defineConfig({
   reporter: [['list'], ['html', { outputFolder: '.jarvis/e2e-report', open: 'never' }]],
   use: {
     baseURL: 'http://127.0.0.1:4329',
+    storageState: '.jarvis/e2e/control-storage.json',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
   webServer: {
-    command: 'node apps/orchestrator/dist/index.js',
-    url: 'http://127.0.0.1:4329/api/health',
+    command: 'node tests/e2e/start-server.mjs',
+    url: 'http://127.0.0.1:4329/health',
     reuseExistingServer: false,
     timeout: 120_000,
     env: {
-      JARVIS_HOME: path.resolve('.jarvis/e2e', String(process.pid)),
+      JARVIS_HOME: path.resolve('.jarvis/e2e/runtime'),
       JARVIS_PORT: '4329',
       JARVIS_EMBEDDINGS: 'off',
     },

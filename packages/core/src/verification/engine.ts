@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Db } from '../db/index.js';
@@ -19,7 +19,10 @@ export interface VerificationResult {
   cycle: number;
   kind: NonNullable<VerificationStep['kind']>;
   required: boolean;
+  failureKind: VerificationFailureKind;
 }
+
+export type VerificationFailureKind = 'none' | 'product' | 'infrastructure' | 'cancelled';
 
 export interface VerificationReport {
   results: VerificationResult[];
@@ -27,6 +30,7 @@ export interface VerificationReport {
   ran: number;
   /** Compact failure text suitable for a fixer prompt — NOT the whole log. */
   failureSummary: string;
+  failureKind: VerificationFailureKind;
 }
 
 /** Order matters: cheap checks first, so a syntax error fails in seconds not minutes. */
@@ -108,7 +112,7 @@ export class VerificationEngine {
       if (opts.signal?.aborted) break;
 
       const started = Date.now();
-      const outcome = await runCommand(command, opts.cwd, timeoutMs, opts.signal);
+      const outcome = await runCommand(command, opts.cwd, timeoutMs, kind, opts.signal);
       const durationMs = Date.now() - started;
 
       const outputPath = path.join(logDir, `${name}.log`);
@@ -131,13 +135,15 @@ export class VerificationEngine {
         cycle,
         kind,
         required,
+        failureKind: outcome.failureKind,
       };
       results.push(result);
 
       this.db
         .prepare(
           `INSERT INTO verifications (id, job_id, cycle, name, command, cwd, exit_code, status, output,
-            output_path, duration_ms, kind, required, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            output_path, duration_ms, kind, required, failure_kind, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         )
         .run(
           result.id,
@@ -153,6 +159,7 @@ export class VerificationEngine {
           result.durationMs,
           result.kind,
           result.required ? 1 : 0,
+          result.failureKind,
           nowIso(),
         );
 
@@ -176,11 +183,19 @@ export class VerificationEngine {
       !installFailed &&
       checks.some((r) => r.required) &&
       required.every((r) => r.status === 'passed');
+    const failureKind: VerificationFailureKind = passed
+      ? 'none'
+      : results.some((result) => result.failureKind === 'cancelled')
+        ? 'cancelled'
+        : results.some((result) => result.failureKind === 'infrastructure') || checks.length === 0
+          ? 'infrastructure'
+          : 'product';
     const report: VerificationReport = {
       results,
       passed,
       ran: checks.length,
       failureSummary: summariseFailures(results),
+      failureKind,
     };
     this.bus?.emit({
       type: 'verification.completed',
@@ -189,6 +204,7 @@ export class VerificationEngine {
         cycle,
         passed,
         ran: checks.length,
+        failureKind,
         steps: results.map((r) => ({ name: r.name, status: r.status })),
       },
     });
@@ -211,6 +227,7 @@ export class VerificationEngine {
       cycle: Number(row.cycle),
       kind: (row.kind as VerificationResult['kind']) ?? 'check',
       required: Number(row.required ?? 1) === 1,
+      failureKind: (row.failure_kind as VerificationFailureKind) ?? 'none',
     }));
   }
 
@@ -219,12 +236,46 @@ export class VerificationEngine {
     const all = this.list(jobId);
     const cycle = all.reduce((latest, result) => Math.max(latest, result.cycle), -1);
     const results = all.filter((result) => result.cycle === cycle);
-    const checks = results.filter((result) => result.kind !== 'setup');
-    const passed =
-      checks.some((result) => result.required) &&
-      results.filter((result) => result.required).every((result) => result.status === 'passed');
-    return { results, passed, ran: checks.length, failureSummary: summariseFailures(results) };
+    return reportFromResults(results);
   }
+
+  /** Reconstruct exactly the evidence named by a persisted repair checkpoint. */
+  reportForResults(
+    jobId: string,
+    resultIds: string[],
+    failureSummary?: string,
+  ): VerificationReport {
+    const wanted = new Set(resultIds);
+    const results = this.list(jobId).filter((result) => wanted.has(result.id));
+    if (wanted.size === 0 || results.length !== wanted.size) {
+      throw new Error('persisted verification repair evidence is incomplete');
+    }
+    return reportFromResults(results, failureSummary);
+  }
+}
+
+function reportFromResults(
+  results: VerificationResult[],
+  persistedFailureSummary?: string,
+): VerificationReport {
+  const checks = results.filter((result) => result.kind !== 'setup');
+  const passed =
+    checks.some((result) => result.required) &&
+    results.filter((result) => result.required).every((result) => result.status === 'passed');
+  const failureKind: VerificationFailureKind = passed
+    ? 'none'
+    : results.some((result) => result.failureKind === 'cancelled')
+      ? 'cancelled'
+      : results.some((result) => result.failureKind === 'infrastructure') || checks.length === 0
+        ? 'infrastructure'
+        : 'product';
+  return {
+    results,
+    passed,
+    ran: checks.length,
+    failureSummary: persistedFailureSummary ?? summariseFailures(results),
+    failureKind,
+  };
 }
 
 /**
@@ -242,6 +293,7 @@ interface CommandOutcome {
   exitCode: number | null;
   output: string;
   startFailed: boolean;
+  failureKind: VerificationFailureKind;
 }
 
 /**
@@ -256,9 +308,19 @@ function runCommand(
   command: string,
   cwd: string,
   timeoutMs: number,
+  kind: NonNullable<VerificationStep['kind']>,
   signal?: AbortSignal,
 ): Promise<CommandOutcome> {
   return new Promise((resolve) => {
+    if (!executableAvailable(command, cwd)) {
+      resolve({
+        exitCode: null,
+        output: `could not run command: executable not found (${firstExecutable(command)})`,
+        startFailed: true,
+        failureKind: 'infrastructure',
+      });
+      return;
+    }
     const child = spawn(command, {
       cwd,
       shell: true,
@@ -280,10 +342,13 @@ function runCommand(
     child.stderr.on('data', capture);
 
     let settled = false;
+    let killFallback: NodeJS.Timeout | undefined;
+    let forced: { failureKind: 'infrastructure' | 'cancelled'; suffix: string } | undefined;
     const done = (outcome: CommandOutcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(killFallback);
       signal?.removeEventListener('abort', onAbort);
       resolve(outcome);
     };
@@ -299,18 +364,28 @@ function runCommand(
       }
     };
 
-    const timer = setTimeout(() => {
+    const terminate = (failureKind: 'infrastructure' | 'cancelled', suffix: string) => {
+      if (settled || forced) return;
+      forced = { failureKind, suffix };
       kill();
-      done({
-        exitCode: null,
-        output: `${chunks.join('')}\n[timed out after ${timeoutMs}ms]`,
-        startFailed: false,
-      });
+      killFallback = setTimeout(
+        () =>
+          done({
+            exitCode: null,
+            output: `${chunks.join('')}\n${suffix}`,
+            startFailed: false,
+            failureKind,
+          }),
+        3000,
+      );
+    };
+
+    const timer = setTimeout(() => {
+      terminate('infrastructure', `[timed out after ${timeoutMs}ms]`);
     }, timeoutMs);
 
     const onAbort = () => {
-      kill();
-      done({ exitCode: null, output: `${chunks.join('')}\n[cancelled]`, startFailed: false });
+      terminate('cancelled', '[cancelled]');
     };
     signal?.addEventListener('abort', onAbort, { once: true });
 
@@ -319,12 +394,54 @@ function runCommand(
         exitCode: null,
         output: `could not run command: ${error.message}`,
         startFailed: true,
+        failureKind: 'infrastructure',
       });
     });
     child.on('close', (code) => {
-      done({ exitCode: code, output: chunks.join(''), startFailed: false });
+      if (forced) {
+        done({
+          exitCode: null,
+          output: `${chunks.join('')}\n${forced.suffix}`,
+          startFailed: false,
+          failureKind: forced.failureKind,
+        });
+        return;
+      }
+      done({
+        exitCode: code,
+        output: chunks.join(''),
+        startFailed: false,
+        failureKind: code === 0 ? 'none' : kind === 'setup' ? 'infrastructure' : 'product',
+      });
     });
   });
+}
+
+const SHELL_BUILTINS = new Set(['echo', 'exit', 'cd', 'set', 'export', 'true', 'false', 'test']);
+
+function firstExecutable(command: string): string {
+  return (
+    command
+      .trim()
+      .match(/^(?:"([^"]+)"|'([^']+)'|([^\s]+))/)
+      ?.slice(1)
+      .find(Boolean) ?? ''
+  );
+}
+
+function executableAvailable(command: string, cwd: string): boolean {
+  const executable = firstExecutable(command);
+  if (!executable || SHELL_BUILTINS.has(executable.toLowerCase())) return true;
+  if (/[\\/]/.test(executable)) {
+    const target = path.isAbsolute(executable) ? executable : path.resolve(cwd, executable);
+    return fs.existsSync(target);
+  }
+  const lookup = spawnSync(process.platform === 'win32' ? 'where.exe' : 'which', [executable], {
+    cwd,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  return lookup.status === 0;
 }
 
 /** Bounded failure digest: enough for a fixer to act, small enough for a prompt. */

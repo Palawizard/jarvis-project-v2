@@ -1,8 +1,10 @@
+import http from 'node:http';
 import { expect, test } from '@playwright/test';
 
 test('command, projects, jobs and controllable memory work in the real UI', async ({
   page,
   request,
+  context,
 }, testInfo) => {
   const consoleErrors: string[] = [];
   const failedRequests: string[] = [];
@@ -17,11 +19,37 @@ test('command, projects, jobs and controllable memory work in the real UI', asyn
   await expect(page.getByText('claude').locator('..')).toContainText(
     /available|unavailable|cooldown/,
   );
+  const credential = await page.evaluate(() => localStorage.getItem('jarvis-human-control'));
+  expect(credential).toBeTruthy();
+  if (!credential) throw new Error('paired browser credential missing');
+  const readHeaders = { 'x-jarvis-control': credential };
+  const mutationHeaders = { ...readHeaders, origin: 'http://127.0.0.1:4329' };
+
+  const candidateServer = http.createServer((_request, response) => {
+    response.end('<!doctype html><title>candidate</title>');
+  });
+  await new Promise<void>((resolve) => candidateServer.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = candidateServer.address();
+    if (!address || typeof address === 'string')
+      throw new Error('candidate server address missing');
+    const candidatePage = await context.newPage();
+    await candidatePage.goto(`http://127.0.0.1:${address.port}`);
+    expect(
+      await candidatePage.evaluate(() => localStorage.getItem('jarvis-human-control')),
+    ).toBeNull();
+    expect(await candidatePage.context().cookies()).toEqual([]);
+    await candidatePage.close();
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      candidateServer.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
 
   await page.getByRole('button', { name: 'Projects' }).click();
   await expect(page.getByText('jarvis', { exact: true }).first()).toBeVisible();
 
-  const projectsResponse = await request.get('/api/projects');
+  const projectsResponse = await request.get('/api/projects', { headers: readHeaders });
   expect(projectsResponse.ok()).toBeTruthy();
   const projects = (await projectsResponse.json()) as Array<{ id: string; isSelf: boolean }>;
   const self = projects.find((project) => project.isSelf);
@@ -29,11 +57,13 @@ test('command, projects, jobs and controllable memory work in the real UI', asyn
   if (!self) throw new Error('self project missing');
 
   const invalidMemory = await request.post('/api/memory', {
+    headers: mutationHeaders,
     data: { scope: 'project', kind: 'fact', content: 'missing project scope id' },
   });
   expect(invalidMemory.status()).toBe(400);
 
   const queued = await request.post('/api/jobs', {
+    headers: mutationHeaders,
     data: {
       projectId: self.id,
       request: 'Document the deterministic E2E smoke-test fixture.',
@@ -78,6 +108,7 @@ test('command, projects, jobs and controllable memory work in the real UI', asyn
 
   // A request may not name its own privileges: the risk ceiling can only tighten.
   const escalation = await request.post('/api/tools/memory.purge', {
+    headers: mutationHeaders,
     data: { input: { id: 'mem_missing' }, maxRisk: 'destructive' },
   });
   expect(escalation.ok()).toBeTruthy();

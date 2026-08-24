@@ -1,6 +1,7 @@
 export { Jarvis } from './jarvis.js';
 export { loadConfig, getConfig, setConfig, ensureDirs, type JarvisConfig } from './config.js';
 export { openDb, transaction, parseJson, type Db } from './db/index.js';
+export { HumanControlAuth } from './auth/control.js';
 export { EventBus, type JarvisEvent, type JarvisEventType } from './events/bus.js';
 
 export { MemoryService, calibrateSemantic, toFtsQuery } from './memory/service.js';
@@ -47,7 +48,14 @@ export {
   type Message,
 } from './sessions/service.js';
 
-export { JobService, normaliseGoal, type Job, type AgentRun } from './jobs/service.js';
+export {
+  JobService,
+  normaliseGoal,
+  type Job,
+  type AgentRun,
+  type RepairKind,
+  type RepairCheckpoint,
+} from './jobs/service.js';
 export {
   canTransition,
   assertTransition,
@@ -86,6 +94,7 @@ export {
   VerificationEngine,
   type VerificationReport,
   type VerificationResult,
+  type VerificationFailureKind,
 } from './verification/engine.js';
 export {
   ReviewEngine,
@@ -93,12 +102,7 @@ export {
   type Review,
   type ReviewFinding,
 } from './review/engine.js';
-export {
-  VisualQaEngine,
-  startDevServer,
-  type VisualQaShot,
-  type VisualReviewFinding,
-} from './visualqa/engine.js';
+export { VisualQaEngine, type VisualQaShot, type VisualReviewFinding } from './visualqa/engine.js';
 export { VisualReviewer, parseVisualReview, type VisualReview } from './visualqa/reviewer.js';
 export {
   startCandidateRuntime,

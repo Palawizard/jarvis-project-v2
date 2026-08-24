@@ -18,7 +18,8 @@ Critical invariants:
 - Database migrations preserve existing memories/jobs/projects and reject unknown versions.
 - Provider and visual-review availability must be reported honestly; `reviewedBy` is never faked.
 - Provider children use official subscription auth and never inherit paid API keys.
-- Every tool runs through the permission boundary in `packages/core/src/tools/`; privilege comes from the call site's actor, never from a request payload, and agents never reach sensitive/destructive. Every definition has an explicit revision which must be bumped for schema/security-semantic changes; approvals bind revision, risk, and canonical input hash. Standing permissions are user-only; approval expiry and claiming are one atomic conditional update.
+- Loopback is not human authority. All private API reads and mutations require the origin-bound browser control credential; mutations also enforce exact configured Origin. Bootstrap/control credentials never enter providers, candidate environments, worktrees, logs, events, URLs, or supervisor requests.
+- Every tool runs through the permission boundary in `packages/core/src/tools/`; privilege comes from the authenticated call site's actor, never from a request payload, and agents never reach sensitive/destructive. Every definition has an explicit revision which must be bumped for schema/security-semantic changes; approvals bind revision, risk, and canonical input hash. Standing permissions are user-only and bind current risk/revision; approval expiry and claiming are one atomic conditional update.
 
 Commands: `pnpm dev`, `pnpm supervisor <config.json>`, `pnpm verify` (complete deterministic gate), `pnpm test` (unit only), `pnpm test:integration`, `pnpm test:all`, `pnpm test:e2e`. Live agents require explicit `JARVIS_LIVE_AGENT_TESTS=1`.
 

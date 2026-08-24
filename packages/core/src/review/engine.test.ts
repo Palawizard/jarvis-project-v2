@@ -89,7 +89,13 @@ describe('review provider resilience', () => {
       acceptance: [],
       diff: 'diff --git a/a b/a',
       files: [{ path: 'a', added: 1, removed: 0 }],
-      verification: { passed: true, ran: 1, failureSummary: '', results: [] },
+      verification: {
+        passed: true,
+        ran: 1,
+        failureSummary: '',
+        failureKind: 'none',
+        results: [],
+      },
       contextPack: '',
       contextPackId: 'fixture-pack',
       implementerProvider: 'codex',
@@ -117,11 +123,32 @@ describe('review provider resilience', () => {
     db.close();
   });
 
-  it('normalizes an advisory-only request_changes claim to approve', () => {
-    const result = parseReviewOutput(
+  it.each([
+    [
+      'request_changes with a malformed critical finding',
+      '```json\n{"verdict":"request_changes","summary":"bad","findings":[{"severity":"critical","category":"security","description":12,"recommendation":"fix"}]}\n```',
+    ],
+    ['a missing findings array', '```json\n{"verdict":"approve","summary":"clean"}\n```'],
+    [
+      'request_changes with advisory-only findings',
       '```json\n{"verdict":"request_changes","summary":"advisory","findings":[{"severity":"medium","category":"style","description":"Optional cleanup","recommendation":"Consider renaming"}]}\n```',
+    ],
+  ])('rejects %s as a protocol error', (_name, output) => {
+    expect(parseReviewOutput(output).verdict).toBe('error');
+  });
+
+  it('never approves a claimed approve with a valid critical finding', () => {
+    const result = parseReviewOutput(
+      '```json\n{"verdict":"approve","summary":"claimed clean","findings":[{"severity":"critical","category":"security","description":"Authority bypass","recommendation":"Authenticate it"}]}\n```',
     );
-    expect(result.verdict).toBe('approve');
-    expect(result.findings[0]?.severity).toBe('medium');
+    expect(result.verdict).toBe('request_changes');
+  });
+
+  it('accepts a clean, well-formed approve', () => {
+    expect(
+      parseReviewOutput(
+        '```json\n{"verdict":"approve","summary":"Clean review","findings":[]}\n```',
+      ).verdict,
+    ).toBe('approve');
   });
 });

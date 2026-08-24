@@ -38,6 +38,7 @@ export type JarvisEventType =
   | 'verification.started'
   | 'verification.step'
   | 'verification.completed'
+  | 'verification.retry'
   | 'review.started'
   | 'review.completed'
   | 'visual_qa.started'

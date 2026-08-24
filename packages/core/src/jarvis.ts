@@ -20,6 +20,7 @@ import { UpgradeManager } from './upgrade/manager.js';
 import { registerBuiltinTools } from './tools/builtin.js';
 import type { ToolRegistry } from './tools/registry.js';
 import { createLogger } from './logger.js';
+import { HumanControlAuth } from './auth/control.js';
 
 const log = createLogger('jarvis');
 
@@ -47,6 +48,7 @@ export class Jarvis {
   readonly applications: CandidateApplicationService;
   readonly upgrades: UpgradeManager;
   readonly tools: ToolRegistry;
+  readonly control: HumanControlAuth;
 
   constructor(config: JarvisConfig = getConfig()) {
     this.config = config;
@@ -54,6 +56,7 @@ export class Jarvis {
     ensureDirs(config);
     this.db = openDb(config);
     this.bus = new EventBus(this.db);
+    this.control = new HumanControlAuth(this.db);
     this.memory = new MemoryService({ db: this.db, bus: this.bus, config });
     this.context = new ContextPackBuilder(this.db, this.memory, config);
     this.projects = new ProjectService(this.db);

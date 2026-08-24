@@ -128,6 +128,8 @@ export interface ToolGrant {
   id: string;
   toolName: string;
   actor: ToolActor;
+  risk: RiskLevel | null;
+  definitionRevision: string | null;
   projectId: string | null;
   sessionId: string | null;
   note: string | null;
@@ -256,13 +258,17 @@ export class ToolRegistry {
 
     // Decide before touching the input: a caller that may not run this tool
     // gets no validation feedback and reaches no tool code at all.
-    const grant = this.#matchingGrant(name, ctx);
+    const grant = this.#matchingGrant(tool, ctx);
     const outcome = decide({
       risk: tool.risk,
       actor: ctx.actor,
       hasGrant: !!grant,
       maxRisk: ctx.maxRisk,
     });
+    if (!grant && outcome.decision === 'allow' && this.#hasDriftedGrant(tool, ctx)) {
+      outcome.decision = 'confirm';
+      outcome.reason = 'tool definition changed since the standing permission';
+    }
 
     if (outcome.decision === 'deny') {
       // The attempt itself is the interesting audit record, so keep the raw
@@ -658,18 +664,23 @@ export class ToolRegistry {
   }
 
   #insertGrant(input: GrantInput, expiresAt: string | null): ToolGrant {
+    const tool = this.#tools.get(input.toolName);
+    if (!tool) throw new Error(`unknown tool: ${input.toolName}`);
     const id = newId('grn');
     const createdAt = nowIso();
     this.#db
       .prepare(
         `INSERT INTO tool_grants
-           (id, tool_name, actor, project_id, session_id, note, created_at, expires_at)
-         VALUES (?,?,?,?,?,?,?,?)`,
+           (id, tool_name, actor, risk, definition_revision, project_id, session_id, note,
+            created_at, expires_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
         input.toolName,
         input.actor,
+        tool.risk,
+        definitionRevision(tool),
         input.projectId ?? null,
         input.sessionId ?? null,
         input.note ?? null,
@@ -698,7 +709,8 @@ export class ToolRegistry {
       : this.#db
           .prepare(
             `SELECT * FROM tool_grants
-              WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+              WHERE revoked_at IS NULL AND risk IS NOT NULL AND definition_revision IS NOT NULL
+                AND (expires_at IS NULL OR expires_at > ?)
               ORDER BY created_at DESC`,
           )
           .all(nowIso());
@@ -719,21 +731,55 @@ export class ToolRegistry {
    * the call's context. A null scope column means "any"; a set one must match
    * exactly, so a project-scoped permission never leaks to another project.
    */
-  #matchingGrant(toolName: string, ctx: ToolCallContext): ToolGrant | null {
+  #matchingGrant(tool: ToolDefinition, ctx: ToolCallContext): ToolGrant | null {
     // Fail closed for anyone who may not hold a grant, so a row written before
     // that rule existed (or straight into the database) still grants nothing.
     if (!isGrantableActor(ctx.actor)) return null;
     const row = this.#db
       .prepare(
         `SELECT * FROM tool_grants
-          WHERE tool_name = ? AND actor = ? AND revoked_at IS NULL
+          WHERE tool_name = ? AND actor = ? AND risk = ? AND definition_revision = ?
+            AND revoked_at IS NULL
             AND (expires_at IS NULL OR expires_at > ?)
             AND (project_id IS NULL OR project_id = ?)
             AND (session_id IS NULL OR session_id = ?)
           ORDER BY created_at DESC LIMIT 1`,
       )
-      .get(toolName, ctx.actor, nowIso(), ctx.projectId ?? null, ctx.sessionId ?? null);
+      .get(
+        tool.name,
+        ctx.actor,
+        tool.risk,
+        definitionRevision(tool),
+        nowIso(),
+        ctx.projectId ?? null,
+        ctx.sessionId ?? null,
+      );
     return row ? rowToGrant(row as Row) : null;
+  }
+
+  #hasDriftedGrant(tool: ToolDefinition, ctx: ToolCallContext): boolean {
+    if (!isGrantableActor(ctx.actor)) return false;
+    return Boolean(
+      this.#db
+        .prepare(
+          `SELECT 1 FROM tool_grants
+            WHERE tool_name = ? AND actor = ? AND revoked_at IS NULL
+              AND (expires_at IS NULL OR expires_at > ?)
+              AND (project_id IS NULL OR project_id = ?)
+              AND (session_id IS NULL OR session_id = ?)
+              AND (risk IS NULL OR risk <> ? OR definition_revision IS NULL OR definition_revision <> ?)
+            LIMIT 1`,
+        )
+        .get(
+          tool.name,
+          ctx.actor,
+          nowIso(),
+          ctx.projectId ?? null,
+          ctx.sessionId ?? null,
+          tool.risk,
+          definitionRevision(tool),
+        ),
+    );
   }
 
   // -------------------------------------------------------------- audit trail
@@ -1090,6 +1136,8 @@ function rowToGrant(row: Row): ToolGrant {
     id: row.id as string,
     toolName: row.tool_name as string,
     actor: row.actor as ToolActor,
+    risk: (row.risk as RiskLevel) ?? null,
+    definitionRevision: (row.definition_revision as string) ?? null,
     projectId: (row.project_id as string) ?? null,
     sessionId: (row.session_id as string) ?? null,
     note: (row.note as string) ?? null,

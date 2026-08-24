@@ -30,9 +30,15 @@ describe('explicit memory command API', () => {
         });
       }
       const session = jarvis.sessions.current();
+      const credential = jarvis.control.pair(jarvis.control.createBootstrap());
+      if (!credential) throw new Error('test pairing failed');
       const response = await createRoutes(jarvis).request('/api/command', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          origin: 'http://127.0.0.1:5199',
+          'x-jarvis-control': credential,
+        },
         body: JSON.stringify({ text: 'forget deployment setting', sessionId: session.id }),
       });
       const body = (await response.json()) as { resolution: string; candidates: unknown[] };

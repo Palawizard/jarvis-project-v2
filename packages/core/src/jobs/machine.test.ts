@@ -177,8 +177,8 @@ describe('job persistence and crash recovery', () => {
     expect(after?.resumeStage).toBe('implementing');
     expect(after?.finishedAt).toBeNull();
     // The reason must be explicit, not a silent reset.
-    expect(after?.pauseReason).toBe('orchestrator_restart');
-    expect(after?.error).toContain('Orchestrator restarted');
+    expect(after?.restartReason).toBe('orchestrator_restart');
+    expect(after?.pauseReason).toBeNull();
     expect(jobs.runs(job.id)[0]?.status).toBe('interrupted');
     expect(bus.list({ jobId: job.id }).some((e) => e.type === 'system.recovery')).toBe(true);
   });

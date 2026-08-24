@@ -8,9 +8,10 @@ Current safety boundary:
 - never push, force refs, stash, or resolve conflicts during activation;
 - preserve dirty user work outside the candidate;
 - require deterministic verification and independent review;
+- require human-control authentication before approval, application, preparation, or activation;
 - require explicit approval and a second explicit activation confirmation.
 
-`scripts/supervisor.mjs` is intentionally outside the process being replaced. `pnpm supervisor <config.json>` starts Jarvis with a supervised activation-request path. The upgrade manager launches the candidate with dynamic API/web ports and a unique `JARVIS_HOME`, records the current/candidate SHA and rollback ref, and exposes activation only after candidate health passes. The supervisor rechecks clean HEAD/branch/ref identity, applies FF-only, rebuilds, restarts, checks `/health`, and restores the prior SHA only when rollback preconditions still hold. Ambiguity becomes `inspection_required`.
+`scripts/supervisor.mjs` is intentionally outside the process being replaced. `pnpm supervisor <config.json>` starts Jarvis with a supervised activation-request path. The upgrade manager launches the candidate with dynamic API/web ports and a unique `JARVIS_HOME`, records the current/candidate SHA and rollback ref, and exposes activation only after candidate health passes. Candidate/provider environments explicitly remove bootstrap/control names. The authenticated browser credential is never written into the activation file; the supervisor continues to trust only the persisted approved request and rechecks clean HEAD/branch/ref identity before FF-only application, rebuild, restart, `/health`, and conditional rollback. Ambiguity becomes `inspection_required`.
 
 The config keeps executable and argument fields separate and places the request outside the repository:
 
@@ -35,7 +36,9 @@ After a successful job, one compact project episode preserves goal, outcome, fil
 
 Projects opt into candidate runtime isolation with an executable/argv and port-environment mapping. Jarvis reserves dynamic local ports until launch, creates an isolated runtime home, and reports unsupported remapping instead of risking the current application's port. Jarvis self-candidates must echo a per-launch nonce and exact commit from `/health`; generic projects rely on their configured health contract. Arbitrary frameworks cannot inherit the reservation socket, so a narrow release-to-bind race remains for generic projects.
 
-Playwright supports bounded deterministic `goto`, `click`, `fill`, `wait`, and `screenshot` actions, desktop/mobile capture, console errors, and failed requests. A router-selected subscription CLI can inspect all images with schema-constrained findings. `reviewedBy` stays null on missing evidence, unavailable reviewer, provider error, or invalid output. Required Jarvis UI review fails closed.
+Playwright supports bounded deterministic `goto`, `click`, `fill`, `wait`, and `screenshot` actions, desktop/mobile capture, console errors, and failed requests. Before navigation it confines every main-frame document, redirect, click/form/JavaScript navigation, and popup to the candidate's exact origin; an attempted escape fails the scenario and cannot yield a successful screenshot. Subresources may use CDNs. Artifact paths are derived only from validated DB-owned job/project identities and proven beneath the configured artifact root before filesystem or browser work.
+
+A router-selected subscription CLI can inspect all images with a whole-response schema. Every finding must reference an exact successfully captured `(scenarioName, route, viewport)` tuple. Malformed or hallucinated findings are reviewer protocol errors that retry/reroute review and never invoke a visual fixer. `reviewedBy` stays null on missing evidence, unavailable reviewer, provider error, or invalid output. Required Jarvis UI review fails closed.
 
 Visual QA configuration is job-scoped when supplied and falls back to the Project defaults; a recovery job never has to PATCH global project configuration. Each persisted scenario has a name, route, bounded declared interactions, and viewports. Interactions run before the final screenshot, and scenario name plus reviewed candidate HEAD are stored with every evidence row and finding. Jarvis's self-project defaults cover both Command and Tools desktop/mobile states, with Tools reached through stable `data-testid` selectors.
 

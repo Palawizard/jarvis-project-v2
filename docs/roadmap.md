@@ -17,6 +17,8 @@
 - Free deterministic GitHub Actions CI.
 - Bounded code/visual repair loops, provider stage rerouting, durable pause/resume, immutable validation-only candidate import, and job-scoped Visual QA scenarios.
 - Explicit ordered verification steps; Jarvis's full gate includes integration and Playwright E2E while live subscription tests remain opt-in.
+- One-use terminal pairing, origin-scoped browser control capability, authenticated private API/fetch-stream events, and adversarial loopback-client denial.
+- Schema-v5 grant-definition binding, exact recovery/repair evidence checkpoints, strict review protocols, and exact-origin Visual QA navigation/artifact confinement.
 
 ## Partial
 
@@ -27,14 +29,14 @@
 - Route/interaction configuration is deterministic and deliberately small, not a browser agent.
 - Restart recovery pauses running development jobs with their worktree checkpoint and marks running agent calls interrupted. Candidate application/supervisor crash recovery remains separately conservative.
 - Tool Registry contains only tools needed for the bootstrap slice; the permission layer is built ahead of the modules that will need it, so `sensitive` and `destructive` are exercised by tests rather than by shipped tools.
-- Tool permission enforcement is in-process. The loopback API is unauthenticated, so a local process running as the same user can still act as the user; OS-level isolation of agent children is not implemented. See `docs/tool-permissions.md`.
+- Human HTTP authority is authenticated even on loopback. OS-level isolation of agent children is still not implemented, so sensitive agent tools remain disabled. See `docs/tool-permissions.md`.
 - A tool timeout aborts `ctx.signal` and records `timed_out` with `effectUnknown`, but cannot force uncooperative code to stop; a tool that ignores the signal may still complete its side effect.
 
 ## Planned — next five milestones
 
 Phase 1b hardened self-development, and the permission-gated tool-execution and recovery layer is now in place. On top of it, voice/screen/desktop and official Gmail/Calendar modules can be developed through Jarvis with the same evidence and approval boundaries, each registering as a risk-classified tool.
 
-**Blocking milestone — OS-level agent and control-plane isolation.** No `sensitive` tool (Gmail, Calendar, screen capture, desktop input) may be enabled for the `agent` actor until agent child processes are isolated from the orchestrator's control plane at the operating-system level: a restricted user or a container without loopback access to the API, so that "an agent cannot reach sensitive tools" is enforced by the OS and not only by in-process policy. Today the loopback API is unauthenticated and an agent child runs as the same user, so it can reach the API and act with the user's authority; stripping `JARVIS_PORT` from its environment raises the cost and does not close it. Until this milestone ships:
+**Blocking milestone — verified OS-level agent isolation.** No `sensitive` tool (Gmail, Calendar, screen capture, desktop input) may be enabled for the `agent` actor until agent child processes run under a verified restricted user or container with filesystem, credential, process, and control-plane network separation. Human HTTP authority now requires a browser-origin capability, so loopback alone cannot impersonate the user; that does not prove containment of arbitrary same-user malware or make sensitive delegated autonomy safe. Until this milestone ships:
 
 - agents are hard-denied `sensitive` and `destructive` by policy, and
 - standing permissions cannot be granted to the `agent` actor at all, so delegated autonomy stays off by construction.

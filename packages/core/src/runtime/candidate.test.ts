@@ -30,7 +30,7 @@ function project(root: string, configured = true): Project {
               executable: process.execPath,
               args: [
                 '-e',
-                `require('node:http').createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok',home:process.env.JARVIS_HOME,supervised:process.env.JARVIS_SUPERVISED,requestPath:process.env.JARVIS_UPGRADE_REQUEST_PATH,apiKey:process.env.OPENAI_API_KEY}))}).listen(Number(process.env.TEST_PORT),'127.0.0.1')`,
+                `require('node:http').createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok',home:process.env.JARVIS_HOME,supervised:process.env.JARVIS_SUPERVISED,requestPath:process.env.JARVIS_UPGRADE_REQUEST_PATH,apiKey:process.env.OPENAI_API_KEY,bootstrap:process.env.JARVIS_BOOTSTRAP_TOKEN,control:process.env.JARVIS_CONTROL_TOKEN}))}).listen(Number(process.env.TEST_PORT),'127.0.0.1')`,
               ],
             },
             portEnvironment: 'TEST_PORT',
@@ -72,10 +72,14 @@ describe('candidate runtime isolation', () => {
       supervised: process.env.JARVIS_SUPERVISED,
       requestPath: process.env.JARVIS_UPGRADE_REQUEST_PATH,
       apiKey: process.env.OPENAI_API_KEY,
+      bootstrap: process.env.JARVIS_BOOTSTRAP_TOKEN,
+      control: process.env.JARVIS_CONTROL_TOKEN,
     };
     process.env.JARVIS_SUPERVISED = '1';
     process.env.JARVIS_UPGRADE_REQUEST_PATH = path.join(root, 'activation.json');
     process.env.OPENAI_API_KEY = 'must-not-reach-candidate';
+    process.env.JARVIS_BOOTSTRAP_TOKEN = 'must-not-reach-candidate';
+    process.env.JARVIS_CONTROL_TOKEN = 'must-not-reach-candidate';
     let runtime: Awaited<ReturnType<typeof startCandidateRuntime>> | undefined;
     try {
       const started = await startCandidateRuntime({
@@ -94,11 +98,15 @@ describe('candidate runtime isolation', () => {
         supervised?: string;
         requestPath?: string;
         apiKey?: string;
+        bootstrap?: string;
+        control?: string;
       };
       expect(health.home).toBe(started.home);
       expect(health.supervised).toBeUndefined();
       expect(health.requestPath).toBeUndefined();
       expect(health.apiKey).toBeUndefined();
+      expect(health.bootstrap).toBeUndefined();
+      expect(health.control).toBeUndefined();
       await started.stop();
       await started.stop();
       runtime = undefined;
@@ -108,6 +116,8 @@ describe('candidate runtime isolation', () => {
       restoreEnv('JARVIS_SUPERVISED', original.supervised);
       restoreEnv('JARVIS_UPGRADE_REQUEST_PATH', original.requestPath);
       restoreEnv('OPENAI_API_KEY', original.apiKey);
+      restoreEnv('JARVIS_BOOTSTRAP_TOKEN', original.bootstrap);
+      restoreEnv('JARVIS_CONTROL_TOKEN', original.control);
     }
   });
 

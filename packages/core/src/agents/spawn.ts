@@ -14,7 +14,13 @@ const API_KEY_ENV = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY'] as 
  * a boundary: the port is guessable and the API is unauthenticated, so an agent
  * determined to reach it still can. See docs/tool-permissions.md.
  */
-const CONTROL_PLANE_ENV = ['JARVIS_PORT', 'JARVIS_WEB_PORT', 'JARVIS_RUNTIME_NONCE'] as const;
+const CONTROL_PLANE_ENV = [
+  'JARVIS_PORT',
+  'JARVIS_WEB_PORT',
+  'JARVIS_RUNTIME_NONCE',
+  'JARVIS_BOOTSTRAP_TOKEN',
+  'JARVIS_CONTROL_TOKEN',
+] as const;
 
 /** Provider runs must use the CLIs' subscription login, never inherited API billing. */
 export function subscriptionProviderEnv(

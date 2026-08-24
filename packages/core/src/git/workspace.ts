@@ -175,7 +175,12 @@ export class GitWorkspace {
         existingBranch === branch &&
         (await repositoryIdentity(status.root)) === (await repositoryIdentity(target))
       ) {
-        await requireAncestor(target, baseRef, existing.head, 'recovery_base_mismatch');
+        if (existing.head !== baseRef) {
+          throw new GitError(
+            `uncheckpointed planning worktree HEAD changed (${baseRef} -> ${existing.head})`,
+            'recovery_head_mismatch',
+          );
+        }
         warnings.push(`Recovered the existing job worktree at ${target}.`);
         return { path: target, branch, baseRef, warnings };
       }
@@ -289,9 +294,10 @@ export class GitWorkspace {
       );
     }
     await requireAncestor(opts.worktreePath, opts.baseRef, status.head, 'recovery_base_mismatch');
-    if (opts.expectedHead && status.head !== opts.expectedHead) {
+    const expectedHead = opts.expectedHead ?? opts.baseRef;
+    if (status.head !== expectedHead) {
       throw new GitError(
-        `recovery HEAD changed (${opts.expectedHead} -> ${status.head})`,
+        `recovery HEAD changed (${expectedHead} -> ${status.head})`,
         'recovery_head_mismatch',
       );
     }

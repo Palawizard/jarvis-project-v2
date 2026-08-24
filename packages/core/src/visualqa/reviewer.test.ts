@@ -16,26 +16,36 @@ afterEach(() => {
 });
 
 describe('visual reviewer', () => {
+  const shotRef = {
+    scenarioName: 'mobile home',
+    route: '/',
+    viewport: 'mobile' as const,
+    status: 'captured' as const,
+  };
+
   it('normalizes structured findings and refuses a pass with a high finding', () => {
-    const review = parseVisualReview({
-      verdict: 'pass',
-      findings: [
-        {
-          severity: 'high',
-          scenarioName: 'mobile home',
-          route: '/',
-          viewport: 'mobile',
-          category: 'layout',
-          description: 'Primary action is clipped',
-          recommendation: 'Allow the action row to wrap',
-        },
-      ],
-    });
+    const review = parseVisualReview(
+      {
+        verdict: 'pass',
+        findings: [
+          {
+            severity: 'high',
+            scenarioName: 'mobile home',
+            route: '/',
+            viewport: 'mobile',
+            category: 'layout',
+            description: 'Primary action is clipped',
+            recommendation: 'Allow the action row to wrap',
+          },
+        ],
+      },
+      [shotRef],
+    );
     expect(review.verdict).toBe('needs_fix');
     expect(review.findings).toHaveLength(1);
   });
 
-  it('keeps low and info visual findings advisory even when the reviewer claims needs_fix', () => {
+  it('rejects needs_fix with only advisory findings', () => {
     const finding = {
       scenarioName: 'tools',
       route: '/',
@@ -44,15 +54,46 @@ describe('visual reviewer', () => {
       description: 'Minor alignment preference',
       recommendation: 'Consider aligning labels',
     };
-    const review = parseVisualReview({
-      verdict: 'needs_fix',
-      findings: [
-        { ...finding, severity: 'low' },
-        { ...finding, severity: 'info' },
-      ],
-    });
-    expect(review.verdict).toBe('pass');
-    expect(review.findings).toHaveLength(2);
+    const review = parseVisualReview(
+      {
+        verdict: 'needs_fix',
+        findings: [
+          { ...finding, severity: 'low' },
+          { ...finding, severity: 'info' },
+        ],
+      },
+      [{ ...finding, status: 'captured' }],
+    );
+    expect(review.verdict).toBe('error');
+  });
+
+  it('rejects malformed findings and missing findings arrays', () => {
+    expect(
+      parseVisualReview({ verdict: 'needs_fix', findings: [{ severity: 'high' }] }).verdict,
+    ).toBe('error');
+    expect(parseVisualReview({ verdict: 'pass' }).verdict).toBe('error');
+  });
+
+  it('rejects a finding that does not match an exact successful shot tuple', () => {
+    const review = parseVisualReview(
+      {
+        verdict: 'needs_fix',
+        findings: [
+          {
+            severity: 'high',
+            scenarioName: 'hallucinated',
+            route: '/',
+            viewport: 'mobile',
+            category: 'layout',
+            description: 'Imagined issue',
+            recommendation: 'Do not fix imagined evidence',
+          },
+        ],
+      },
+      [shotRef],
+    );
+    expect(review.verdict).toBe('error');
+    expect(review.error).toContain('unknown or failed');
   });
 
   it('reports missing/unavailable review evidence without faking reviewedBy', async () => {

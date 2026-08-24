@@ -33,7 +33,7 @@ describe('database migrations', () => {
     const migrated = openDb(config);
     expect(
       migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
-    ).toEqual({ value: '4' });
+    ).toEqual({ value: '5' });
     expect(migrated.prepare("SELECT name FROM projects WHERE id='prj_keep'").get()).toEqual({
       name: 'preserved',
     });
@@ -52,7 +52,7 @@ describe('database migrations', () => {
     migrated.close();
   });
 
-  it('migrates v2 to v4 and keeps the jobs and memories already there', () => {
+  it('migrates v2 to v5 and keeps the jobs and memories already there', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-migration-v3-'));
     homes.push(home);
     const config = loadConfig({ home });
@@ -74,7 +74,7 @@ describe('database migrations', () => {
     const migrated = openDb(config);
     expect(
       migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
-    ).toEqual({ value: '4' });
+    ).toEqual({ value: '5' });
     expect(migrated.prepare("SELECT stage FROM jobs WHERE id='job_v2'").get()).toEqual({
       stage: 'awaiting_user',
     });
@@ -167,7 +167,7 @@ describe('database migrations', () => {
     expect(
       migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
     ).toEqual({
-      value: '4',
+      value: '5',
     });
     expect(migrated.prepare("SELECT content FROM memories WHERE id='mem_v3'").get()).toEqual({
       content: 'preserved v3 memory',
@@ -195,6 +195,71 @@ describe('database migrations', () => {
         n: 1,
       });
     }
+    expect(
+      migrated
+        .prepare("SELECT revoked_at,risk,definition_revision FROM tool_grants WHERE id='grant_v3'")
+        .get(),
+    ).toEqual({ revoked_at: 'now', risk: null, definition_revision: null });
+    migrated.close();
+  });
+
+  it('migrates realistic populated v4 state and revokes legacy grants without integrity metadata', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-migration-v4-'));
+    homes.push(home);
+    const config = loadConfig({ home });
+    fs.mkdirSync(home, { recursive: true });
+    const v4 = new DatabaseSync(config.dbPath);
+    v4.exec(fs.readFileSync(path.join(import.meta.dirname, 'schema.sql'), 'utf8'));
+    v4.prepare('INSERT INTO schema_meta(key,value) VALUES (?,?)').run('schema_version', '1');
+    for (const version of [2, 3, 4]) v4.exec(MIGRATIONS.get(version) as string);
+    v4.prepare("UPDATE schema_meta SET value='4' WHERE key='schema_version'").run();
+    v4.prepare(
+      `INSERT INTO projects (id,name,root_path,default_branch,stack,commands,is_self,config,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run('prj_v4', 'v4', home, 'main', '{}', '{}', 0, '{}', 'now', 'now');
+    v4.prepare(
+      `INSERT INTO jobs (id,project_id,request,goal,stage,status,head_ref,reviewed_head,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      'job_v4',
+      'prj_v4',
+      'keep',
+      'keep',
+      'awaiting_user',
+      'awaiting_user',
+      'abc',
+      'abc',
+      'now',
+      'now',
+    );
+    v4.prepare(
+      `INSERT INTO tool_grants (id,tool_name,actor,project_id,note,created_at)
+       VALUES (?,?,?,?,?,?)`,
+    ).run('grant_v4', 'calendar.write', 'user', 'prj_v4', 'legacy permission', 'now');
+    v4.close();
+
+    const migrated = openDb(config);
+    expect(
+      migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
+    ).toEqual({
+      value: '5',
+    });
+    expect(
+      migrated.prepare("SELECT stage,head_ref,reviewed_head FROM jobs WHERE id='job_v4'").get(),
+    ).toEqual({
+      stage: 'awaiting_user',
+      head_ref: 'abc',
+      reviewed_head: 'abc',
+    });
+    expect(
+      migrated
+        .prepare("SELECT revoked_at,risk,definition_revision FROM tool_grants WHERE id='grant_v4'")
+        .get(),
+    ).toEqual({
+      revoked_at: 'now',
+      risk: null,
+      definition_revision: null,
+    });
     migrated.close();
   });
 

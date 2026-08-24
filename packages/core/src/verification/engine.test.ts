@@ -56,6 +56,7 @@ describe('deterministic verification', () => {
     const failed = report.results.find((r) => r.name === 'test');
     expect(failed?.status).toBe('failed');
     expect(failed?.exitCode).toBe(3);
+    expect(report.failureKind).toBe('product');
     expect(report.failureSummary).toContain('test');
     expect(report.failureSummary).toContain('boom');
   });
@@ -138,6 +139,7 @@ describe('deterministic verification', () => {
     expect(report.results.map((r) => r.name)).toEqual(['install']);
     expect(report.passed).toBe(false);
     expect(report.failureSummary).toContain('install');
+    expect(report.failureKind).toBe('infrastructure');
   });
 
   it('does not report a change as verified when nothing was actually checked', async () => {
@@ -153,6 +155,49 @@ describe('deterministic verification', () => {
       commands: { test: OK },
     });
     expect(report.passed).toBe(false);
+    expect(report.failureKind).toBe('infrastructure');
+  });
+
+  it('classifies a missing executable as infrastructure', async () => {
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { test: 'jarvis-executable-that-does-not-exist --version' },
+    });
+    expect(report.failureKind).toBe('infrastructure');
+    expect(report.results[0]?.status).toBe('error');
+  });
+
+  it('classifies dependency registry failure as infrastructure', async () => {
+    fs.writeFileSync(path.join(home, 'package.json'), '{"name":"x"}');
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: {
+        install: `node -e "console.error('ENETUNREACH registry');process.exit(1)"`,
+        test: OK,
+      },
+    });
+    expect(report.failureKind).toBe('infrastructure');
+    expect(report.results.map((result) => result.name)).toEqual(['install']);
+  });
+
+  it('classifies an infrastructure timeout without proposing source repair', async () => {
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: {},
+      steps: [
+        {
+          name: 'setup-timeout',
+          command: `node -e "setInterval(()=>{},1000)"`,
+          kind: 'setup',
+          timeoutMs: 20,
+        },
+      ],
+    });
+    expect(report.failureKind).toBe('infrastructure');
+    expect(report.failureSummary).toContain('timed out');
   });
 
   it('redacts credential-like strings from stored output', async () => {

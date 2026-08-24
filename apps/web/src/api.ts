@@ -345,6 +345,8 @@ export interface ToolGrant {
   id: string;
   toolName: string;
   actor: ToolActor;
+  risk: RiskLevel | null;
+  definitionRevision: string | null;
   projectId: string | null;
   sessionId: string | null;
   note: string | null;
@@ -392,11 +394,36 @@ export interface Message {
   createdAt: string;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export interface AuthStatus {
+  authenticated: boolean;
+  paired: boolean;
+}
+
+const CONTROL_STORAGE_KEY = 'jarvis-human-control';
+
+export function controlCredential(): string | null {
+  return typeof localStorage === 'undefined' ? null : localStorage.getItem(CONTROL_STORAGE_KEY);
+}
+
+export async function authenticatedFetch(path: string, init?: RequestInit): Promise<Response> {
+  const credential = controlCredential();
   const response = await fetch(path, {
     ...init,
-    headers: { 'content-type': 'application/json', ...init?.headers },
+    headers: {
+      ...(init?.body ? { 'content-type': 'application/json' } : {}),
+      ...(credential ? { 'x-jarvis-control': credential } : {}),
+      ...init?.headers,
+    },
   });
+  if (response.status === 401 && typeof localStorage !== 'undefined') {
+    localStorage.removeItem(CONTROL_STORAGE_KEY);
+    if (typeof window !== 'undefined') window.dispatchEvent(new Event('jarvis-auth-failed'));
+  }
+  return response;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await authenticatedFetch(path, init);
   const text = await response.text();
   const body = text ? (JSON.parse(text) as unknown) : null;
   if (!response.ok) {
@@ -408,6 +435,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  authStatus: () => request<AuthStatus>('/api/auth/status'),
+  pair: async (bootstrap: string) => {
+    const paired = await request<{ credential: string }>('/api/auth/pair', {
+      method: 'POST',
+      body: JSON.stringify({ bootstrap }),
+    });
+    localStorage.setItem(CONTROL_STORAGE_KEY, paired.credential);
+    return paired;
+  },
+  revokeControl: async () => {
+    const result = await request<{ revoked: boolean; restartRequired: boolean }>(
+      '/api/auth/revoke',
+      { method: 'POST' },
+    );
+    localStorage.removeItem(CONTROL_STORAGE_KEY);
+    return result;
+  },
   health: () => request<Health>('/api/health'),
 
   projects: () => request<Project[]>('/api/projects'),
@@ -528,6 +572,11 @@ export const api = {
   toolGrants: () => request<ToolGrant[]>('/api/tool-grants'),
   revokeToolGrant: (id: string) =>
     request<{ revoked: boolean }>(`/api/tool-grants/${id}`, { method: 'DELETE' }),
+  artifact: async (url: string) => {
+    const response = await authenticatedFetch(url);
+    if (!response.ok) throw new Error(`artifact request failed: ${response.status}`);
+    return response.blob();
+  },
 };
 
 /** Screenshots are served from the artifacts root, addressed by relative path. */

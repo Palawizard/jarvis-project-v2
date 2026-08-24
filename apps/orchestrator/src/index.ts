@@ -11,6 +11,13 @@ const log = createLogger('orchestrator');
 
 async function main(): Promise<void> {
   const jarvis = Jarvis.open();
+  if (!jarvis.control.paired()) {
+    const bootstrap = jarvis.control.createBootstrap();
+    process.stderr.write(
+      `\nJarvis human pairing token (valid once for 10 minutes): ${bootstrap}\n` +
+        `Open the Jarvis UI and enter it there. It is not available through HTTP.\n\n`,
+    );
+  }
   const boot = await jarvis.boot();
   log.info('booted', {
     home: jarvis.config.home,
@@ -25,7 +32,11 @@ async function main(): Promise<void> {
   // The UI dev server runs on a different port; the API is bound to localhost only.
   app.use(
     '/api/*',
-    cors({ origin: (origin) => (origin?.startsWith('http://localhost') ? origin : null) }),
+    cors({
+      origin: (origin) => (jarvis.config.controlOrigins.includes(origin) ? origin : null),
+      allowHeaders: ['Content-Type', 'X-Jarvis-Control'],
+      allowMethods: ['GET', 'HEAD', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    }),
   );
   app.route('/', createRoutes(jarvis));
 
@@ -36,7 +47,9 @@ async function main(): Promise<void> {
       const requested = c.req.path === '/' ? '/index.html' : c.req.path;
       const target = path.resolve(webDist, `.${requested}`);
       const file =
-        target.startsWith(webDist) && fs.existsSync(target) && fs.statSync(target).isFile()
+        target.startsWith(webDist + path.sep) &&
+        fs.existsSync(target) &&
+        fs.statSync(target).isFile()
           ? target
           : path.join(webDist, 'index.html');
       const ext = path.extname(file);

@@ -6,6 +6,7 @@ import type { AgentRegistry } from '../agents/registry.js';
 import type { AgentRunResult, ProviderId, TaskProfile } from '../agents/types.js';
 import type { VerificationReport } from '../verification/engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
+import { z } from 'zod';
 
 export interface ReviewFinding {
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
@@ -48,6 +49,23 @@ export interface ReviewOptions {
 }
 
 const MAX_DIFF_CHARS = 120_000;
+const FINDING_SCHEMA = z
+  .object({
+    severity: z.enum(['critical', 'high', 'medium', 'low', 'info']),
+    category: z.enum(['correctness', 'security', 'design', 'tests', 'performance', 'style']),
+    file: z.string().trim().min(1).optional(),
+    line: z.number().int().positive().optional(),
+    description: z.string().trim().min(1),
+    recommendation: z.string(),
+  })
+  .strict();
+const REVIEW_SCHEMA = z
+  .object({
+    verdict: z.enum(['approve', 'request_changes']),
+    summary: z.string().trim().min(1),
+    findings: z.array(FINDING_SCHEMA),
+  })
+  .strict();
 
 /**
  * Independent review pass.
@@ -201,7 +219,10 @@ export class ReviewEngine {
       return review;
     }
 
-    const parsed = parseReviewOutput(result.result);
+    const parsed = parseReviewOutput(
+      result.result,
+      this.config.pipeline.codeReviewBlockingSeverities,
+    );
     if (parsed.verdict === 'error') {
       const protocolError = parsed.summary || 'reviewer returned invalid structured output';
       this.agents.recordResult?.(routed.provider.id, {
@@ -351,7 +372,10 @@ array is a valid and common answer for a clean change.`;
  * A reviewer that returns unparseable output is reported as `error`, never
  * silently treated as an approval.
  */
-export function parseReviewOutput(text: string): {
+export function parseReviewOutput(
+  text: string,
+  blockingSeverities: readonly string[] = ['critical', 'high'],
+): {
   verdict: Review['verdict'];
   summary: string;
   findings: ReviewFinding[];
@@ -359,50 +383,37 @@ export function parseReviewOutput(text: string): {
   const blocks = [...text.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)]
     .map((m) => m[1])
     .filter(Boolean);
-  // Prefer the last block: models often show an example before their answer.
-  for (const block of blocks.reverse()) {
-    try {
-      const parsed = JSON.parse((block as string).trim()) as Record<string, unknown>;
-      if (!parsed || typeof parsed !== 'object' || !('verdict' in parsed)) continue;
-      const findings = Array.isArray(parsed.findings)
-        ? parsed.findings.flatMap((f) => {
-            const finding = normaliseFinding(f);
-            return finding ? [finding] : [];
-          })
-        : [];
-      const hasBlocking = findings.some((f) => f.severity === 'critical' || f.severity === 'high');
-      return {
-        // Structured severity is authoritative in both directions: advisory
-        // findings cannot turn a candidate into a blocking request.
-        verdict: hasBlocking ? 'request_changes' : 'approve',
-        summary: typeof parsed.summary === 'string' ? parsed.summary : '',
-        findings,
-      };
-    } catch {
-      continue;
+  const block = blocks.at(-1);
+  if (!block) return invalidReview();
+  try {
+    const checked = REVIEW_SCHEMA.safeParse(JSON.parse(block.trim()));
+    if (!checked.success) return invalidReview(checked.error.issues[0]?.message);
+    const findings = checked.data.findings as ReviewFinding[];
+    const blocking = findings.filter((finding) => blockingSeverities.includes(finding.severity));
+    if (blocking.some((finding) => !finding.recommendation.trim())) {
+      return invalidReview('blocking findings require a recommendation');
     }
+    if (checked.data.verdict === 'request_changes' && blocking.length === 0) {
+      return invalidReview('request_changes requires at least one configured blocking finding');
+    }
+    return {
+      verdict: blocking.length ? 'request_changes' : 'approve',
+      summary: checked.data.summary,
+      findings,
+    };
+  } catch {
+    return invalidReview();
   }
-  return {
-    verdict: 'error',
-    summary: 'Reviewer output could not be parsed as structured findings.',
-    findings: [],
-  };
 }
 
-function normaliseFinding(raw: unknown): ReviewFinding | null {
-  if (typeof raw !== 'object' || raw === null) return null;
-  const obj = raw as Record<string, unknown>;
-  const description = typeof obj.description === 'string' ? obj.description.trim() : '';
-  if (!description) return null;
-  const severities: ReviewFinding['severity'][] = ['critical', 'high', 'medium', 'low', 'info'];
+function invalidReview(detail?: string): {
+  verdict: 'error';
+  summary: string;
+  findings: [];
+} {
   return {
-    severity: severities.includes(obj.severity as ReviewFinding['severity'])
-      ? (obj.severity as ReviewFinding['severity'])
-      : 'medium',
-    category: typeof obj.category === 'string' ? obj.category : 'general',
-    ...(typeof obj.file === 'string' ? { file: obj.file } : {}),
-    ...(typeof obj.line === 'number' ? { line: obj.line } : {}),
-    description,
-    recommendation: typeof obj.recommendation === 'string' ? obj.recommendation : '',
+    verdict: 'error',
+    summary: `Reviewer output failed strict structured validation${detail ? `: ${detail}` : '.'}`,
+    findings: [],
   };
 }

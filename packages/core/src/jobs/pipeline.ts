@@ -1,4 +1,5 @@
 import type { Db } from '../db/index.js';
+import fs from 'node:fs';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
@@ -84,24 +85,63 @@ export class JobPipeline {
     const { jobId } = { jobId: input.job.id };
     let job = jobs.get(jobId) as Job;
     let provider = input.implementerProvider;
+    let infrastructureAttempts = 0;
+    let verificationCycle =
+      Number(
+        (
+          this.deps.db
+            .prepare('SELECT MAX(cycle) AS cycle FROM verifications WHERE job_id=?')
+            .get(jobId) as { cycle?: number | null }
+        ).cycle ?? -1,
+      ) + 1;
     for (;;) {
+      job = jobs.get(jobId) as Job;
       if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
 
       // Verification failures have their own bounded repair budget.
       let report: VerificationReport;
       for (;;) {
-        jobs.transition(jobId, 'verifying', { pauseReason: null, error: null });
+        const verificationPatch = {
+          pauseReason: null,
+          error: null,
+          restartReason: null,
+          repairKind: null,
+          repairCheckpoint: null,
+        };
+        if (job.stage === 'verifying') jobs.patch(jobId, verificationPatch);
+        else jobs.transition(jobId, 'verifying', verificationPatch);
         job = jobs.get(jobId) as Job;
         report = await verification.run({
           jobId,
           cwd: input.cwd,
           commands: input.project.commands,
           steps: input.project.config.verification?.steps,
-          cycle: job.fixCycles + job.reviewFixCycles + job.visualFixCycles,
+          cycle: verificationCycle++,
           signal: input.signal,
         });
         if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
         if (report.passed) break;
+        if (report.failureKind === 'cancelled') {
+          jobs.transition(jobId, 'cancelled');
+          return;
+        }
+        if (report.failureKind === 'infrastructure') {
+          if (infrastructureAttempts < this.config.pipeline.verificationInfraRetries) {
+            infrastructureAttempts += 1;
+            this.deps.bus.emit({
+              type: 'verification.retry',
+              jobId,
+              payload: { attempt: infrastructureAttempts, failureKind: report.failureKind },
+            });
+            continue;
+          }
+          this.pause(
+            jobId,
+            'verifying',
+            `Verification infrastructure attempts exhausted (${infrastructureAttempts + 1} total).\n\n${report.failureSummary}`,
+          );
+          return;
+        }
         if (job.fixCycles >= this.config.pipeline.maxFixCycles) {
           this.pause(
             jobId,
@@ -111,7 +151,18 @@ export class JobPipeline {
           return;
         }
         const cycle = job.fixCycles + 1;
-        jobs.transition(jobId, 'fixing', { fixCycles: cycle });
+        jobs.transition(jobId, 'fixing', {
+          fixCycles: cycle,
+          repairKind: 'verification',
+          repairCheckpoint: {
+            kind: 'verification',
+            verification: {
+              resultIds: report.results.map((result) => result.id),
+              cycle: report.results[0]?.cycle ?? 0,
+              failureSummary: report.failureSummary,
+            },
+          },
+        });
         const fixed = await this.runAgentStage({
           jobId,
           role: 'fixer',
@@ -140,6 +191,8 @@ export class JobPipeline {
           reviewedHead: null,
           visualHead: null,
           headRef: await this.git.resolveCommit(input.cwd, 'HEAD'),
+          repairKind: null,
+          repairCheckpoint: null,
         });
       }
 
@@ -189,7 +242,19 @@ export class JobPipeline {
           return;
         }
         const cycle = job.reviewFixCycles + 1;
-        jobs.transition(jobId, 'fixing', { reviewFixCycles: cycle });
+        jobs.transition(jobId, 'fixing', {
+          reviewFixCycles: cycle,
+          repairKind: 'code_review',
+          repairCheckpoint: {
+            kind: 'code_review',
+            verification: {
+              resultIds: report.results.map((result) => result.id),
+              cycle: report.results[0]?.cycle ?? 0,
+              failureSummary: report.failureSummary,
+            },
+            review: { id: reviewResult.id, findings: blockers },
+          },
+        });
         const fixed = await this.runAgentStage({
           jobId,
           role: 'fixer',
@@ -214,7 +279,12 @@ export class JobPipeline {
         }
         provider = fixed.provider;
         await this.git.commitPending(input.cwd, `jarvis: code review fix ${cycle}`);
-        jobs.patch(jobId, { reviewedHead: null, visualHead: null });
+        jobs.patch(jobId, {
+          reviewedHead: null,
+          visualHead: null,
+          repairKind: null,
+          repairCheckpoint: null,
+        });
         continue;
       }
       job = jobs.patch(jobId, { reviewedHead: changes.head });
@@ -254,7 +324,18 @@ export class JobPipeline {
             return;
           }
           const cycle = job.visualFixCycles + 1;
-          jobs.transition(jobId, 'fixing', { visualFixCycles: cycle });
+          jobs.transition(jobId, 'fixing', {
+            visualFixCycles: cycle,
+            repairKind: 'visual',
+            repairCheckpoint: {
+              kind: 'visual',
+              visual: {
+                shotIds: visual.shots.map((shot) => shot.id),
+                findings: blockingReview.findings,
+                cycle: job.visualFixCycles,
+              },
+            },
+          });
           const fixed = await this.runAgentStage({
             jobId,
             role: 'visual_fixer',
@@ -282,7 +363,12 @@ export class JobPipeline {
           }
           provider = fixed.provider;
           await this.git.commitPending(input.cwd, `jarvis: visual fix ${cycle}`);
-          jobs.patch(jobId, { reviewedHead: null, visualHead: null });
+          jobs.patch(jobId, {
+            reviewedHead: null,
+            visualHead: null,
+            repairKind: null,
+            repairCheckpoint: null,
+          });
           continue;
         } else {
           job = jobs.patch(jobId, { visualHead: changes.head });
@@ -421,16 +507,90 @@ export class JobPipeline {
       let provider = job.lastProvider ?? undefined;
       let runId = jobs.runs(jobId).at(-1)?.id ?? '';
       if (resumeStage === 'implementing' || resumeStage === 'fixing') {
-        jobs.transition(jobId, resumeStage, { pauseReason: null, error: null });
+        let role: 'implementer' | 'fixer' | 'visual_fixer' = 'implementer';
+        let prompt = buildResumePrompt(job, resumeStage);
+        let imagePaths: string[] | undefined;
+        if (resumeStage === 'fixing') {
+          const checkpoint = job.repairCheckpoint;
+          if (!checkpoint || checkpoint.kind !== job.repairKind) {
+            jobs.patch(jobId, {
+              pauseReason: 'Resume refused: exact repair checkpoint is missing',
+              error: 'Resume refused: exact repair checkpoint is missing',
+            });
+            return;
+          }
+          if (checkpoint.kind === 'verification' && checkpoint.verification) {
+            role = 'fixer';
+            prompt = buildFixerPrompt({
+              job,
+              failures: checkpoint.verification.failureSummary,
+            });
+          } else if (
+            checkpoint.kind === 'code_review' &&
+            checkpoint.review &&
+            checkpoint.verification
+          ) {
+            role = 'fixer';
+            prompt = buildReviewFixerPrompt({
+              job,
+              blockers: checkpoint.review.findings,
+              verification: this.deps.verification.reportForResults(
+                jobId,
+                checkpoint.verification.resultIds,
+                checkpoint.verification.failureSummary,
+              ),
+            });
+          } else if (checkpoint.kind === 'visual' && checkpoint.visual) {
+            role = 'visual_fixer';
+            const changes = await this.git.collectChanges(job.worktreePath, job.baseRef);
+            const shots = this.visualQa
+              .list(jobId)
+              .filter((shot) => checkpoint.visual?.shotIds.includes(shot.id));
+            imagePaths = shots.flatMap((shot) =>
+              shot.screenshotPath && fs.existsSync(shot.screenshotPath)
+                ? [shot.screenshotPath]
+                : [],
+            );
+            if (imagePaths.length !== checkpoint.visual.shotIds.length) {
+              jobs.patch(jobId, {
+                pauseReason: 'Resume refused: persisted visual repair evidence is incomplete',
+                error: 'Resume refused: persisted visual repair evidence is incomplete',
+              });
+              return;
+            }
+            prompt = buildVisualFixerPrompt({
+              job,
+              review: {
+                verdict: 'needs_fix',
+                findings: checkpoint.visual.findings,
+                provider: null,
+                model: null,
+              },
+              diff: changes.diff,
+            });
+          } else {
+            jobs.patch(jobId, {
+              pauseReason: 'Resume refused: repair checkpoint is malformed',
+              error: 'Resume refused: repair checkpoint is malformed',
+            });
+            return;
+          }
+        }
+        jobs.transition(jobId, resumeStage, {
+          pauseReason: null,
+          error: null,
+          restartReason: null,
+        });
         const resumed = await this.runAgentStage({
           jobId,
-          role: resumeStage === 'implementing' ? 'implementer' : 'fixer',
+          role,
           cwd: job.worktreePath,
           contextPackId: pack.id,
-          prompt: buildResumePrompt(job, resumeStage),
+          prompt,
           signal,
           preferredProvider: provider,
           resumeSessionId: job.resumeSessionId ?? undefined,
+          ...(imagePaths ? { imagePaths } : {}),
         });
         if (resumed.status === 'cancelled' || signal.aborted) {
           jobs.transition(jobId, 'cancelled');
@@ -441,6 +601,11 @@ export class JobPipeline {
           return;
         }
         await this.git.commitPending(job.worktreePath, `jarvis: resume ${resumeStage}`);
+        jobs.patch(jobId, {
+          headRef: await this.git.resolveCommit(job.worktreePath, 'HEAD'),
+          repairKind: null,
+          repairCheckpoint: null,
+        });
         summary = resumed.result;
         provider = resumed.provider;
         runId = resumed.runId;
@@ -493,6 +658,7 @@ export class JobPipeline {
       branch: worktree.branch,
       worktreePath: worktree.path,
       baseRef: worktree.baseRef,
+      headRef: worktree.baseRef,
     });
 
     const pack = await context.build({
@@ -554,6 +720,7 @@ export class JobPipeline {
       return;
     }
     await this.git.commitPending(worktree.path, `jarvis: ${job.goal}`);
+    jobs.patch(jobId, { headRef: await this.git.resolveCommit(worktree.path, 'HEAD') });
     await this.runCandidateGates({
       job: jobs.get(jobId) as Job,
       project,

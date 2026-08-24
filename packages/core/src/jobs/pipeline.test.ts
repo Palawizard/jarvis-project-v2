@@ -18,7 +18,7 @@ import { GitWorkspace } from '../git/workspace.js';
 import { JobService } from './service.js';
 import { ProjectService, type Project } from '../projects/service.js';
 import type { Review, ReviewFinding, ReviewOptions } from '../review/engine.js';
-import type { VerificationReport } from '../verification/engine.js';
+import { VerificationEngine, type VerificationReport } from '../verification/engine.js';
 import { JobPipeline } from './pipeline.js';
 import { nowIso } from '../ids.js';
 import type { VisualQaShot, VisualReviewFinding } from '../visualqa/engine.js';
@@ -74,6 +74,52 @@ const highFinding = (): ReviewFinding => ({
   recommendation: 'Repair the fixture candidate.',
 });
 
+const failedVerification = (failureKind: 'product' | 'infrastructure'): VerificationReport => ({
+  passed: false,
+  ran: failureKind === 'product' ? 1 : 0,
+  failureSummary: `${failureKind} fixture failure`,
+  failureKind,
+  results: [
+    {
+      id: `ver-${failureKind}`,
+      name: failureKind === 'product' ? 'test' : 'install',
+      command: 'fixture',
+      status: failureKind === 'product' ? 'failed' : 'error',
+      exitCode: failureKind === 'product' ? 1 : null,
+      output: `${failureKind} failure`,
+      outputPath: null,
+      durationMs: 1,
+      cycle: 0,
+      kind: failureKind === 'product' ? 'check' : 'setup',
+      required: true,
+      failureKind,
+    },
+  ],
+});
+
+const passedVerification = (): VerificationReport => ({
+  passed: true,
+  ran: 1,
+  failureSummary: '',
+  failureKind: 'none',
+  results: [
+    {
+      id: 'ver-pass',
+      name: 'test',
+      command: 'fixture',
+      status: 'passed',
+      exitCode: 0,
+      output: '',
+      outputPath: null,
+      durationMs: 1,
+      cycle: 0,
+      kind: 'check',
+      required: true,
+      failureKind: 'none',
+    },
+  ],
+});
+
 interface Harness {
   home: string;
   repo: string;
@@ -96,6 +142,7 @@ async function harness(options: {
   maxReviewFixCycles?: number;
   visual?: 'repair' | 'infrastructure' | 'advisory';
   selfDevelopment?: boolean;
+  verification?: VerificationReport[];
 }): Promise<Harness> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-pipeline-'));
   roots.push(home);
@@ -154,10 +201,18 @@ async function harness(options: {
   const verification = {
     async run(input: { cycle: number }): Promise<VerificationReport> {
       verificationCalls.push(input.cycle);
+      const configured = options.verification?.[verificationCalls.length - 1];
+      if (configured) {
+        return {
+          ...configured,
+          results: configured.results.map((result) => ({ ...result, cycle: input.cycle })),
+        };
+      }
       return {
         passed: true,
         ran: 1,
         failureSummary: '',
+        failureKind: 'none',
         results: [
           {
             id: `ver-${verificationCalls.length}`,
@@ -171,9 +226,20 @@ async function harness(options: {
             cycle: input.cycle,
             kind: 'check',
             required: true,
+            failureKind: 'none',
           },
         ],
       };
+    },
+    latestReport(): VerificationReport {
+      return passedVerification();
+    },
+    reportForResults(jobId: string, resultIds: string[], failureSummary: string) {
+      return new VerificationEngine(db, config.artifactsDir, bus).reportForResults(
+        jobId,
+        resultIds,
+        failureSummary,
+      );
     },
   };
   const reviewHeads: string[] = [];
@@ -594,6 +660,235 @@ describe('job repair pipeline', () => {
     expect(h.provider.calls.filter((call) => call.role === 'visual_fixer')).toHaveLength(0);
     h.db.close();
   });
+
+  it('retries verification infrastructure without invoking a source fixer', async () => {
+    const h = await harness({
+      verification: [failedVerification('infrastructure'), passedVerification()],
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'approved',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('awaiting_user');
+    expect(h.verificationCalls).toHaveLength(2);
+    expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('pauses after bounded verification infrastructure retries without a fixer', async () => {
+    const h = await harness({
+      verification: [
+        failedVerification('infrastructure'),
+        failedVerification('infrastructure'),
+        failedVerification('infrastructure'),
+      ],
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'unused',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('paused');
+    expect(job.resumeStage).toBe('verifying');
+    expect(job.pauseReason).toContain('infrastructure attempts exhausted');
+    expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('invokes the verification fixer for an actual product failure', async () => {
+    const h = await harness({
+      verification: [failedVerification('product'), passedVerification()],
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'approved',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('awaiting_user');
+    expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(1);
+    h.db.close();
+  });
+
+  it.each([
+    ['verification', 'fixer', 'persisted verification failure', undefined],
+    ['code_review', 'fixer', highFinding().description, undefined],
+    ['visual', 'visual_fixer', 'persisted visual issue', 'advisory'],
+  ] as const)(
+    'resumes the exact interrupted %s repair checkpoint',
+    async (kind, expectedRole, evidence, visual) => {
+      const h = await harness({
+        ...(visual ? { visual } : {}),
+        review: (_call, opts) => ({
+          runId: null,
+          provider: 'codex',
+          verdict: 'approve',
+          summary: 'approved',
+          findings: [],
+          headRef: opts.headRef,
+          blocking: false,
+        }),
+      });
+      const job = h.jobs.create({ projectId: h.project.id, request: `Resume ${kind} repair.` });
+      h.jobs.transition(job.id, 'planning');
+      h.jobs.transition(job.id, 'implementing');
+      const worktree = await new GitWorkspace(h.config.worktreesDir).createWorktree({
+        repoRoot: h.repo,
+        jobId: job.id,
+      });
+      fs.writeFileSync(path.join(worktree.path, 'change.txt'), 'checkpoint\n');
+      const head = (await new GitWorkspace(h.config.worktreesDir).commitPending(
+        worktree.path,
+        'repair checkpoint',
+      )) as string;
+      h.jobs.patch(job.id, {
+        worktreePath: worktree.path,
+        branch: worktree.branch,
+        baseRef: worktree.baseRef,
+        headRef: head,
+      });
+      h.jobs.transition(job.id, 'verifying');
+      h.db
+        .prepare(
+          `INSERT INTO verifications
+            (id,job_id,cycle,name,command,cwd,exit_code,status,output,duration_ms,kind,required,
+             failure_kind,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          'ver-checkpoint',
+          job.id,
+          0,
+          'test',
+          'test',
+          worktree.path,
+          kind === 'verification' ? 1 : 0,
+          kind === 'verification' ? 'failed' : 'passed',
+          evidence,
+          1,
+          'check',
+          1,
+          kind === 'verification' ? 'product' : 'none',
+          nowIso(),
+        );
+      if (kind === 'code_review') {
+        h.db
+          .prepare(
+            `INSERT INTO verifications
+              (id,job_id,cycle,name,command,cwd,exit_code,status,output,duration_ms,kind,required,
+               failure_kind,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          )
+          .run(
+            'ver-newer-unrelated',
+            job.id,
+            1,
+            'newer-unrelated-check',
+            'test',
+            worktree.path,
+            0,
+            'passed',
+            '',
+            1,
+            'check',
+            1,
+            'none',
+            nowIso(),
+          );
+      }
+      const screenshotPath = path.join(h.home, 'persisted-visual.png');
+      if (kind === 'visual') {
+        fs.writeFileSync(screenshotPath, 'visual evidence');
+        h.db
+          .prepare(
+            `INSERT INTO visual_qa
+            (id,job_id,project_id,scenario_name,route,viewport,screenshot_path,console_errors,
+             network_failures,status,head_ref,cycle,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          )
+          .run(
+            'shot-checkpoint',
+            job.id,
+            h.project.id,
+            'tools',
+            '/',
+            'desktop',
+            screenshotPath,
+            '[]',
+            '[]',
+            'captured',
+            head,
+            0,
+            nowIso(),
+          );
+      }
+      h.jobs.transition(job.id, 'fixing', {
+        repairKind: kind,
+        repairCheckpoint:
+          kind === 'verification'
+            ? {
+                kind,
+                verification: {
+                  resultIds: ['ver-checkpoint'],
+                  cycle: 0,
+                  failureSummary: 'persisted verification failure',
+                },
+              }
+            : kind === 'code_review'
+              ? {
+                  kind,
+                  verification: { resultIds: ['ver-checkpoint'], cycle: 0, failureSummary: '' },
+                  review: { id: 'review-checkpoint', findings: [highFinding()] },
+                }
+              : {
+                  kind,
+                  visual: {
+                    shotIds: ['shot-checkpoint'],
+                    cycle: 0,
+                    findings: [
+                      {
+                        severity: 'high',
+                        scenarioName: 'tools',
+                        route: '/',
+                        viewport: 'desktop',
+                        category: 'layout',
+                        description: 'persisted visual issue',
+                        recommendation: 'fix the persisted visual issue',
+                      },
+                    ],
+                  },
+                },
+      });
+      expect(h.jobs.recoverInterrupted().jobs).toBe(1);
+      expect(h.jobs.get(job.id)?.restartReason).toBe('orchestrator_restart');
+      h.pipeline.resume(job.id);
+      const deadline = Date.now() + 20_000;
+      while (h.pipeline.isRunning(job.id) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(h.jobs.get(job.id)?.stage).toBe('awaiting_user');
+      const resumed = h.provider.calls.find((call) => call.role === expectedRole);
+      expect(resumed?.prompt).toContain(evidence);
+      if (kind === 'code_review') expect(resumed?.prompt).not.toContain('newer-unrelated-check');
+      if (kind === 'visual') expect(resumed?.imagePaths).toEqual([screenshotPath]);
+      h.db.close();
+    },
+  );
 
   it.each([
     ['verifying', undefined],

@@ -6,6 +6,7 @@ import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { ProjectCommands, VerificationStep } from '../projects/service.js';
 import { redactSecrets } from '../memory/secrets.js';
+import { untrustedProcessEnv } from '../agents/spawn.js';
 
 export interface VerificationResult {
   id: string;
@@ -313,7 +314,7 @@ function runCommand(
       cwd,
       shell: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, CI: '1', FORCE_COLOR: '0', NO_COLOR: '1' },
+      env: { ...untrustedProcessEnv(), CI: '1', FORCE_COLOR: '0', NO_COLOR: '1' },
       windowsHide: true,
     });
 

@@ -212,7 +212,7 @@ describe('deterministic visual interactions', () => {
     }
   });
 
-  it('invalidates navigation scheduled specifically during the final screenshot window', async () => {
+  it('invalidates navigation after the screenshot file is written but before acceptance', async () => {
     let foreignRequests = 0;
     const target = http.createServer((_request, response) => {
       foreignRequests++;
@@ -223,21 +223,17 @@ describe('deterministic visual interactions', () => {
     const targetAddress = target.address();
     if (!targetAddress || typeof targetAddress === 'string') throw new Error('target did not bind');
     const escaped = `http://127.0.0.1:${targetAddress.port}/escaped`;
-    const candidate = http.createServer((request, response) => {
-      if (request.url === '/slow-font') {
-        setTimeout(() => response.end('not-a-font'), 700);
-        return;
-      }
-      response.end(
-        `<style>@font-face{font-family:slow;src:url('/slow-font')} .slow{font-family:slow}</style>` +
-          `<button id="go" onclick="document.body.className='slow';setTimeout(()=>location.href='${escaped}',425)">go</button>`,
-      );
-    });
+    const candidate = http.createServer((_request, response) => response.end('<h1>candidate</h1>'));
     servers.push(candidate);
     await new Promise<void>((resolve) => candidate.listen(0, '127.0.0.1', resolve));
     const address = candidate.address();
     if (!address || typeof address === 'string') throw new Error('candidate did not bind');
-    const { engine, db, artifactsDir } = visualFixture();
+    const { engine, db, artifactsDir } = visualFixture(async (page, screenshotPath) => {
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      await page.evaluate((url) => {
+        location.href = url;
+      }, escaped);
+    });
     try {
       const shots = await engine.capture({
         jobId: 'job-tools',
@@ -248,7 +244,6 @@ describe('deterministic visual interactions', () => {
           {
             name: 'screenshot-race',
             route: '/',
-            interactions: [{ action: 'click', selector: '#go' }],
             viewports: ['desktop'],
           },
         ],
@@ -367,7 +362,9 @@ describe('deterministic visual interactions', () => {
   });
 });
 
-function visualFixture(): {
+function visualFixture(
+  captureScreenshot?: NonNullable<ConstructorParameters<typeof VisualQaEngine>[3]>,
+): {
   engine: VisualQaEngine;
   db: ReturnType<typeof openDb>;
   artifactsDir: string;
@@ -386,7 +383,7 @@ function visualFixture(): {
      VALUES (?,?,?,?,?,?,?,?)`,
   ).run('job-tools', 'project-tools', 'capture', 'capture', 'visual_qa', 'running', 'now', 'now');
   return {
-    engine: new VisualQaEngine(db, config.artifactsDir),
+    engine: new VisualQaEngine(db, config.artifactsDir, undefined, captureScreenshot),
     db,
     artifactsDir: config.artifactsDir,
   };

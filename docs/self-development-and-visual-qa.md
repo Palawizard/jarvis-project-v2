@@ -11,7 +11,7 @@ Current safety boundary:
 - require human-control authentication before approval, application, preparation, or activation;
 - require explicit approval and a second explicit activation confirmation.
 
-`scripts/supervisor.mjs` is intentionally outside the process being replaced. `pnpm supervisor <config.json>` starts Jarvis with a supervised activation-request path. The upgrade manager launches the candidate with dynamic API/web ports, an explicit non-authoritative candidate-mode flag, and a unique `JARVIS_HOME`; candidate mode never mints or prints a human pairing bootstrap. It records the current/candidate SHA and rollback ref, and exposes activation only after candidate health passes. Candidate/provider environments explicitly remove bootstrap/control names. The authenticated browser credential is never written into the activation file; the supervisor continues to trust only the persisted approved request and rechecks clean HEAD/branch/ref identity before FF-only application, rebuild, restart, `/health`, and conditional rollback. Ambiguity becomes `inspection_required`.
+`scripts/supervisor.mjs` is intentionally outside the process being replaced. `pnpm supervisor <config.json>` starts Jarvis with a supervised activation-request path. The upgrade manager launches the candidate with dynamic API/web ports, an explicit non-authoritative candidate-mode flag, and a unique `JARVIS_HOME`; candidate mode never mints or prints a human pairing bootstrap. It records the current/candidate SHA and rollback ref, and exposes activation only after candidate health passes. Candidate commands receive an allowlisted platform environment; provider children also lose ambient secrets and every control/supervisor variable. The authenticated browser credential is never written into the activation file. A second high-entropy token held by the human is entered only at activation; the config contains only its SHA-256 hash, and rejected/processed request records never retain the plaintext. The supervisor then rechecks clean HEAD/branch/ref identity before FF-only application, rebuild, restart, `/health`, and conditional rollback. Ambiguity becomes `inspection_required`.
 
 The config keeps executable and argument fields separate and places the request outside the repository:
 
@@ -19,6 +19,7 @@ The config keeps executable and argument fields separate and places the request 
 {
   "repository": "C:\\absolute\\jarvis",
   "requestFile": "C:\\outside-jarvis\\activation.json",
+  "activationTokenHash": "<sha256-of-a-random-32-byte-human-token>",
   "healthUrl": "http://127.0.0.1:4319/health",
   "buildCommand": { "executable": "pnpm", "args": ["build"] },
   "startCommand": {
@@ -27,6 +28,8 @@ The config keeps executable and argument fields separate and places the request 
   }
 }
 ```
+
+Generate the token and hash out of band, keep the token with the human, and put only the hash in the config. For example: `node -e "const c=require('node:crypto'),t=c.randomBytes(32).toString('hex');console.log('token='+t);console.log('hash='+c.createHash('sha256').update(t).digest('hex'))"`. The UI asks for the token only at the final activation action.
 
 `GET /health` returns status, version, commit, and a real DB probe without runtime paths or credentials.
 

@@ -380,11 +380,9 @@ export function parseReviewOutput(
   summary: string;
   findings: ReviewFinding[];
 } {
-  const blocks = [...text.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)]
-    .map((m) => m[1])
-    .filter(Boolean);
-  const block = blocks.at(-1);
-  if (!block) return invalidReview();
+  const match = text.trim().match(/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/);
+  const block = match?.[1];
+  if (!block) return invalidReview('expected exactly one terminal JSON block');
   try {
     const checked = REVIEW_SCHEMA.safeParse(JSON.parse(block.trim()));
     if (!checked.success) return invalidReview(checked.error.issues[0]?.message);

@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -175,7 +176,7 @@ export class UpgradeManager {
     }
   }
 
-  async requestActivation(jobId: string): Promise<UpgradeTransaction> {
+  async requestActivation(jobId: string, activationToken: string): Promise<UpgradeTransaction> {
     const transaction = this.getForJob(jobId);
     if (!transaction || transaction.status !== 'preflight_passed') {
       throw new Error('self-upgrade preflight must pass before activation');
@@ -183,6 +184,21 @@ export class UpgradeManager {
     const requestPath = process.env.JARVIS_UPGRADE_REQUEST_PATH;
     if (process.env.JARVIS_SUPERVISED !== '1' || !requestPath) {
       throw new Error('Jarvis is not running under the upgrade supervisor');
+    }
+    if (activationToken.length < 32 || activationToken.length > 4096) {
+      throw new Error('the out-of-band supervisor activation token is required');
+    }
+    const tokenHash = process.env.JARVIS_UPGRADE_TOKEN_HASH;
+    if (!/^[0-9a-f]{64}$/.test(tokenHash ?? '')) {
+      throw new Error('the supervisor activation-token hash is unavailable');
+    }
+    if (
+      !timingSafeEqual(
+        createHash('sha256').update(activationToken, 'utf8').digest(),
+        Buffer.from(tokenHash as string, 'hex'),
+      )
+    ) {
+      throw new Error('the out-of-band supervisor activation token is invalid');
     }
     const job = this.jobs.get(jobId);
     if (!job?.worktreePath) throw new Error('candidate worktree is unavailable');
@@ -212,6 +228,7 @@ export class UpgradeManager {
       transactionId: transaction.id,
       approved: true,
       approvedBy: 'user',
+      activationToken,
       repository: transaction.repository,
       branch: transaction.branch,
       previousSha: transaction.previousSha,

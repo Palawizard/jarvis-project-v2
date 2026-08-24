@@ -2,7 +2,7 @@
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clean = (value) => String(value ?? '').trim();
@@ -81,12 +81,16 @@ function loadConfig(file) {
   const repo = fs.realpathSync(raw.repository);
   const root = fs.realpathSync(git(repo, ['rev-parse', '--show-toplevel']));
   if (root !== repo) throw new Error(`repository must be the Git root: ${root}`);
+  if (!/^[0-9a-f]{64}$/.test(raw.activationTokenHash ?? '')) {
+    throw new Error('activationTokenHash must be a lowercase SHA-256 hash');
+  }
   return {
     repository: repo,
     requestFile: outsideRepository(repo, raw.requestFile, 'requestFile'),
     healthUrl: validateHealthUrl(raw.healthUrl),
     startCommand: validateProcess('startCommand', raw.startCommand),
     buildCommand: validateProcess('buildCommand', raw.buildCommand),
+    activationTokenHash: raw.activationTokenHash,
     pollMs: Math.max(25, Number(raw.pollMs) || 250),
     healthTimeoutMs: Math.max(250, Number(raw.healthTimeoutMs) || 30_000),
     commandTimeoutMs: Math.max(1_000, Number(raw.commandTimeoutMs) || 10 * 60_000),
@@ -97,6 +101,14 @@ function loadConfig(file) {
 function validateRequest(raw, config) {
   if (raw?.approved !== true || raw.approvedBy !== 'user') {
     throw new Error('activation request is not explicitly user-approved');
+  }
+  if (typeof raw.activationToken !== 'string' || raw.activationToken.length < 32) {
+    throw new Error('activation request is missing the out-of-band human token');
+  }
+  const expected = Buffer.from(config.activationTokenHash, 'hex');
+  const supplied = createHash('sha256').update(raw.activationToken, 'utf8').digest();
+  if (!timingSafeEqual(supplied, expected)) {
+    throw new Error('activation request human token is invalid');
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(raw.transactionId ?? '')) {
     throw new Error('transactionId must contain only letters, numbers, _ or -');
@@ -209,7 +221,7 @@ async function stopChild(child) {
   }
 }
 
-async function spawnProcess(spec, repo, requestFile, stdio = 'inherit') {
+async function spawnProcess(spec, repo, requestFile, activationTokenHash, stdio = 'inherit') {
   const child = spawn(spec.executable, spec.args, {
     cwd: repo,
     env: {
@@ -217,6 +229,7 @@ async function spawnProcess(spec, repo, requestFile, stdio = 'inherit') {
       ...spec.env,
       JARVIS_SUPERVISED: '1',
       JARVIS_UPGRADE_REQUEST_PATH: requestFile,
+      JARVIS_UPGRADE_TOKEN_HASH: activationTokenHash,
     },
     stdio,
     shell: false,
@@ -232,11 +245,13 @@ async function spawnProcess(spec, repo, requestFile, stdio = 'inherit') {
 
 async function runBuild(config) {
   const started = Date.now();
-  const child = await spawnProcess(config.buildCommand, config.repository, config.requestFile, [
-    'ignore',
-    'pipe',
-    'pipe',
-  ]);
+  const child = await spawnProcess(
+    config.buildCommand,
+    config.repository,
+    config.requestFile,
+    config.activationTokenHash,
+    ['ignore', 'pipe', 'pipe'],
+  );
   let output = '';
   const append = (chunk) => {
     output = `${output}${chunk}`.slice(-8_000);
@@ -287,7 +302,12 @@ function requireState(repo, head) {
 }
 
 async function startHealthy(config, sha) {
-  const child = await spawnProcess(config.startCommand, config.repository, config.requestFile);
+  const child = await spawnProcess(
+    config.startCommand,
+    config.repository,
+    config.requestFile,
+    config.activationTokenHash,
+  );
   try {
     return { child, health: await waitForHealth(config, child, sha) };
   } catch (error) {
@@ -480,13 +500,34 @@ async function main() {
       const processing = `${config.requestFile}.processing`;
       if (fs.existsSync(processing)) throw new Error(`ambiguous pending request: ${processing}`);
       fs.renameSync(config.requestFile, processing);
-      const request = validateRequest(JSON.parse(fs.readFileSync(processing, 'utf8')), config);
+      let request;
+      try {
+        request = validateRequest(JSON.parse(fs.readFileSync(processing, 'utf8')), config);
+      } catch (error) {
+        const rejected = `${config.requestFile}.${Date.now()}.rejected`;
+        atomicJson(rejected, {
+          status: 'rejected',
+          error: error instanceof Error ? error.message : String(error),
+          rejectedAt: new Date().toISOString(),
+        });
+        fs.rmSync(processing);
+        if (config.once) stopping = true;
+        continue;
+      }
       const outcome = await activate(config, request, child);
       child = outcome.child;
       const evidenceFile = request.resultPath;
       if (fs.existsSync(evidenceFile)) throw new Error(`evidence already exists: ${evidenceFile}`);
       atomicJson(evidenceFile, outcome.evidence);
-      fs.renameSync(processing, `${config.requestFile}.${request.transactionId}.processed`);
+      atomicJson(`${config.requestFile}.${request.transactionId}.processed`, {
+        transactionId: request.transactionId,
+        repository: request.repository,
+        branch: request.branch,
+        previousSha: request.previousSha,
+        candidateSha: request.candidateSha,
+        processedAt: new Date().toISOString(),
+      });
+      fs.rmSync(processing);
       if (config.once) stopping = true;
     }
   } finally {

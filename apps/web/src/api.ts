@@ -515,8 +515,11 @@ export const api = {
     request<CandidateApplication>(`/api/jobs/${id}/apply`, { method: 'POST' }),
   prepareUpgrade: (id: string) =>
     request<UpgradeTransaction>(`/api/jobs/${id}/upgrade/prepare`, { method: 'POST' }),
-  activateUpgrade: (id: string) =>
-    request<UpgradeTransaction>(`/api/jobs/${id}/upgrade/activate`, { method: 'POST' }),
+  activateUpgrade: (id: string, activationToken: string) =>
+    request<UpgradeTransaction>(`/api/jobs/${id}/upgrade/activate`, {
+      method: 'POST',
+      body: JSON.stringify({ activationToken }),
+    }),
 
   memory: (params: Record<string, string>) =>
     request<{ items: Memory[]; total: number }>(`/api/memory?${new URLSearchParams(params)}`),

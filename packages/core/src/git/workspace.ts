@@ -382,6 +382,27 @@ export class GitWorkspace {
     return changes;
   }
 
+  /** Preserve validation-only provenance: exact materialized HEAD and source tree, no residue. */
+  async validateMaterializedCandidate(
+    worktreePath: string,
+    baseRef: string,
+    expectedHead: string,
+    sourceRef: string,
+  ) {
+    const changes = await this.validateCandidate(worktreePath, baseRef, expectedHead);
+    const [candidateTree, sourceTree] = await Promise.all([
+      git(worktreePath, ['rev-parse', `${changes.head}^{tree}`]),
+      git(worktreePath, ['rev-parse', `${sourceRef}^{tree}`]),
+    ]);
+    if (candidateTree !== sourceTree) {
+      throw new GitError(
+        'validation-only candidate no longer matches its pinned source tree',
+        'candidate_tree_mismatch',
+      );
+    }
+    return changes;
+  }
+
   /** Validate both repositories and prove that applying the reviewed commit is FF-only. */
   async preflightFastForward(opts: {
     targetRoot: string;

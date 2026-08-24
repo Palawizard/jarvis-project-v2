@@ -43,6 +43,8 @@ const VIEWPORTS = {
   mobile: { width: 390, height: 844 },
 } as const;
 
+type ScreenshotCapture = (page: import('playwright').Page, screenshotPath: string) => Promise<void>;
+
 /**
  * Visual QA evidence capture.
  *
@@ -56,6 +58,9 @@ export class VisualQaEngine {
     private readonly db: Db,
     private readonly artifactsDir: string,
     private readonly bus?: EventBus,
+    private readonly captureScreenshot: ScreenshotCapture = async (page, screenshotPath) => {
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+    },
   ) {}
 
   async capture(opts: {
@@ -214,6 +219,7 @@ export class VisualQaEngine {
         viewport,
         navigation.assert,
         screenshotPaths,
+        this.captureScreenshot,
       );
       await navigation.settle();
       navigation.assert();
@@ -222,7 +228,7 @@ export class VisualQaEngine {
       await navigation.settle();
       navigation.assert();
       screenshotPaths.add(screenshotPath);
-      await page.screenshot({ path: screenshotPath, fullPage: true });
+      await this.captureScreenshot(page, screenshotPath);
       await navigation.settle();
       navigation.assert();
       // Closing the whole context stops page timers and popup creation. The
@@ -410,6 +416,7 @@ async function runInteractions(
   viewport: 'desktop' | 'mobile',
   assertConfined: () => void,
   screenshotPaths: Set<string>,
+  captureScreenshot: ScreenshotCapture,
 ): Promise<void> {
   if (interactions.length > 50) throw new Error('visual interaction script exceeds 50 actions');
   let screenshotIndex = 0;
@@ -446,10 +453,7 @@ async function runInteractions(
         const safeName = (step.name ?? `step-${++screenshotIndex}`).replace(/[^a-z0-9_-]+/gi, '_');
         const screenshotPath = path.join(outDir, `${safeName}-${viewport}-${newId('step')}.png`);
         screenshotPaths.add(screenshotPath);
-        await page.screenshot({
-          path: screenshotPath,
-          fullPage: true,
-        });
+        await captureScreenshot(page, screenshotPath);
         assertConfined();
         break;
       }
@@ -467,6 +471,23 @@ async function confineNavigation(
   const reject = (url: string, kind: string) => {
     violation ??= `${kind} escaped candidate origin: ${url}`.slice(0, 500);
   };
+  const cdp = await context.newCDPSession(page);
+  await cdp.send('Page.enable');
+  const frameTree = (await cdp.send('Page.getFrameTree')) as {
+    frameTree: { frame: { id: string } };
+  };
+  const mainFrameId = frameTree.frameTree.frame.id;
+  cdp.on('Page.frameRequestedNavigation', (event) => {
+    const requested = event as { frameId?: string; url?: string };
+    if (requested.frameId !== mainFrameId || !requested.url) return;
+    try {
+      if (new URL(requested.url).origin !== expectedOrigin) {
+        reject(requested.url, 'main-frame navigation attempt');
+      }
+    } catch {
+      reject(requested.url, 'invalid main-frame navigation attempt');
+    }
+  });
   await context.route('**/*', (route) => {
     const task = (async () => {
       const request = route.request();

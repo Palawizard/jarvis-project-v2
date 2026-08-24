@@ -400,6 +400,19 @@ async function runToRest(
   return finished;
 }
 
+function createPinnedSource(h: Harness): { base: string; source: string } {
+  const git = (args: string[]) =>
+    execFileSync('git', args, { cwd: h.repo, encoding: 'utf8' }).trim();
+  const base = git(['rev-parse', 'HEAD']);
+  git(['switch', '-qc', 'source']);
+  fs.writeFileSync(path.join(h.repo, 'imported.bin'), Buffer.from([0, 1, 255, 128]));
+  git(['add', '-A']);
+  git(['commit', '-qm', 'pinned source']);
+  const source = git(['rev-parse', 'HEAD']);
+  git(['switch', '-q', 'main']);
+  return { base, source };
+}
+
 async function pausedCandidate(
   h: Harness,
   resumeStage: JobStage,
@@ -568,15 +581,9 @@ describe('job repair pipeline', () => {
         blocking: false,
       }),
     });
+    const { base, source } = createPinnedSource(h);
     const git = (args: string[]) =>
       execFileSync('git', args, { cwd: h.repo, encoding: 'utf8' }).trim();
-    const base = git(['rev-parse', 'HEAD']);
-    git(['switch', '-qc', 'source']);
-    fs.writeFileSync(path.join(h.repo, 'imported.bin'), Buffer.from([0, 1, 255, 128]));
-    git(['add', '-A']);
-    git(['commit', '-qm', 'pinned source']);
-    const source = git(['rev-parse', 'HEAD']);
-    git(['switch', '-q', 'main']);
 
     const job = await runToRest(h, {
       projectId: h.project.id,
@@ -598,6 +605,159 @@ describe('job repair pipeline', () => {
         encoding: 'utf8',
       }).trim(),
     ).toBe(git(['rev-parse', `${source}^{tree}`]));
+    h.db.close();
+  });
+
+  it('pauses a failing validation-only candidate without invoking any source fixer', async () => {
+    const h = await harness({
+      verification: [failedVerification('product')],
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'unused',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const { base, source } = createPinnedSource(h);
+    const job = await runToRest(h, {
+      projectId: h.project.id,
+      request: 'Validate the failing pinned source.',
+      candidateSource: { baseSha: base, sourceSha: source },
+      validationOnly: true,
+    });
+    expect(job.stage).toBe('paused');
+    expect(job.resumeStage).toBe('verifying');
+    expect(job.pauseReason).toContain('source fixers are disabled');
+    expect(h.provider.calls).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('rejects tracked source mutation performed by a passing validation command', async () => {
+    const command = `node -e "require('node:fs').writeFileSync('imported.bin','tampered')"`;
+    const h = await harness({
+      realVerification: true,
+      commands: { test: command },
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'unused',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const { base, source } = createPinnedSource(h);
+    const job = await runToRest(h, {
+      projectId: h.project.id,
+      request: 'Validate without deriving new source.',
+      candidateSource: { baseSha: base, sourceSha: source },
+      validationOnly: true,
+    });
+    expect(job.stage).toBe('paused');
+    expect(job.pauseReason).toContain('source identity changed during verification');
+    expect(h.provider.calls).toHaveLength(0);
+    expect(
+      execFileSync('git', ['rev-parse', `${job.headRef}^{tree}`], {
+        cwd: job.worktreePath as string,
+        encoding: 'utf8',
+      }).trim(),
+    ).toBe(
+      execFileSync('git', ['rev-parse', `${source}^{tree}`], {
+        cwd: h.repo,
+        encoding: 'utf8',
+      }).trim(),
+    );
+    expect(
+      execFileSync('git', ['status', '--porcelain'], {
+        cwd: job.worktreePath as string,
+        encoding: 'utf8',
+      }),
+    ).toContain('imported.bin');
+    h.db.close();
+  });
+
+  it('pauses blocking validation-only review findings without a review fixer', async () => {
+    const h = await harness({
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'request_changes',
+        summary: 'blocked',
+        findings: [highFinding()],
+        headRef: opts.headRef,
+        blocking: true,
+      }),
+    });
+    const { base, source } = createPinnedSource(h);
+    const job = await runToRest(h, {
+      projectId: h.project.id,
+      request: 'Review the exact pinned source.',
+      candidateSource: { baseSha: base, sourceSha: source },
+      validationOnly: true,
+    });
+    expect(job.stage).toBe('paused');
+    expect(job.resumeStage).toBe('reviewing');
+    expect(job.pauseReason).toContain('source fixers are disabled');
+    expect(h.provider.calls).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('pauses blocking validation-only visual findings without a visual fixer', async () => {
+    const h = await harness({
+      visual: 'repair',
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'approved',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const { base, source } = createPinnedSource(h);
+    const job = await runToRest(h, {
+      projectId: h.project.id,
+      request: 'Visually review the exact pinned source.',
+      candidateSource: { baseSha: base, sourceSha: source },
+      validationOnly: true,
+    });
+    expect(job.stage).toBe('paused');
+    expect(job.resumeStage).toBe('visual_qa');
+    expect(job.pauseReason).toContain('source fixers are disabled');
+    expect(h.provider.calls).toHaveLength(0);
+    h.db.close();
+  });
+
+  it('reruns verification after a passing check changes and commits source', async () => {
+    const command = `node -e "require('node:fs').writeFileSync('generated.txt','stable')"`;
+    const h = await harness({
+      realVerification: true,
+      commands: { test: command },
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'approved',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('awaiting_user');
+    expect(h.verificationCalls).toHaveLength(2);
+    expect(h.reviewHeads).toEqual([job.headRef]);
+    expect(
+      execFileSync('git', ['show', `${job.headRef}:generated.txt`], {
+        cwd: job.worktreePath as string,
+        encoding: 'utf8',
+      }),
+    ).toBe('stable');
     h.db.close();
   });
 

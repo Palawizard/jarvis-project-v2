@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -8,6 +9,7 @@ import path from 'node:path';
 const roots: string[] = [];
 const children: ChildProcess[] = [];
 const supervisor = path.resolve('scripts/supervisor.mjs');
+const ACTIVATION_TOKEN = 'human-held-supervisor-token-0123456789abcdef';
 
 function git(repo: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
@@ -74,7 +76,11 @@ async function waitFor<T>(
   throw new Error('timed out waiting for supervisor evidence');
 }
 
-async function runActivation(healthyCandidate: boolean, tamperCommand = false) {
+async function runActivation(
+  healthyCandidate: boolean,
+  tamperCommand = false,
+  activationToken = ACTIVATION_TOKEN,
+) {
   const setup = fixture(healthyCandidate);
   const selectedPort = await port();
   const requestFile = path.join(setup.stateDir, 'activate.json');
@@ -93,6 +99,7 @@ async function runActivation(healthyCandidate: boolean, tamperCommand = false) {
     JSON.stringify({
       repository: setup.repo,
       requestFile,
+      activationTokenHash: createHash('sha256').update(ACTIVATION_TOKEN).digest('hex'),
       healthUrl,
       startCommand,
       buildCommand,
@@ -127,6 +134,7 @@ async function runActivation(healthyCandidate: boolean, tamperCommand = false) {
     transactionId,
     approved: true,
     approvedBy: 'user',
+    activationToken,
     repository: setup.repo,
     branch: 'main',
     previousSha: setup.previousSha,
@@ -142,13 +150,19 @@ async function runActivation(healthyCandidate: boolean, tamperCommand = false) {
   fs.writeFileSync(temporary, JSON.stringify(request));
   fs.renameSync(temporary, requestFile);
 
-  if (tamperCommand) {
+  if (tamperCommand || activationToken !== ACTIVATION_TOKEN) {
     const code = await waitFor(() => (child.exitCode === null ? null : child.exitCode));
     children.splice(children.indexOf(child), 1);
+    const rejected = fs
+      .readdirSync(setup.stateDir)
+      .find((name) => name.startsWith('activate.json.') && name.endsWith('.rejected'));
     const evidence: Record<string, unknown> = {
       supervisorExitCode: code,
       logs,
       resultExists: fs.existsSync(resultPath),
+      rejection: rejected
+        ? JSON.parse(fs.readFileSync(path.join(setup.stateDir, rejected), 'utf8'))
+        : null,
     };
     return { ...setup, evidence };
   }
@@ -198,6 +212,11 @@ describe('external self-upgrade supervisor', () => {
     });
     expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.candidateSha);
     expect(git(result.repo, 'status', '--porcelain')).toBe('');
+    const processed = fs.readFileSync(
+      path.join(result.stateDir, 'activate.json.good-activation.processed'),
+      'utf8',
+    );
+    expect(processed).not.toContain(ACTIVATION_TOKEN);
   });
 
   it('restores and restarts the old revision after candidate health fails', async () => {
@@ -219,8 +238,22 @@ describe('external self-upgrade supervisor', () => {
 
   it('rejects activation commands that differ from operator configuration', async () => {
     const result = await runActivation(true, true);
-    expect(result.evidence).toMatchObject({ supervisorExitCode: 1, resultExists: false });
-    expect(String(result.evidence.logs)).toContain('buildCommand does not match supervisor config');
+    expect(result.evidence).toMatchObject({
+      supervisorExitCode: 0,
+      resultExists: false,
+      rejection: { status: 'rejected', error: 'buildCommand does not match supervisor config' },
+    });
+    expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.previousSha);
+    expect(git(result.repo, 'status', '--porcelain')).toBe('');
+  });
+
+  it('rejects a self-asserted approval without the out-of-band human token', async () => {
+    const result = await runActivation(true, false, 'attacker-cannot-self-approve-0123456789');
+    expect(result.evidence).toMatchObject({
+      supervisorExitCode: 0,
+      resultExists: false,
+      rejection: { status: 'rejected', error: 'activation request human token is invalid' },
+    });
     expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.previousSha);
     expect(git(result.repo, 'status', '--porcelain')).toBe('');
   });

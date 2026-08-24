@@ -174,8 +174,10 @@ export function JobDetailView({
             className="btn sm danger"
             onClick={() => {
               if (!confirm('Activate this exact Jarvis candidate through the supervisor?')) return;
+              const activationToken = prompt('Enter the out-of-band supervisor activation token:');
+              if (!activationToken) return;
               void api
-                .activateUpgrade(job.id)
+                .activateUpgrade(job.id, activationToken)
                 .then(() => {
                   setActionError(null);
                   detail.reload();

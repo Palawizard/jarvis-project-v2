@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import type { JarvisConfig } from '../config.js';
-import { killTree } from '../agents/spawn.js';
+import { killTree, untrustedProcessEnv } from '../agents/spawn.js';
 import { repoStatus } from '../git/workspace.js';
 import { redactSecrets } from '../memory/secrets.js';
 import type { Project } from '../projects/service.js';
@@ -45,7 +45,7 @@ export async function startCandidateRuntime(opts: {
   const baseUrl = `http://127.0.0.1:${web}`;
   const healthUrl = `http://127.0.0.1:${api ?? web}${runtime.healthPath ?? '/'}`;
   const env = {
-    ...process.env,
+    ...untrustedProcessEnv(),
     JARVIS_HOME: home,
     JARVIS_RUNTIME_NONCE: runtimeNonce,
     JARVIS_CANDIDATE_RUNTIME: '1',
@@ -59,19 +59,6 @@ export async function startCandidateRuntime(opts: {
         }
       : {}),
   };
-  for (const key of [
-    'JARVIS_SUPERVISED',
-    'JARVIS_UPGRADE_REQUEST_PATH',
-    'JARVIS_COMMIT',
-    'JARVIS_BOOTSTRAP_TOKEN',
-    'JARVIS_CONTROL_TOKEN',
-    'ANTHROPIC_API_KEY',
-    'OPENAI_API_KEY',
-    'CODEX_API_KEY',
-  ]) {
-    delete env[key];
-  }
-
   // Generic frameworks cannot inherit our listening socket. Hold both ports
   // until the last moment, then launch and verify the exact health URL.
   await apiReservation?.release();

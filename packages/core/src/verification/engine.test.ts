@@ -46,6 +46,30 @@ describe('deterministic verification', () => {
     expect(report.results[0]?.output).toContain('verification-ran');
   });
 
+  it('does not expose ambient secrets or supervisor authority to verification commands', async () => {
+    const names = [
+      'JARVIS_SUPERVISED',
+      'JARVIS_UPGRADE_REQUEST_PATH',
+      'JARVIS_UPGRADE_TOKEN_HASH',
+      'GITHUB_TOKEN',
+    ] as const;
+    const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    for (const name of names) process.env[name] = 'must-not-leak';
+    try {
+      const command =
+        `node -e "const e=process.env;` +
+        `process.exit(e.JARVIS_SUPERVISED||e.JARVIS_UPGRADE_REQUEST_PATH||e.JARVIS_UPGRADE_TOKEN_HASH||e.GITHUB_TOKEN?9:0)"`;
+      const report = await engine.run({ jobId: JOB_ID, cwd: home, commands: { test: command } });
+      expect(report.passed).toBe(true);
+      expect(report.results[0]?.exitCode).toBe(0);
+    } finally {
+      for (const name of names) {
+        if (original[name] === undefined) delete process.env[name];
+        else process.env[name] = original[name];
+      }
+    }
+  });
+
   it('reports a real failure and captures the output', async () => {
     const report = await engine.run({
       jobId: JOB_ID,

@@ -86,6 +86,7 @@ export class JobPipeline {
     let job = jobs.get(jobId) as Job;
     let provider = input.implementerProvider;
     let infrastructureAttempts = 0;
+    let verificationMutationCycles = 0;
     let verificationCycle =
       Number(
         (
@@ -100,6 +101,7 @@ export class JobPipeline {
 
       // Verification failures have their own bounded repair budget.
       let report: VerificationReport;
+      let verifiedHead = '';
       for (;;) {
         const verificationPatch = {
           pauseReason: null,
@@ -111,6 +113,7 @@ export class JobPipeline {
         if (job.stage === 'verifying') jobs.patch(jobId, verificationPatch);
         else jobs.transition(jobId, 'verifying', verificationPatch);
         job = jobs.get(jobId) as Job;
+        verifiedHead = await this.git.resolveCommit(input.cwd, 'HEAD');
         report = await verification.run({
           jobId,
           cwd: input.cwd,
@@ -120,6 +123,34 @@ export class JobPipeline {
           signal: input.signal,
         });
         if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
+        if (job.validationOnly) {
+          try {
+            await this.git.validateMaterializedCandidate(
+              input.cwd,
+              job.baseRef as string,
+              job.headRef as string,
+              job.candidateSourceSha as string,
+            );
+          } catch (error) {
+            this.pause(
+              jobId,
+              'verifying',
+              `Validation-only source identity changed during verification: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            return;
+          }
+        } else if (!report.passed) {
+          try {
+            await this.git.validateCandidate(input.cwd, job.baseRef as string, verifiedHead);
+          } catch (error) {
+            this.pause(
+              jobId,
+              'verifying',
+              `Verification changed candidate source before failing; fixer evidence is untrusted: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            return;
+          }
+        }
         if (report.passed) break;
         if (report.failureKind === 'cancelled') {
           jobs.transition(jobId, 'cancelled');
@@ -139,6 +170,14 @@ export class JobPipeline {
             jobId,
             'verifying',
             `Verification infrastructure attempts exhausted (${infrastructureAttempts + 1} total).\n\n${report.failureSummary}`,
+          );
+          return;
+        }
+        if (job.validationOnly) {
+          this.pause(
+            jobId,
+            'verifying',
+            `Validation-only verification failed; source fixers are disabled.\n\n${report.failureSummary}`,
           );
           return;
         }
@@ -196,8 +235,35 @@ export class JobPipeline {
         });
       }
 
-      await this.git.commitPending(input.cwd, 'jarvis: deterministic verification updates');
-      const changes = await this.git.validateCandidate(input.cwd, job.baseRef as string);
+      if (!job.validationOnly) {
+        await this.git.commitPending(input.cwd, 'jarvis: deterministic verification updates');
+        const headAfterVerification = await this.git.resolveCommit(input.cwd, 'HEAD');
+        if (headAfterVerification !== verifiedHead) {
+          if (verificationMutationCycles >= this.config.pipeline.maxFixCycles) {
+            this.pause(
+              jobId,
+              'verifying',
+              'Verification kept changing candidate source; fresh evidence could not stabilize.',
+            );
+            return;
+          }
+          verificationMutationCycles += 1;
+          job = jobs.patch(jobId, {
+            headRef: headAfterVerification,
+            reviewedHead: null,
+            visualHead: null,
+          });
+          continue;
+        }
+      }
+      const changes = job.validationOnly
+        ? await this.git.validateMaterializedCandidate(
+            input.cwd,
+            job.baseRef as string,
+            job.headRef as string,
+            job.candidateSourceSha as string,
+          )
+        : await this.git.validateCandidate(input.cwd, job.baseRef as string, verifiedHead);
       job = jobs.patch(jobId, { headRef: changes.head, reviewedHead: null, visualHead: null });
 
       const session = job.sessionId ? sessions.get(job.sessionId) : null;
@@ -237,6 +303,14 @@ export class JobPipeline {
         this.config.pipeline.codeReviewBlockingSeverities.includes(finding.severity),
       );
       if (blockers.length) {
+        if (job.validationOnly) {
+          this.pause(
+            jobId,
+            'reviewing',
+            `Validation-only review found blocking issues; source fixers are disabled.\n\n${renderCodeBlockers(blockers)}`,
+          );
+          return;
+        }
         if (job.reviewFixCycles >= this.config.pipeline.maxReviewFixCycles) {
           this.pause(jobId, 'reviewing', renderCodeBlockers(blockers));
           return;
@@ -319,6 +393,14 @@ export class JobPipeline {
               this.config.pipeline.visualBlockingSeverities.includes(finding.severity),
             ),
           };
+          if (job.validationOnly) {
+            this.pause(
+              jobId,
+              'visual_qa',
+              `Validation-only visual review found blocking issues; source fixers are disabled.\n\n${renderVisualBlockers(blockingReview)}`,
+            );
+            return;
+          }
           if (job.visualFixCycles >= this.config.pipeline.maxVisualFixCycles) {
             this.pause(jobId, 'visual_qa', renderVisualBlockers(blockingReview));
             return;
@@ -375,7 +457,16 @@ export class JobPipeline {
         }
       }
 
-      await this.git.validateCandidate(input.cwd, job.baseRef as string, changes.head);
+      if (job.validationOnly) {
+        await this.git.validateMaterializedCandidate(
+          input.cwd,
+          job.baseRef as string,
+          changes.head,
+          job.candidateSourceSha as string,
+        );
+      } else {
+        await this.git.validateCandidate(input.cwd, job.baseRef as string, changes.head);
+      }
       job = jobs.get(jobId) as Job;
       if (
         job.reviewedHead !== changes.head ||
@@ -483,6 +574,13 @@ export class JobPipeline {
 
     if (job.stage === 'paused' && job.worktreePath && job.baseRef) {
       const resumeStage = job.resumeStage ?? 'verifying';
+      if (job.validationOnly && (resumeStage === 'implementing' || resumeStage === 'fixing')) {
+        jobs.patch(jobId, {
+          pauseReason: 'Resume refused: validation-only jobs cannot enter a source-editing stage',
+          error: 'Resume refused: validation-only jobs cannot enter a source-editing stage',
+        });
+        return;
+      }
       await this.git.validateRecoveryWorkspace({
         repoRoot: project.rootPath,
         worktreePath: job.worktreePath,

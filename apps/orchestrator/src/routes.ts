@@ -569,7 +569,11 @@ export function createRoutes(jarvis: Jarvis): Hono {
 
   app.post('/api/jobs/:id/upgrade/activate', async (c) => {
     try {
-      return c.json(await jarvis.upgrades.requestActivation(c.req.param('id')));
+      const body = (await c.req.json().catch(() => ({}))) as { activationToken?: unknown };
+      if (typeof body.activationToken !== 'string') return fail('activationToken is required', 400);
+      return c.json(
+        await jarvis.upgrades.requestActivation(c.req.param('id'), body.activationToken),
+      );
     } catch (error) {
       return fail(error instanceof Error ? error.message : String(error), 409);
     }

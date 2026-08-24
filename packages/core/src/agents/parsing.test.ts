@@ -7,7 +7,13 @@ import { extractMemoryProposals } from './proposals.js';
 import { proposalToInput } from './types.js';
 import { buildClaudeArgs, buildClaudePrompt, handleClaudeEvent } from './claude.js';
 import { buildCodexArgs } from './codex.js';
-import { jsonlProtocolError, killTree, runJsonlProcess, subscriptionProviderEnv } from './spawn.js';
+import {
+  jsonlProtocolError,
+  killTree,
+  runJsonlProcess,
+  subscriptionProviderEnv,
+  untrustedProcessEnv,
+} from './spawn.js';
 import { parseReviewOutput } from '../review/engine.js';
 import { classifyExplicitMemory, detectExplicitCommand, scoreCandidate } from '../memory/policy.js';
 import type { AgentEvent } from './types.js';
@@ -96,7 +102,7 @@ describe('provider process protocol', () => {
     }
   });
 
-  it('removes API billing keys and the control-plane address from provider children', () => {
+  it('removes secrets and every control or supervisor authority from provider children', () => {
     const source = {
       PATH: 'kept',
       ANTHROPIC_API_KEY: 'secret',
@@ -107,6 +113,11 @@ describe('provider process protocol', () => {
       JARVIS_RUNTIME_NONCE: 'nonce',
       JARVIS_BOOTSTRAP_TOKEN: 'bootstrap',
       JARVIS_CONTROL_TOKEN: 'control',
+      JARVIS_HOME: 'private-home',
+      JARVIS_SUPERVISED: '1',
+      JARVIS_UPGRADE_REQUEST_PATH: 'activate.json',
+      JARVIS_UPGRADE_TOKEN_HASH: 'public-hash',
+      GITHUB_TOKEN: 'ambient-secret',
     };
     expect(subscriptionProviderEnv(source)).toMatchObject({ PATH: 'kept', NO_COLOR: '1' });
     expect(subscriptionProviderEnv(source)).not.toHaveProperty('ANTHROPIC_API_KEY');
@@ -115,8 +126,25 @@ describe('provider process protocol', () => {
     expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_RUNTIME_NONCE');
     expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_BOOTSTRAP_TOKEN');
     expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_CONTROL_TOKEN');
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_HOME');
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_SUPERVISED');
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_UPGRADE_REQUEST_PATH');
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('JARVIS_UPGRADE_TOKEN_HASH');
+    expect(subscriptionProviderEnv(source)).not.toHaveProperty('GITHUB_TOKEN');
     expect(source).toHaveProperty('ANTHROPIC_API_KEY', 'secret');
     expect(source).toHaveProperty('JARVIS_PORT', '4319');
+  });
+
+  it('allowlists only platform essentials for candidate-controlled processes', () => {
+    expect(
+      untrustedProcessEnv({
+        PATH: 'kept',
+        TEMP: 'temp',
+        JARVIS_UPGRADE_REQUEST_PATH: 'activate.json',
+        GITHUB_TOKEN: 'secret',
+        UNRELATED_AMBIENT_VALUE: 'private',
+      }),
+    ).toEqual({ PATH: 'kept', TEMP: 'temp' });
   });
 
   it('does not expose API billing keys to a spawned provider process', async () => {
@@ -374,9 +402,7 @@ describe('claude stream-json translation', () => {
 
 describe('review output parsing', () => {
   it('parses a structured verdict with findings', () => {
-    const parsed = parseReviewOutput(`Here is my review.
-
-\`\`\`json
+    const parsed = parseReviewOutput(`\`\`\`json
 {"verdict":"request_changes","summary":"The change works but leaks a handle.",
  "findings":[{"severity":"high","category":"correctness","file":"src/a.ts","line":10,
    "description":"The stream is never closed.","recommendation":"Close it in a finally block."}]}
@@ -386,7 +412,7 @@ describe('review output parsing', () => {
     expect(parsed.findings[0]?.severity).toBe('high');
   });
 
-  it('prefers the last json block, so an example above the answer does not win', () => {
+  it('rejects multiple JSON blocks instead of letting a later block hide findings', () => {
     const parsed = parseReviewOutput(`For reference the format is:
 \`\`\`json
 {"verdict":"approve","summary":"example","findings":[]}
@@ -395,8 +421,15 @@ And my actual review:
 \`\`\`json
 {"verdict":"approve","summary":"real answer","findings":[]}
 \`\`\``);
-    expect(parsed.summary).toBe('real answer');
-    expect(parsed.verdict).toBe('approve');
+    expect(parsed.verdict).toBe('error');
+    expect(parsed.summary).toContain('exactly one terminal JSON block');
+  });
+
+  it('rejects non-whitespace after the structured response', () => {
+    const parsed = parseReviewOutput(
+      '```json\n{"verdict":"approve","summary":"clean","findings":[]}\n```\nHIGH: hidden finding',
+    );
+    expect(parsed.verdict).toBe('error');
   });
 
   it('refuses to approve while reporting blocking findings', () => {

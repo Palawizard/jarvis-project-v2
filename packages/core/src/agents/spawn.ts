@@ -5,8 +5,6 @@ import type { ResolvedCli } from './resolve.js';
 
 const log = createLogger('agent-spawn');
 
-const API_KEY_ENV = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY'] as const;
-
 /**
  * Jarvis's own control plane. An agent child has no business talking to the
  * orchestrator API — its privileged path is the in-process tool boundary, where
@@ -15,19 +13,73 @@ const API_KEY_ENV = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY'] as 
  * remain the actual control-plane boundary. See docs/tool-permissions.md.
  */
 const CONTROL_PLANE_ENV = [
+  'JARVIS_HOME',
   'JARVIS_PORT',
   'JARVIS_WEB_PORT',
   'JARVIS_RUNTIME_NONCE',
+  'JARVIS_CANDIDATE_RUNTIME',
+  'JARVIS_SUPERVISED',
+  'JARVIS_SUPERVISOR_CONFIG',
+  'JARVIS_UPGRADE_REQUEST_PATH',
+  'JARVIS_UPGRADE_TOKEN_HASH',
   'JARVIS_BOOTSTRAP_TOKEN',
   'JARVIS_CONTROL_TOKEN',
 ] as const;
+
+const UNTRUSTED_ENV_ALLOWLIST = [
+  'PATH',
+  'Path',
+  'PATHEXT',
+  'SystemRoot',
+  'SYSTEMROOT',
+  'WINDIR',
+  'ComSpec',
+  'COMSPEC',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'HOME',
+  'USERPROFILE',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'PROGRAMDATA',
+  'ProgramFiles',
+  'ProgramFiles(x86)',
+  'CommonProgramFiles',
+  'CommonProgramFiles(x86)',
+  'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE',
+  'SHELL',
+  'LANG',
+  'LC_ALL',
+  'TERM',
+  'XDG_CONFIG_HOME',
+  'XDG_CACHE_HOME',
+  'PNPM_HOME',
+  'COREPACK_HOME',
+  'NPM_CONFIG_USERCONFIG',
+] as const;
+
+const SECRET_ENV_NAME =
+  /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|API_KEY|PRIVATE_KEY)(?:_|$)/i;
+
+/** Minimal platform environment for candidate-controlled commands and runtimes. */
+export function untrustedProcessEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of UNTRUSTED_ENV_ALLOWLIST) {
+    if (source[key] !== undefined) env[key] = source[key];
+  }
+  return env;
+}
 
 /** Provider runs must use the CLIs' subscription login, never inherited API billing. */
 export function subscriptionProviderEnv(
   source: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...source, FORCE_COLOR: '0', NO_COLOR: '1' };
-  for (const key of [...API_KEY_ENV, ...CONTROL_PLANE_ENV]) delete env[key];
+  for (const key of Object.keys(env)) {
+    if (SECRET_ENV_NAME.test(key) || CONTROL_PLANE_ENV.includes(key as never)) delete env[key];
+  }
   return env;
 }
 

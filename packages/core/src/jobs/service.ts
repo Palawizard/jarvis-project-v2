@@ -123,6 +123,17 @@ function rowToJob(row: Row): Job {
   };
 }
 
+/**
+ * Binds `visual_qa_plan=CASE WHEN ? THEN ? ELSE visual_qa_plan END`. Unrelated
+ * writes leave the stored column untouched, so a malformed persisted plan keeps
+ * failing closed at the application gate instead of being silently rewritten to
+ * NULL by `rowToJob`'s lenient parse (which reads it back as "no plan").
+ */
+function visualPlanBinding(patch: Partial<Job>): [number, string | null] {
+  if (!('visualQaPlan' in patch)) return [0, null];
+  return [1, patch.visualQaPlan ? JSON.stringify(patch.visualQaPlan) : null];
+}
+
 function rowToRun(row: Row): AgentRun {
   return {
     id: row.id as string,
@@ -280,7 +291,8 @@ export class JobService {
           fix_cycles=?, review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?,
           restart_reason=?, repair_kind=?, repair_checkpoint=?, last_provider=?, resume_session_id=?,
           reviewed_head=?, visual_head=?, candidate_base_sha=?,
-          candidate_source_sha=?, validation_only=?, visual_qa_config=?, visual_qa_plan=?,
+          candidate_source_sha=?, validation_only=?, visual_qa_config=?,
+          visual_qa_plan=CASE WHEN ? THEN ? ELSE visual_qa_plan END,
           episode_id=?, goal=?,
           acceptance=?, updated_at=?, finished_at=? WHERE id=?`,
       )
@@ -308,7 +320,7 @@ export class JobService {
         next.candidateSourceSha,
         next.validationOnly ? 1 : 0,
         next.visualQaConfig ? JSON.stringify(next.visualQaConfig) : null,
-        next.visualQaPlan ? JSON.stringify(next.visualQaPlan) : null,
+        ...visualPlanBinding(patch),
         next.episodeId,
         next.goal,
         JSON.stringify(next.acceptance),
@@ -342,7 +354,8 @@ export class JobService {
           review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?, last_provider=?,
           restart_reason=?, repair_kind=?, repair_checkpoint=?, resume_session_id=?, reviewed_head=?,
           visual_head=?, candidate_base_sha=?,
-          candidate_source_sha=?, validation_only=?, visual_qa_config=?, visual_qa_plan=?,
+          candidate_source_sha=?, validation_only=?, visual_qa_config=?,
+          visual_qa_plan=CASE WHEN ? THEN ? ELSE visual_qa_plan END,
           episode_id=?, goal=?,
           acceptance=?, updated_at=? WHERE id=?`,
       )
@@ -368,7 +381,7 @@ export class JobService {
         next.candidateSourceSha,
         next.validationOnly ? 1 : 0,
         next.visualQaConfig ? JSON.stringify(next.visualQaConfig) : null,
-        next.visualQaPlan ? JSON.stringify(next.visualQaPlan) : null,
+        ...visualPlanBinding(patch),
         next.episodeId,
         next.goal,
         JSON.stringify(next.acceptance),

@@ -67,6 +67,7 @@ http.createServer((req,res)=>{ if(req.url!=='/health'){res.statusCode=404; retur
 async function waitFor<T>(
   read: () => Promise<T | null> | T | null,
   timeoutMs = 20_000,
+  what = 'supervisor evidence',
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -74,7 +75,16 @@ async function waitFor<T>(
     if (value !== null) return value;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error('timed out waiting for supervisor evidence');
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+/**
+ * Polls the settled exit instead of awaiting the one-shot 'exit' event: the
+ * child often exits before we get here (the event would never fire again), and
+ * a supervisor that never exits must fail the test rather than hang it.
+ */
+function waitForExit(child: ChildProcess, timeoutMs = 20_000): Promise<number | string> {
+  return waitFor(() => child.exitCode ?? child.signalCode, timeoutMs, 'supervisor exit');
 }
 
 async function submit(
@@ -186,7 +196,7 @@ async function runActivation(
   const response = await submit(initialHealth.upgradeSocket as string, request);
 
   if (tamperCommand || activationToken !== ACTIVATION_TOKEN) {
-    const code = await waitFor(() => (child.exitCode === null ? null : child.exitCode));
+    const code = await waitForExit(child);
     children.splice(children.indexOf(child), 1);
     const rejected = fs
       .readdirSync(setup.stateDir)
@@ -208,7 +218,7 @@ async function runActivation(
       ? (JSON.parse(fs.readFileSync(resultPath, 'utf8')) as Record<string, unknown>)
       : null,
   );
-  const code = await new Promise<number | null>((resolve) => child.once('exit', resolve));
+  const code = await waitForExit(child);
   if (code !== 0) throw new Error(`supervisor exited ${code}: ${logs}`);
   children.splice(children.indexOf(child), 1);
   return { ...setup, evidence, logs, response, evidencePublicKey: evidenceKeys.publicKey };
@@ -231,6 +241,17 @@ afterEach(async () => {
 });
 
 describe('external self-upgrade supervisor', () => {
+  it('settles the exit wait for an already-exited child and bounds one that never exits', async () => {
+    const opts = { windowsHide: true, stdio: 'ignore' as const };
+    const done = spawn(process.execPath, ['-e', 'process.exit(3)'], opts);
+    await new Promise((resolve) => done.once('exit', resolve));
+    expect(await waitForExit(done)).toBe(3);
+
+    const hung = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], opts);
+    children.push(hung);
+    await expect(waitForExit(hung, 200)).rejects.toThrow('timed out waiting for supervisor exit');
+  });
+
   it('fast-forwards, rebuilds, restarts and healthchecks a good candidate', async () => {
     const result = await runActivation(true);
     expect(result.evidence).toMatchObject({

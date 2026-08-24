@@ -427,6 +427,22 @@ describe('approval validates the persisted visual QA plan', () => {
     expect(service.getForJob(prepared.job.id)).toBeNull();
   });
 
+  it('F2: a malformed plan survives unrelated job patches instead of decaying to null', async () => {
+    const prepared = await candidate();
+    projectDefaults();
+    setPlan(prepared.job.id, 'not json');
+    // Any bookkeeping write used to rewrite the column from the lenient parse.
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    const row = db
+      .prepare('SELECT visual_qa_plan FROM jobs WHERE id=?')
+      .get(prepared.job.id) as Record<string, unknown>;
+    expect(row.visual_qa_plan).toBe('not json');
+    seedVisualEvidence(prepared.job.id, prepared.head, DEFAULT_SHOTS);
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(
+      'persisted visual QA plan is malformed',
+    );
+  });
+
   it('G: legacy pre-plan jobs still use project defaults', async () => {
     const prepared = await candidate();
     projectDefaults();

@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess, type StdioOptions } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { createLogger } from '../logger.js';
@@ -119,31 +121,58 @@ export function spawnContained(
   const stdio = Array.isArray(options.stdio)
     ? (['pipe', options.stdio[1] ?? 'inherit', options.stdio[2] ?? 'inherit'] as StdioOptions)
     : (['pipe', options.stdio, options.stdio] as StdioOptions);
-  const child = spawn(
-    powershell,
-    [
-      '-NoLogo',
-      '-NoProfile',
-      '-NonInteractive',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-EncodedCommand',
-      WINDOWS_JOB_RUNNER,
-    ],
-    {
-      cwd: options.cwd,
-      env: options.env,
-      stdio,
-      shell: false,
-      windowsHide: true,
-    },
+  // The wrapper's control payload travels through a private file, never stdin:
+  // stdin belongs to the contained target so callers can stream a prompt that
+  // would not fit on a Windows command line. See runJsonlProcess.
+  const specPath = path.join(os.tmpdir(), `jarvis-contained-${randomUUID()}.json`);
+  fs.writeFileSync(
+    specPath,
+    JSON.stringify({ executable, args, cwd: options.cwd, shell: options.shell === true }),
+    { mode: 0o600 },
   );
+  const removeSpec = () => {
+    try {
+      fs.rmSync(specPath, { force: true });
+    } catch {
+      /* the wrapper deletes it as soon as it has read it */
+    }
+  };
+  let child: ChildProcess;
+  try {
+    child = spawn(
+      powershell,
+      [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-EncodedCommand',
+        WINDOWS_JOB_RUNNER,
+      ],
+      {
+        cwd: options.cwd,
+        // Bootstrap-only; the wrapper drops it before creating the target.
+        env: { ...options.env, JARVIS_CONTAINED_SPEC_PATH: specPath },
+        stdio,
+        shell: false,
+        windowsHide: true,
+      },
+    );
+  } catch (error) {
+    removeSpec();
+    throw error;
+  }
+  child.once('error', removeSpec);
+  child.once('close', removeSpec);
   child.stdin?.on('error', () => {
     /* spawn/early-exit errors are reported on the child itself */
   });
-  child.stdin?.end(
-    JSON.stringify({ executable, args, cwd: options.cwd, shell: options.shell === true }),
-  );
+  // Callers that asked for no stdin still expect the target to see EOF.
+  const wantsStdin = Array.isArray(options.stdio)
+    ? options.stdio[0] === 'pipe'
+    : options.stdio === 'pipe';
+  if (!wantsStdin) child.stdin?.end();
   return child;
 }
 

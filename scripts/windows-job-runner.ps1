@@ -1,9 +1,25 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# The caller supplies only an executable/argv/cwd JSON object on stdin. The
-# target inherits this wrapper's already-sanitized environment and stdio.
-$payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
+# The caller supplies only an executable/argv/cwd JSON object, through a private
+# short-lived file named by JARVIS_CONTAINED_SPEC_PATH. This wrapper must never
+# read stdin: stdin is the contained target's own prompt channel, and the target
+# inherits it untouched along with the already-sanitized environment.
+$specPath = $env:JARVIS_CONTAINED_SPEC_PATH
+# Drop the bootstrap path before CreateProcessW so the target never inherits it.
+Remove-Item -LiteralPath 'Env:JARVIS_CONTAINED_SPEC_PATH' -ErrorAction SilentlyContinue
+if (-not $specPath) {
+  [Console]::Error.WriteLine('contained process failed: missing control spec')
+  exit 127
+}
+try {
+  $payload = [IO.File]::ReadAllText($specPath) | ConvertFrom-Json
+} catch {
+  [Console]::Error.WriteLine('contained process failed: unreadable control spec')
+  exit 127
+} finally {
+  Remove-Item -LiteralPath $specPath -Force -ErrorAction SilentlyContinue
+}
 
 Add-Type -TypeDefinition @'
 using System;

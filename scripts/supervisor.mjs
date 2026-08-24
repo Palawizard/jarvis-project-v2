@@ -2,6 +2,7 @@
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import {
   createHash,
@@ -337,6 +338,28 @@ async function spawnProcess(spec, repo, supervised, stdio = 'inherit') {
         }
       : {}),
   };
+  // The wrapper reads its target from a private short-lived file; stdin stays
+  // the contained process's own channel. Mirrors spawnContained in @jarvis/core.
+  const specPath =
+    process.platform === 'win32'
+      ? path.join(os.tmpdir(), `jarvis-contained-${randomUUID()}.json`)
+      : null;
+  const removeSpec = () => {
+    if (specPath) {
+      try {
+        fs.rmSync(specPath, { force: true });
+      } catch {
+        /* the wrapper deletes it as soon as it has read it */
+      }
+    }
+  };
+  if (specPath) {
+    fs.writeFileSync(
+      specPath,
+      JSON.stringify({ executable: spec.executable, args: spec.args, cwd: repo, shell: false }),
+      { mode: 0o600 },
+    );
+  }
   const child =
     process.platform === 'win32'
       ? spawn(
@@ -358,7 +381,8 @@ async function spawnProcess(spec, repo, supervised, stdio = 'inherit') {
           ],
           {
             cwd: repo,
-            env,
+            // Bootstrap-only; the wrapper drops it before creating the target.
+            env: { ...env, JARVIS_CONTAINED_SPEC_PATH: specPath },
             stdio: Array.isArray(stdio)
               ? ['pipe', stdio[1] ?? 'inherit', stdio[2] ?? 'inherit']
               : ['pipe', stdio, stdio],
@@ -375,17 +399,23 @@ async function spawnProcess(spec, repo, supervised, stdio = 'inherit') {
           windowsHide: true,
         });
   if (process.platform === 'win32') {
+    child.once('error', removeSpec);
+    child.once('close', removeSpec);
     child.stdin.on('error', () => {
       /* spawn/early-exit errors are reported on the child itself */
     });
-    child.stdin.end(
-      JSON.stringify({ executable: spec.executable, args: spec.args, cwd: repo, shell: false }),
-    );
+    // Nothing here writes a prompt, but the target still expects EOF on stdin.
+    child.stdin.end();
   }
-  await new Promise((resolve, reject) => {
-    child.once('spawn', resolve);
-    child.once('error', reject);
-  });
+  try {
+    await new Promise((resolve, reject) => {
+      child.once('spawn', resolve);
+      child.once('error', reject);
+    });
+  } catch (error) {
+    removeSpec();
+    throw error;
+  }
   return child;
 }
 

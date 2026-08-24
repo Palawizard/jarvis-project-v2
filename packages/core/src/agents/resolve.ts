@@ -25,9 +25,20 @@ export function resolveCli(opts: {
   packageName: string;
   envOverride?: string;
 }): ResolvedCli | null {
+  // An explicitly set override is authoritative in both directions: it selects
+  // the binary, and a path that does not exist means the provider is
+  // unavailable. Falling back to discovery here would make it impossible to
+  // disable one provider without uninstalling it.
   const override = opts.envOverride ? process.env[opts.envOverride] : undefined;
-  if (override && fs.existsSync(override)) {
+  if (override) {
     const source = opts.envOverride ?? 'environment override';
+    if (!fs.existsSync(override)) {
+      log.debug('CLI override does not exist; provider is unavailable', {
+        binName: opts.binName,
+        source,
+      });
+      return null;
+    }
     return override.endsWith('.js')
       ? { command: process.execPath, prefixArgs: [override], source }
       : { command: override, prefixArgs: [], source };

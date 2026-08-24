@@ -58,6 +58,7 @@ beforeEach(async () => {
     verification,
     review,
     config.worktreesDir,
+    config.artifactsDir,
   );
   workspace = new GitWorkspace(config.worktreesDir);
 });

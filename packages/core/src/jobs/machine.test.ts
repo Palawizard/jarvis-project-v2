@@ -203,9 +203,14 @@ describe('job persistence and crash recovery', () => {
     });
     jobs.finishRun(run.id, {
       status: 'completed',
-      result: 'done',
+      result: 'done Jarvis human pairing token: bootstrap-secret-value',
+      error: 'Bearer abcdefghijklmnopqrstuvwxyz123456',
       externalSessionId: 'sess-abc-123',
     });
-    expect(jobs.runs(job.id)[0]?.externalSessionId).toBe('sess-abc-123');
+    const persisted = jobs.runs(job.id)[0];
+    expect(persisted?.externalSessionId).toBe('sess-abc-123');
+    expect(persisted?.result).toContain('[redacted:jarvis_pairing_token]');
+    expect(persisted?.result).not.toContain('bootstrap-secret-value');
+    expect(persisted?.error).toContain('[redacted:bearer_header]');
   });
 });

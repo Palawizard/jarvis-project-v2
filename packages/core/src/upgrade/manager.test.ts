@@ -133,7 +133,26 @@ describe('self-upgrade activation publication', () => {
     expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
     expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1);
     expect(connections).toBe(1);
-    expect(manager.getForJob(job.id)?.status).toBe('activation_requested');
+    const transaction = manager.getForJob(job.id);
+    expect(transaction?.status).toBe('activation_requested');
+    const resultPath = path.join(config.home, 'upgrades', 'upgrade-claim-result.json');
+    fs.writeFileSync(
+      resultPath,
+      JSON.stringify({
+        status: 'activated',
+        transactionId: 'upgrade-claim',
+        repository: repo,
+        branch: 'main',
+        previousSha: worktree.baseRef,
+        candidateSha,
+        headAfter: candidateSha,
+      }),
+    );
+    expect(manager.getForJob(job.id)?.status).toBe('inspection_required');
+    expect(
+      db.prepare("SELECT status FROM candidate_applications WHERE id='application'").get(),
+    ).toEqual({ status: 'approved' });
+    expect(git(['rev-parse', 'HEAD'])).toBe(worktree.baseRef);
     expect(fs.existsSync(requestPath)).toBe(false);
     expect(
       fs.existsSync(path.dirname(requestPath))

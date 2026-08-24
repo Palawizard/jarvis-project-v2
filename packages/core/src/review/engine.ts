@@ -6,6 +6,7 @@ import type { AgentRegistry } from '../agents/registry.js';
 import type { AgentRunResult, ProviderId, TaskProfile } from '../agents/types.js';
 import type { VerificationReport } from '../verification/engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
+import { redactSecrets } from '../memory/secrets.js';
 import { z } from 'zod';
 
 export interface ReviewFinding {
@@ -169,7 +170,7 @@ export class ReviewEngine {
               type: 'agent.output',
               jobId: opts.jobId,
               runId,
-              payload: { role: 'reviewer', text: event.text.slice(0, 2000) },
+              payload: { role: 'reviewer', text: redactSecrets(event.text).slice(0, 2000) },
             });
           }
         },
@@ -191,8 +192,8 @@ export class ReviewEngine {
       )
       .run(
         result.status,
-        result.result.slice(0, 20_000),
-        result.error ?? null,
+        redactSecrets(result.result).slice(0, 20_000),
+        result.error ? redactSecrets(result.error) : null,
         result.sessionId ?? null,
         nowIso(),
         runId,
@@ -205,7 +206,7 @@ export class ReviewEngine {
         runId,
         provider: routed.provider.id,
         verdict: 'error',
-        summary: `Reviewer failed: ${result.error ?? 'unknown error'}`,
+        summary: `Reviewer failed: ${result.error ? redactSecrets(result.error) : 'unknown error'}`,
         findings: [],
         headRef: opts.headRef,
         blocking: true,
@@ -224,7 +225,9 @@ export class ReviewEngine {
       this.config.pipeline.codeReviewBlockingSeverities,
     );
     if (parsed.verdict === 'error') {
-      const protocolError = parsed.summary || 'reviewer returned invalid structured output';
+      const protocolError = redactSecrets(
+        parsed.summary || 'reviewer returned invalid structured output',
+      );
       this.agents.recordResult?.(routed.provider.id, {
         status: 'failed',
         error: `protocol failure: ${protocolError}`,

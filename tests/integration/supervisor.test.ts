@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync, verify as verifyBytes } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -113,6 +113,10 @@ async function runActivation(
   const requestFile = path.join(setup.stateDir, 'activate.json');
   const transactionId = healthyCandidate ? 'good-activation' : 'broken-activation';
   const resultPath = path.join(setup.stateDir, `${transactionId}.result.json`);
+  const evidenceKeys = generateKeyPairSync('ed25519');
+  const evidencePrivateKey = evidenceKeys.privateKey
+    .export({ type: 'pkcs8', format: 'pem' })
+    .toString();
   const healthUrl = `http://127.0.0.1:${selectedPort}/health`;
   const startCommand = {
     executable: process.execPath,
@@ -176,6 +180,7 @@ async function runActivation(
     buildCommand,
     startCommand,
     resultPath,
+    evidencePrivateKey,
   };
   if (tamperCommand) request.buildCommand = { ...buildCommand, args: ['malicious.mjs'] };
   const response = await submit(initialHealth.upgradeSocket as string, request);
@@ -195,7 +200,7 @@ async function runActivation(
         ? JSON.parse(fs.readFileSync(path.join(setup.stateDir, rejected), 'utf8'))
         : null,
     };
-    return { ...setup, evidence };
+    return { ...setup, evidence, evidencePublicKey: evidenceKeys.publicKey };
   }
 
   const evidence = await waitFor(() =>
@@ -206,7 +211,18 @@ async function runActivation(
   const code = await new Promise<number | null>((resolve) => child.once('exit', resolve));
   if (code !== 0) throw new Error(`supervisor exited ${code}: ${logs}`);
   children.splice(children.indexOf(child), 1);
-  return { ...setup, evidence, logs, response };
+  return { ...setup, evidence, logs, response, evidencePublicKey: evidenceKeys.publicKey };
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
 }
 
 afterEach(async () => {
@@ -241,6 +257,15 @@ describe('external self-upgrade supervisor', () => {
         },
       },
     });
+    const { evidenceSignature, ...signed } = result.evidence;
+    expect(
+      verifyBytes(
+        null,
+        Buffer.from(stableJson(signed), 'utf8'),
+        result.evidencePublicKey,
+        Buffer.from(String(evidenceSignature), 'base64'),
+      ),
+    ).toBe(true);
     expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.candidateSha);
     expect(git(result.repo, 'status', '--porcelain')).toBe('');
     const processed = fs.readFileSync(
@@ -255,13 +280,13 @@ describe('external self-upgrade supervisor', () => {
     expect(JSON.stringify(result.evidence)).not.toContain(ACTIVATION_TOKEN);
     expect(result.logs).not.toContain(ACTIVATION_TOKEN);
     expect(result.logs).not.toContain(AMBIENT_TOKEN);
-    expect(
-      fs
-        .readdirSync(result.stateDir, { withFileTypes: true })
-        .filter((entry) => entry.isFile())
-        .map((entry) => fs.readFileSync(path.join(result.stateDir, entry.name), 'utf8'))
-        .join('\n'),
-    ).not.toContain(ACTIVATION_TOKEN);
+    const persistedState = fs
+      .readdirSync(result.stateDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => fs.readFileSync(path.join(result.stateDir, entry.name), 'utf8'))
+      .join('\n');
+    expect(persistedState).not.toContain(ACTIVATION_TOKEN);
+    expect(persistedState).not.toContain('BEGIN PRIVATE KEY');
   });
 
   it('restores and restarts the old revision after candidate health fails', async () => {

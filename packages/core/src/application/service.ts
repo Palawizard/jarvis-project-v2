@@ -59,6 +59,7 @@ export class CandidateApplicationService {
     private readonly verification: VerificationEngine,
     private readonly review: ReviewEngine,
     worktreesDir: string,
+    private readonly artifactsDir: string,
   ) {
     this.git = new GitWorkspace(worktreesDir);
   }
@@ -408,7 +409,7 @@ export class CandidateApplicationService {
             row.status === 'captured' &&
             !!row.reviewed_by &&
             !!row.review_findings &&
-            validateVisualEvidence(row.screenshot_path),
+            validateVisualEvidence(row.screenshot_path, this.artifactsDir),
         );
       const persistedReviews = new Set(selected.map((row) => row.review_findings));
       if (passed && persistedReviews.size === 1) {

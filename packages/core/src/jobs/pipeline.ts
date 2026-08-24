@@ -23,6 +23,7 @@ import {
   type ProviderId,
 } from '../agents/types.js';
 import type { MemoryInput } from '../memory/types.js';
+import { redactSecrets } from '../memory/secrets.js';
 import type { AgentRole } from '../agents/types.js';
 import type { VisualReview } from '../visualqa/reviewer.js';
 
@@ -1037,7 +1038,7 @@ export class JobPipeline {
             type: 'agent.output',
             jobId: opts.jobId,
             runId: run.id,
-            payload: { text: event.text.slice(0, 4000) },
+            payload: { text: redactSecrets(event.text).slice(0, 4000) },
           });
           break;
         case 'thinking':
@@ -1117,7 +1118,11 @@ export class JobPipeline {
       type: result.status === 'completed' ? 'agent.completed' : 'agent.failed',
       jobId: opts.jobId,
       runId: run.id,
-      payload: { status: result.status, error: result.error, sessionId: result.sessionId },
+      payload: {
+        status: result.status,
+        error: result.error ? redactSecrets(result.error) : result.error,
+        sessionId: result.sessionId,
+      },
     });
 
     return {

@@ -153,6 +153,8 @@ Loopback is explicitly untrusted. All private reads and human-authority mutation
 
 This does not claim verified OS process isolation: same-OS-user malware that can inspect/control the human browser or read its profile is outside this browser-capability boundary. `AgentIsolationBackend.preflight()` remains false until a restricted user/container can verify process, filesystem/credential, and control-plane network separation. Sensitive agent tools therefore remain denied even though ordinary agent/candidate loopback impersonation is closed.
 
+The same boundary applies to project-owned install, verification, build, and candidate-runtime commands: Phase 1c.1 contains their process lifetime and strips ambient secrets, but does not sandbox their filesystem reads or writes. Only user-registered trusted repositories may execute those commands until the isolation milestone ships; this known limitation is not treated as authority to enable sensitive or destructive agent tools.
+
 Two smaller residual notes:
 
 - Secret detection is pattern-based (`memory/secrets.ts`). It is deliberately

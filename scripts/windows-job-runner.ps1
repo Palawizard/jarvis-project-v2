@@ -106,6 +106,7 @@ namespace Jarvis {
     [DllImport("kernel32.dll", SetLastError = true)] static extern uint ResumeThread(IntPtr thread);
     [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr process, uint exitCode);
     [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int kind);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
 
@@ -179,6 +180,10 @@ namespace Jarvis {
         } finally { Marshal.FreeHGlobal(accounting); }
       } finally {
         if (process.hThread != IntPtr.Zero) CloseHandle(process.hThread);
+        if (process.hProcess != IntPtr.Zero && WaitForSingleObject(process.hProcess, 0) == 258) {
+          TerminateProcess(process.hProcess, 127);
+          WaitForSingleObject(process.hProcess, 5000);
+        }
         if (process.hProcess != IntPtr.Zero) CloseHandle(process.hProcess);
         if (limits != IntPtr.Zero) Marshal.FreeHGlobal(limits);
         if (job != IntPtr.Zero) CloseHandle(job);

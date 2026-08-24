@@ -81,6 +81,7 @@ export class Jarvis {
       this.verification,
       this.review,
       config.worktreesDir,
+      config.artifactsDir,
     );
     this.upgrades = new UpgradeManager(
       this.db,

@@ -6,6 +6,7 @@ import type { ProviderId } from '../agents/types.js';
 import type { VisualQaScenario } from '../projects/service.js';
 import type { ReviewFinding } from '../review/engine.js';
 import type { VisualReviewFinding } from '../visualqa/engine.js';
+import { redactSecrets } from '../memory/secrets.js';
 
 export type RepairKind = 'verification' | 'code_review' | 'visual';
 export interface RepairCheckpoint {
@@ -435,8 +436,8 @@ export class JobService {
       )
       .run(
         patch.status,
-        patch.result?.slice(0, 40_000) ?? null,
-        patch.error ?? null,
+        patch.result === undefined ? null : redactSecrets(patch.result).slice(0, 40_000),
+        patch.error === undefined || patch.error === null ? null : redactSecrets(patch.error),
         patch.externalSessionId ?? null,
         JSON.stringify(patch.usage ?? {}),
         nowIso(),

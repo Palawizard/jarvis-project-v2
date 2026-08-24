@@ -1,5 +1,10 @@
-import { execFile } from 'node:child_process';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { execFile, execFileSync } from 'node:child_process';
+import {
+  createHash,
+  generateKeyPairSync,
+  timingSafeEqual,
+  verify as verifyBytes,
+} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
@@ -225,6 +230,13 @@ export class UpgradeManager {
 
     const resultPath = path.join(this.config.home, 'upgrades', `${transaction.id}-result.json`);
     fs.mkdirSync(path.dirname(resultPath), { recursive: true, mode: 0o700 });
+    const evidenceKeys = generateKeyPairSync('ed25519');
+    const evidencePublicKey = evidenceKeys.publicKey
+      .export({ type: 'spki', format: 'pem' })
+      .toString();
+    const evidencePrivateKey = evidenceKeys.privateKey
+      .export({ type: 'pkcs8', format: 'pem' })
+      .toString();
     const request = {
       transactionId: transaction.id,
       approved: true,
@@ -239,14 +251,21 @@ export class UpgradeManager {
       buildCommand: { executable: 'pnpm', args: ['build'] },
       startCommand: { executable: 'pnpm', args: ['--filter', '@jarvis/orchestrator', 'start'] },
       resultPath,
+      evidencePrivateKey,
     };
     const activationAt = nowIso();
     const claimed = this.db
       .prepare(
         `UPDATE upgrade_transactions SET status='activation_requested', activation_at=?,
-          failure=NULL, updated_at=? WHERE id=? AND status='preflight_passed'`,
+          healthcheck_result=?, failure=NULL, updated_at=?
+          WHERE id=? AND status='preflight_passed'`,
       )
-      .run(activationAt, activationAt, transaction.id);
+      .run(
+        activationAt,
+        JSON.stringify({ activationEvidencePublicKey: evidencePublicKey }),
+        activationAt,
+        transaction.id,
+      );
     if (Number(claimed.changes) !== 1) {
       throw new Error('self-upgrade activation is already being processed');
     }
@@ -272,11 +291,18 @@ export class UpgradeManager {
     if (!fs.existsSync(resultPath)) return transaction;
     let result: {
       status?: string;
+      transactionId?: string;
+      repository?: string;
+      branch?: string;
+      previousSha?: string;
+      candidateSha?: string;
+      headAfter?: string;
       healthcheck?: Record<string, unknown>;
       rollbackHealthcheck?: Record<string, unknown>;
       rollbackSha?: string;
       error?: string;
       activationError?: string;
+      evidenceSignature?: string;
     };
     try {
       result = JSON.parse(fs.readFileSync(resultPath, 'utf8')) as typeof result;
@@ -288,15 +314,57 @@ export class UpgradeManager {
         this.db.prepare('SELECT * FROM upgrade_transactions WHERE id=?').get(transaction.id) as Row,
       );
     }
-    if (result.status === 'activated') {
-      this.setStatus(transaction.id, 'activation_succeeded', {
-        healthcheckResult: result.healthcheck ?? { status: 'ok' },
-        completedAt: nowIso(),
+    const publicKey = transaction.healthcheckResult?.activationEvidencePublicKey;
+    if (
+      !verifyEvidence(result as Record<string, unknown>, publicKey) ||
+      result.transactionId !== transaction.id ||
+      path.resolve(result.repository ?? '') !== path.resolve(transaction.repository) ||
+      result.branch !== transaction.branch ||
+      result.previousSha !== transaction.previousSha ||
+      result.candidateSha !== transaction.candidateSha
+    ) {
+      this.setStatus(transaction.id, 'inspection_required', {
+        failure: 'supervisor result signature or transaction identity is invalid',
       });
+      return rowToUpgrade(
+        this.db.prepare('SELECT * FROM upgrade_transactions WHERE id=?').get(transaction.id) as Row,
+      );
+    }
+    if (result.status === 'activated') {
+      if (
+        result.headAfter !== transaction.candidateSha ||
+        !exactRepositoryState(transaction.repository, transaction.branch, transaction.candidateSha)
+      ) {
+        this.setStatus(transaction.id, 'inspection_required', {
+          failure: 'supervisor reported activation but the live checkout identity does not match',
+        });
+        return rowToUpgrade(
+          this.db
+            .prepare('SELECT * FROM upgrade_transactions WHERE id=?')
+            .get(transaction.id) as Row,
+        );
+      }
+      if (
+        !this.setStatus(
+          transaction.id,
+          'activation_succeeded',
+          {
+            healthcheckResult: result.healthcheck ?? { status: 'ok' },
+            completedAt: nowIso(),
+          },
+          'activation_requested',
+        )
+      ) {
+        return rowToUpgrade(
+          this.db
+            .prepare('SELECT * FROM upgrade_transactions WHERE id=?')
+            .get(transaction.id) as Row,
+        );
+      }
       this.db
         .prepare(
           `UPDATE candidate_applications SET status='applied', target_head_before=?,
-            target_head_after=?, completed_at=?, updated_at=? WHERE id=?`,
+            target_head_after=?, completed_at=?, updated_at=? WHERE id=? AND status='approved'`,
         )
         .run(
           transaction.previousSha,
@@ -313,12 +381,39 @@ export class UpgradeManager {
         payload: { transactionId: transaction.id },
       });
     } else if (result.status === 'rolled_back') {
-      this.setStatus(transaction.id, 'rollback_completed', {
-        healthcheckResult: result.rollbackHealthcheck ?? result.healthcheck ?? null,
-        rollbackSha: result.rollbackSha ?? transaction.previousSha,
-        failure: result.activationError ?? result.error ?? 'new version failed healthcheck',
-        completedAt: nowIso(),
-      });
+      if (
+        result.rollbackSha !== transaction.previousSha ||
+        result.headAfter !== transaction.previousSha ||
+        !exactRepositoryState(transaction.repository, transaction.branch, transaction.previousSha)
+      ) {
+        this.setStatus(transaction.id, 'inspection_required', {
+          failure: 'supervisor reported rollback but the live checkout identity does not match',
+        });
+        return rowToUpgrade(
+          this.db
+            .prepare('SELECT * FROM upgrade_transactions WHERE id=?')
+            .get(transaction.id) as Row,
+        );
+      }
+      if (
+        !this.setStatus(
+          transaction.id,
+          'rollback_completed',
+          {
+            healthcheckResult: result.rollbackHealthcheck ?? result.healthcheck ?? null,
+            rollbackSha: result.rollbackSha,
+            failure: result.activationError ?? result.error ?? 'new version failed healthcheck',
+            completedAt: nowIso(),
+          },
+          'activation_requested',
+        )
+      ) {
+        return rowToUpgrade(
+          this.db
+            .prepare('SELECT * FROM upgrade_transactions WHERE id=?')
+            .get(transaction.id) as Row,
+        );
+      }
       this.bus.emit({
         type: 'upgrade.healthcheck.failed',
         jobId: transaction.jobId,
@@ -357,12 +452,13 @@ export class UpgradeManager {
       activationAt?: string | null;
       completedAt?: string | null;
     } = {},
-  ): void {
+    expectedStatus?: UpgradeStatus,
+  ): boolean {
     const current = this.db.prepare('SELECT * FROM upgrade_transactions WHERE id=?').get(id) as Row;
-    this.db
+    const changed = this.db
       .prepare(
         `UPDATE upgrade_transactions SET status=?, healthcheck_result=?, rollback_sha=?, failure=?,
-          activation_at=?, completed_at=?, updated_at=? WHERE id=?`,
+          activation_at=?, completed_at=?, updated_at=? WHERE id=?${expectedStatus ? ' AND status=?' : ''}`,
       )
       .run(
         status,
@@ -383,7 +479,9 @@ export class UpgradeManager {
           : patch.completedAt,
         nowIso(),
         id,
+        ...(expectedStatus ? [expectedStatus] : []),
       );
+    return Number(changed.changes) === 1;
   }
 }
 
@@ -429,6 +527,57 @@ function sendActivationRequest(endpoint: string, request: Record<string, unknown
 }
 
 const ZERO_SHA = '0000000000000000000000000000000000000000';
+
+function canonicalEvidence(result: Record<string, unknown>): string {
+  const value = { ...result };
+  delete value.evidenceSignature;
+  return stableJson(value);
+}
+
+function verifyEvidence(result: Record<string, unknown>, publicKey: unknown): boolean {
+  if (typeof publicKey !== 'string' || typeof result.evidenceSignature !== 'string') return false;
+  try {
+    return verifyBytes(
+      null,
+      Buffer.from(canonicalEvidence(result), 'utf8'),
+      publicKey,
+      Buffer.from(result.evidenceSignature, 'base64'),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function exactRepositoryState(repository: string, branch: string, head: string): boolean {
+  try {
+    const currentHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repository,
+      encoding: 'utf8',
+    }).trim();
+    const currentBranch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], {
+      cwd: repository,
+      encoding: 'utf8',
+    }).trim();
+    const dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=normal'], {
+      cwd: repository,
+      encoding: 'utf8',
+    }).trim();
+    return currentHead === head && currentBranch === branch && dirty === '';
+  } catch {
+    return false;
+  }
+}
 
 async function git(cwd: string, args: string[]): Promise<string> {
   const { stdout } = await exec('git', args, { cwd, maxBuffer: 4 * 1024 * 1024 });

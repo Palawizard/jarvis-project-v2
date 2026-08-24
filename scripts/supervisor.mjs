@@ -3,7 +3,13 @@ import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import {
+  createHash,
+  createPrivateKey,
+  randomUUID,
+  sign as signBytes,
+  timingSafeEqual,
+} from 'node:crypto';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clean = (value) => String(value ?? '').trim();
@@ -84,6 +90,28 @@ function atomicJson(file, value) {
   } finally {
     fs.rmSync(temporary, { force: true });
   }
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function signedEvidence(evidence, privateKey) {
+  return {
+    ...evidence,
+    evidenceSignature: signBytes(
+      null,
+      Buffer.from(stableJson(evidence), 'utf8'),
+      privateKey,
+    ).toString('base64'),
+  };
 }
 
 function git(repo, args) {
@@ -197,6 +225,13 @@ function validateRequest(raw, config) {
   if (typeof raw.resultPath !== 'string' || !raw.resultPath.trim()) {
     throw new Error('resultPath is required');
   }
+  if (typeof raw.evidencePrivateKey !== 'string') {
+    throw new Error('activation request is missing its one-shot evidence key');
+  }
+  const evidencePrivateKey = createPrivateKey(raw.evidencePrivateKey);
+  if (evidencePrivateKey.asymmetricKeyType !== 'ed25519') {
+    throw new Error('activation evidence key must be Ed25519');
+  }
   const healthUrl = validateHealthUrl(raw.healthUrl);
   const buildCommand = validateProcess('buildCommand', raw.buildCommand);
   const startCommand = validateProcess('startCommand', raw.startCommand);
@@ -218,6 +253,7 @@ function validateRequest(raw, config) {
     buildCommand,
     startCommand,
     resultPath: outsideRepository(config.repository, raw.resultPath, 'resultPath'),
+    evidencePrivateKey,
   };
 }
 
@@ -713,7 +749,8 @@ async function main() {
         }
         // The raw human bearer existed only in this process's memory. Persist
         // the validated token-free request before acknowledging the caller.
-        atomicJson(processing, request);
+        const { evidencePrivateKey: _evidencePrivateKey, ...persistableRequest } = request;
+        atomicJson(processing, persistableRequest);
         await incoming.accept();
       } catch (error) {
         const rejected = `${config.requestFile}.${Date.now()}.rejected`;
@@ -731,7 +768,7 @@ async function main() {
       child = outcome.child;
       const evidenceFile = request.resultPath;
       if (fs.existsSync(evidenceFile)) throw new Error(`evidence already exists: ${evidenceFile}`);
-      atomicJson(evidenceFile, outcome.evidence);
+      atomicJson(evidenceFile, signedEvidence(outcome.evidence, request.evidencePrivateKey));
       atomicJson(`${config.requestFile}.${request.transactionId}.processed`, {
         transactionId: request.transactionId,
         repository: request.repository,

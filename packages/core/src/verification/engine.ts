@@ -6,7 +6,7 @@ import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { ProjectCommands, VerificationStep } from '../projects/service.js';
 import { redactSecrets } from '../memory/secrets.js';
-import { untrustedProcessEnv } from '../agents/spawn.js';
+import { killTree, untrustedProcessEnv } from '../agents/spawn.js';
 
 export interface VerificationResult {
   id: string;
@@ -80,7 +80,7 @@ export class VerificationEngine {
       kind: NonNullable<VerificationStep['kind']>;
       required: boolean;
     }> = [];
-    if (opts.commands.install && fs.existsSync(path.join(opts.cwd, 'package.json'))) {
+    if (opts.commands.install) {
       steps.push({
         name: 'install',
         command: opts.commands.install,
@@ -90,9 +90,10 @@ export class VerificationEngine {
       });
     }
     if (opts.steps?.length) {
+      const configured: typeof steps = [];
       for (const step of opts.steps) {
         if (!step.name.trim() || !step.command.trim()) continue;
-        steps.push({
+        configured.push({
           name: step.name,
           command: step.command,
           timeoutMs: step.timeoutMs ?? STEP_TIMEOUT_MS,
@@ -100,6 +101,10 @@ export class VerificationEngine {
           required: step.required ?? true,
         });
       }
+      steps.push(
+        ...configured.filter((step) => step.kind === 'setup'),
+        ...configured.filter((step) => step.kind !== 'setup'),
+      );
     } else {
       for (const name of STEP_ORDER) {
         const command = opts.commands[name];
@@ -331,41 +336,25 @@ function runCommand(
     child.stderr.on('data', capture);
 
     let settled = false;
-    let killFallback: NodeJS.Timeout | undefined;
     let forced: { failureKind: 'infrastructure' | 'cancelled'; suffix: string } | undefined;
     const done = (outcome: CommandOutcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      clearTimeout(killFallback);
       signal?.removeEventListener('abort', onAbort);
       resolve(outcome);
-    };
-
-    const kill = () => {
-      if (child.pid && process.platform === 'win32') {
-        spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
-          stdio: 'ignore',
-          windowsHide: true,
-        });
-      } else {
-        child.kill('SIGTERM');
-      }
     };
 
     const terminate = (failureKind: 'infrastructure' | 'cancelled', suffix: string) => {
       if (settled || forced) return;
       forced = { failureKind, suffix };
-      kill();
-      killFallback = setTimeout(
-        () =>
-          done({
-            exitCode: null,
-            output: `${chunks.join('')}\n${suffix}`,
-            startFailed: false,
-            failureKind,
-          }),
-        3000,
+      void killTree(child).finally(() =>
+        done({
+          exitCode: null,
+          output: `${chunks.join('')}\n${suffix}`,
+          startFailed: false,
+          failureKind,
+        }),
       );
     };
 

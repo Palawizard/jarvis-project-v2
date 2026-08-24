@@ -384,7 +384,9 @@ export function parseReviewOutput(
   const block = match?.[1];
   if (!block) return invalidReview('expected exactly one terminal JSON block');
   try {
-    const checked = REVIEW_SCHEMA.safeParse(JSON.parse(block.trim()));
+    const raw = block.trim();
+    if (hasDuplicateJsonKeys(raw)) return invalidReview('duplicate JSON object key');
+    const checked = REVIEW_SCHEMA.safeParse(JSON.parse(raw));
     if (!checked.success) return invalidReview(checked.error.issues[0]?.message);
     const findings = checked.data.findings as ReviewFinding[];
     const blocking = findings.filter((finding) => blockingSeverities.includes(finding.severity));
@@ -402,6 +404,70 @@ export function parseReviewOutput(
   } catch {
     return invalidReview();
   }
+}
+
+function hasDuplicateJsonKeys(text: string): boolean {
+  let index = 0;
+  let duplicate = false;
+  const whitespace = () => {
+    while (/\s/.test(text[index] ?? '')) index++;
+  };
+  const string = () => {
+    const start = index++;
+    while (index < text.length) {
+      if (text[index] === '\\') index += 2;
+      else if (text[index++] === '"') return JSON.parse(text.slice(start, index)) as string;
+    }
+    throw new Error('unterminated JSON string');
+  };
+  const value = (): void => {
+    whitespace();
+    if (text[index] === '{') return object();
+    if (text[index] === '[') return array();
+    if (text[index] === '"') {
+      string();
+      return;
+    }
+    const start = index;
+    while (index < text.length && !/[\s,\]}]/.test(text[index] ?? '')) index++;
+    JSON.parse(text.slice(start, index));
+  };
+  const object = (): void => {
+    const keys = new Set<string>();
+    index++;
+    whitespace();
+    if (text[index] === '}') return void index++;
+    for (;;) {
+      whitespace();
+      if (text[index] !== '"') throw new Error('invalid JSON object key');
+      const key = string();
+      if (keys.has(key)) duplicate = true;
+      keys.add(key);
+      whitespace();
+      if (text[index++] !== ':') throw new Error('invalid JSON object');
+      value();
+      whitespace();
+      const delimiter = text[index++];
+      if (delimiter === '}') return;
+      if (delimiter !== ',') throw new Error('invalid JSON object');
+    }
+  };
+  const array = (): void => {
+    index++;
+    whitespace();
+    if (text[index] === ']') return void index++;
+    for (;;) {
+      value();
+      whitespace();
+      const delimiter = text[index++];
+      if (delimiter === ']') return;
+      if (delimiter !== ',') throw new Error('invalid JSON array');
+    }
+  };
+  value();
+  whitespace();
+  if (index !== text.length) throw new Error('trailing JSON input');
+  return duplicate;
 }
 
 function invalidReview(detail?: string): {

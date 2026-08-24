@@ -34,10 +34,10 @@ function fixture(healthyCandidate: boolean) {
   const stateDir = path.join(root, 'state');
   fs.mkdirSync(repo);
   fs.mkdirSync(stateDir);
-  fs.writeFileSync(path.join(repo, '.gitignore'), '.built\n');
+  fs.writeFileSync(path.join(repo, '.gitignore'), '.built\n.observed-request\n');
   fs.writeFileSync(
     path.join(repo, 'build.mjs'),
-    `import {execFileSync} from 'node:child_process'; import fs from 'node:fs'; fs.writeFileSync('.built', execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n`,
+    `import {execFileSync} from 'node:child_process'; import fs from 'node:fs'; const processing=process.env.JARVIS_UPGRADE_REQUEST_PATH+'.processing'; const observed=fs.existsSync(processing)?fs.readFileSync(processing,'utf8'):''; fs.writeFileSync('.observed-request',observed); console.error(observed); fs.writeFileSync('.built', execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n`,
   );
   fs.writeFileSync(
     path.join(repo, 'server.mjs'),
@@ -175,7 +175,7 @@ async function runActivation(
   const code = await new Promise<number | null>((resolve) => child.once('exit', resolve));
   if (code !== 0) throw new Error(`supervisor exited ${code}: ${logs}`);
   children.splice(children.indexOf(child), 1);
-  return { ...setup, evidence };
+  return { ...setup, evidence, logs };
 }
 
 afterEach(async () => {
@@ -217,6 +217,18 @@ describe('external self-upgrade supervisor', () => {
       'utf8',
     );
     expect(processed).not.toContain(ACTIVATION_TOKEN);
+    const observed = fs.readFileSync(path.join(result.repo, '.observed-request'), 'utf8');
+    expect(observed).not.toContain(ACTIVATION_TOKEN);
+    expect(observed).not.toContain('activationToken');
+    expect(JSON.stringify(result.evidence)).not.toContain(ACTIVATION_TOKEN);
+    expect(result.logs).not.toContain(ACTIVATION_TOKEN);
+    expect(
+      fs
+        .readdirSync(result.stateDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => fs.readFileSync(path.join(result.stateDir, entry.name), 'utf8'))
+        .join('\n'),
+    ).not.toContain(ACTIVATION_TOKEN);
   });
 
   it('restores and restarts the old revision after candidate health fails', async () => {
@@ -248,7 +260,8 @@ describe('external self-upgrade supervisor', () => {
   });
 
   it('rejects a self-asserted approval without the out-of-band human token', async () => {
-    const result = await runActivation(true, false, 'attacker-cannot-self-approve-0123456789');
+    const attackerToken = 'attacker-cannot-self-approve-0123456789';
+    const result = await runActivation(true, false, attackerToken);
     expect(result.evidence).toMatchObject({
       supervisorExitCode: 0,
       resultExists: false,
@@ -256,5 +269,12 @@ describe('external self-upgrade supervisor', () => {
     });
     expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.previousSha);
     expect(git(result.repo, 'status', '--porcelain')).toBe('');
+    expect(
+      fs
+        .readdirSync(result.stateDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => fs.readFileSync(path.join(result.stateDir, entry.name), 'utf8'))
+        .join('\n'),
+    ).not.toContain(attackerToken);
   });
 });

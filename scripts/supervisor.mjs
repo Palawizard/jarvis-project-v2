@@ -10,12 +10,16 @@ const clean = (value) => String(value ?? '').trim();
 function atomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: 'utf8',
-    flag: 'wx',
-    mode: 0o600,
-  });
-  fs.renameSync(temporary, file);
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o600,
+    });
+    fs.renameSync(temporary, file);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
 }
 
 function git(repo, args) {
@@ -503,14 +507,18 @@ async function main() {
       let request;
       try {
         request = validateRequest(JSON.parse(fs.readFileSync(processing, 'utf8')), config);
+        // Consume the human secret before any candidate-controlled build or
+        // runtime can observe the request path. The validated request returned
+        // above deliberately contains no activationToken.
+        atomicJson(processing, request);
       } catch (error) {
         const rejected = `${config.requestFile}.${Date.now()}.rejected`;
+        fs.rmSync(processing, { force: true });
         atomicJson(rejected, {
           status: 'rejected',
           error: error instanceof Error ? error.message : String(error),
           rejectedAt: new Date().toISOString(),
         });
-        fs.rmSync(processing);
         if (config.once) stopping = true;
         continue;
       }

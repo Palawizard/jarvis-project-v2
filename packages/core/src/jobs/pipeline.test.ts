@@ -146,6 +146,7 @@ async function harness(options: {
   realVerification?: boolean;
   verificationInfraRetries?: number;
   commands?: ProjectCommands;
+  packageManifestForInstall?: boolean;
 }): Promise<Harness> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-pipeline-'));
   roots.push(home);
@@ -157,7 +158,7 @@ async function harness(options: {
   git(['config', 'user.name', 'Test']);
   git(['config', 'core.autocrlf', 'false']);
   fs.writeFileSync(path.join(repo, 'README.md'), '# fixture\n');
-  if (options.commands?.install) {
+  if (options.commands?.install && options.packageManifestForInstall !== false) {
     fs.writeFileSync(path.join(repo, 'package.json'), '{"name":"pipeline-fixture"}\n');
     fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n');
   }
@@ -903,6 +904,35 @@ describe('job repair pipeline', () => {
     expect(
       h.db.prepare("SELECT DISTINCT failure_kind FROM verifications WHERE kind='setup'").all(),
     ).toEqual([{ failure_kind: 'infrastructure' }]);
+    h.db.close();
+  });
+
+  it('treats configured non-JavaScript setup failure as infrastructure without a fixer', async () => {
+    const h = await harness({
+      realVerification: true,
+      verificationInfraRetries: 1,
+      packageManifestForInstall: false,
+      commands: { install: 'echo setup-failed && exit 1', test: 'echo product-looking && exit 3' },
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'unused',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('paused');
+    expect(h.verificationCalls).toHaveLength(2);
+    expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(0);
+    expect(
+      h.db.prepare('SELECT name,failure_kind FROM verifications ORDER BY cycle').all(),
+    ).toEqual([
+      { name: 'install', failure_kind: 'infrastructure' },
+      { name: 'install', failure_kind: 'infrastructure' },
+    ]);
     h.db.close();
   });
 

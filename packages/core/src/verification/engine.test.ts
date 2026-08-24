@@ -153,6 +153,16 @@ describe('deterministic verification', () => {
     expect(report.results.map((r) => r.name)).toEqual(['install', 'test']);
   });
 
+  it('runs a configured install without assuming a JavaScript manifest', async () => {
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install: FAIL, test: OK },
+    });
+    expect(report.failureKind).toBe('infrastructure');
+    expect(report.results.map((result) => result.name)).toEqual(['install']);
+  });
+
   it('reruns failed setup across real consecutive engines despite partial residue', async () => {
     fs.writeFileSync(path.join(home, 'package.json'), '{"name":"x"}');
     const install =
@@ -281,6 +291,20 @@ describe('deterministic verification', () => {
       steps: [
         { name: 'prepare', command: FAIL, kind: 'setup' },
         { name: 'test', command: OK, kind: 'check' },
+      ],
+    });
+    expect(report.failureKind).toBe('infrastructure');
+    expect(report.results.map((result) => result.name)).toEqual(['prepare']);
+  });
+
+  it('runs declared setup before checks even when configuration order is unsafe', async () => {
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: {},
+      steps: [
+        { name: 'test', command: FAIL, kind: 'check' },
+        { name: 'prepare', command: FAIL, kind: 'setup' },
       ],
     });
     expect(report.failureKind).toBe('infrastructure');

@@ -245,6 +245,7 @@ export class UpgradeManager {
     try {
       fs.renameSync(temporary, requestPath);
     } catch (error) {
+      fs.rmSync(temporary, { force: true });
       this.setStatus(transaction.id, 'inspection_required', {
         failure: `activation request publication failed: ${error instanceof Error ? error.message : String(error)}`,
       });

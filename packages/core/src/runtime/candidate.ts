@@ -6,6 +6,7 @@ import path from 'node:path';
 import type { JarvisConfig } from '../config.js';
 import { killTree } from '../agents/spawn.js';
 import { repoStatus } from '../git/workspace.js';
+import { redactSecrets } from '../memory/secrets.js';
 import type { Project } from '../projects/service.js';
 
 export class CandidateRuntimeUnsupportedError extends Error {}
@@ -47,6 +48,7 @@ export async function startCandidateRuntime(opts: {
     ...process.env,
     JARVIS_HOME: home,
     JARVIS_RUNTIME_NONCE: runtimeNonce,
+    JARVIS_CANDIDATE_RUNTIME: '1',
     FORCE_COLOR: '0',
     BROWSER: 'none',
     [runtime.portEnvironment]: String(web),
@@ -90,9 +92,10 @@ export async function startCandidateRuntime(opts: {
     shell: process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(executable),
   });
   const logs: string[] = [];
+  let logBuffer = '';
   const capture = (chunk: Buffer) => {
-    logs.push(chunk.toString());
-    if (logs.length > 200) logs.shift();
+    logBuffer = (logBuffer + chunk.toString()).slice(-20_000);
+    logs.splice(0, logs.length, redactSecrets(logBuffer));
   };
   child.stdout?.on('data', capture);
   child.stderr?.on('data', capture);

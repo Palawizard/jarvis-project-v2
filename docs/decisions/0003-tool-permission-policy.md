@@ -30,7 +30,7 @@ Jarvis cannot know a tool is idempotent.
 
 - Registering a future tool means declaring a risk level, nothing more.
 - Refusals, timeouts and interrupted actions are first-class UI content.
-- A local process running as the same user can still act as the user; that is a
-  property of an unauthenticated loopback API, documented in
-  `docs/tool-permissions.md` rather than papered over with a token that any such
-  process could read.
+- Loopback is not authority. Private API access requires the origin-bound browser
+  control credential, and mutations additionally require the exact configured
+  Origin; residual same-user browser/profile compromise is documented in
+  `docs/tool-permissions.md`.

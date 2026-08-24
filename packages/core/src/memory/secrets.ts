@@ -15,6 +15,10 @@ interface SecretRule {
 }
 
 const RULES: SecretRule[] = [
+  {
+    name: 'jarvis_pairing_token',
+    pattern: /\bJarvis human pairing token[^\r\n:]*:\s*[^\s]+/i,
+  },
   { name: 'anthropic_api_key', pattern: /\bsk-ant-[A-Za-z0-9_-]{16,}/ },
   { name: 'openai_api_key', pattern: /\bsk-(?:proj-)?[A-Za-z0-9_-]{24,}/ },
   { name: 'github_token', pattern: /\bgh[pousr]_[A-Za-z0-9]{20,}/ },

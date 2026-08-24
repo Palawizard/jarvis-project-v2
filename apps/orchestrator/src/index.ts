@@ -11,7 +11,7 @@ const log = createLogger('orchestrator');
 
 async function main(): Promise<void> {
   const jarvis = Jarvis.open();
-  if (!jarvis.control.paired()) {
+  if (process.env.JARVIS_CANDIDATE_RUNTIME !== '1' && !jarvis.control.paired()) {
     const bootstrap = jarvis.control.createBootstrap();
     process.stderr.write(
       `\nJarvis human pairing token (valid once for 10 minutes): ${bootstrap}\n` +

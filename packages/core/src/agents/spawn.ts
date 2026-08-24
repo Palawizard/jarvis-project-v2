@@ -11,8 +11,8 @@ const API_KEY_ENV = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY'] as 
  * Jarvis's own control plane. An agent child has no business talking to the
  * orchestrator API — its privileged path is the in-process tool boundary, where
  * `actor: 'agent'` applies. Not handing it the address is defence in depth, not
- * a boundary: the port is guessable and the API is unauthenticated, so an agent
- * determined to reach it still can. See docs/tool-permissions.md.
+ * a boundary: the authenticated browser capability and exact mutation Origin
+ * remain the actual control-plane boundary. See docs/tool-permissions.md.
  */
 const CONTROL_PLANE_ENV = [
   'JARVIS_PORT',

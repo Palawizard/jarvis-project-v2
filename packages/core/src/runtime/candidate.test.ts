@@ -30,7 +30,7 @@ function project(root: string, configured = true): Project {
               executable: process.execPath,
               args: [
                 '-e',
-                `require('node:http').createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok',home:process.env.JARVIS_HOME,supervised:process.env.JARVIS_SUPERVISED,requestPath:process.env.JARVIS_UPGRADE_REQUEST_PATH,apiKey:process.env.OPENAI_API_KEY,bootstrap:process.env.JARVIS_BOOTSTRAP_TOKEN,control:process.env.JARVIS_CONTROL_TOKEN}))}).listen(Number(process.env.TEST_PORT),'127.0.0.1')`,
+                `if(process.env.JARVIS_CANDIDATE_RUNTIME!=='1')console.error('Jarvis human pairing token: should-never-print');require('node:http').createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok',home:process.env.JARVIS_HOME,candidateMode:process.env.JARVIS_CANDIDATE_RUNTIME,supervised:process.env.JARVIS_SUPERVISED,requestPath:process.env.JARVIS_UPGRADE_REQUEST_PATH,apiKey:process.env.OPENAI_API_KEY,bootstrap:process.env.JARVIS_BOOTSTRAP_TOKEN,control:process.env.JARVIS_CONTROL_TOKEN}))}).listen(Number(process.env.TEST_PORT),'127.0.0.1')`,
               ],
             },
             portEnvironment: 'TEST_PORT',
@@ -95,6 +95,7 @@ describe('candidate runtime isolation', () => {
       expect(started.home).toBe(path.join(config.home, 'candidate-runtimes', 'job_fixture'));
       const health = (await (await fetch(started.healthUrl)).json()) as {
         home: string;
+        candidateMode?: string;
         supervised?: string;
         requestPath?: string;
         apiKey?: string;
@@ -102,11 +103,13 @@ describe('candidate runtime isolation', () => {
         control?: string;
       };
       expect(health.home).toBe(started.home);
+      expect(health.candidateMode).toBe('1');
       expect(health.supervised).toBeUndefined();
       expect(health.requestPath).toBeUndefined();
       expect(health.apiKey).toBeUndefined();
       expect(health.bootstrap).toBeUndefined();
       expect(health.control).toBeUndefined();
+      expect(started.logs.join('')).not.toContain('Jarvis human pairing token');
       await started.stop();
       await started.stop();
       runtime = undefined;
@@ -149,6 +152,32 @@ describe('candidate runtime isolation', () => {
         timeoutMs: 2_000,
       }),
     ).rejects.toThrow();
+  });
+
+  it('redacts a pairing bootstrap from candidate startup errors', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
+    roots.push(root);
+    const secret = 'candidate-bootstrap-secret-0123456789';
+    const leaking = project(root);
+    if (!leaking.config.candidateRuntime) throw new Error('fixture runtime missing');
+    leaking.config.candidateRuntime.command.args = [
+      '-e',
+      `process.stderr.write('Jarvis human pairing token (valid once): ${secret}\\n');process.exit(1)`,
+    ];
+    let message = '';
+    try {
+      await startCandidateRuntime({
+        project: leaking,
+        cwd: root,
+        jobId: 'job_leaking_runtime',
+        config: loadConfig({ home: path.join(root, 'home') }),
+        timeoutMs: 2_000,
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain('[redacted:jarvis_pairing_token]');
+    expect(message).not.toContain(secret);
   });
 
   it('rejects a self-candidate health response without the launch identity', async () => {

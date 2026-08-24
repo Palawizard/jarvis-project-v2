@@ -42,6 +42,30 @@ export class HumanControlAuth {
     return credential;
   }
 
+  /**
+   * Candidate runtimes have no human to pair with, so Visual QA would only ever
+   * photograph the pairing screen. The parent generates one ephemeral credential
+   * per candidate runtime and hands the child nothing but its SHA-256 hash; this
+   * seeds the isolated candidate JARVIS_HOME with that hash so the candidate API
+   * accepts exactly that credential and nothing else. The real ~/.jarvis row is
+   * never read, copied or reused, and knowing the hash does not authenticate.
+   */
+  initCandidateVisualQa(env: NodeJS.ProcessEnv = process.env): boolean {
+    if (env.JARVIS_CANDIDATE_RUNTIME !== '1') return false;
+    const hash = env.JARVIS_CANDIDATE_QA_CREDENTIAL_HASH?.toLowerCase();
+    if (!hash || !/^[a-f0-9]{64}$/.test(hash)) return false;
+    const now = nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO human_control (id, credential_hash, paired_at, updated_at)
+         VALUES ('primary',?,?,?)
+         ON CONFLICT(id) DO UPDATE SET credential_hash=excluded.credential_hash,
+           paired_at=excluded.paired_at, updated_at=excluded.updated_at`,
+      )
+      .run(hash, now, now);
+    return true;
+  }
+
   authenticated(credential: string | undefined): boolean {
     if (!credential) return false;
     const row = this.db

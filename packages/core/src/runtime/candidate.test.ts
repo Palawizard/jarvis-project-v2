@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { loadConfig } from '../config.js';
 import type { Project } from '../projects/service.js';
@@ -468,3 +469,92 @@ function processAlive(pid: number): boolean {
     return false;
   }
 }
+
+describe('candidate Visual QA credential', () => {
+  /** Health server echoes back exactly what the parent put in its environment. */
+  function echoProject(root: string): Project {
+    const base = project(root);
+    base.config.candidateRuntime = {
+      command: {
+        executable: process.execPath,
+        args: [
+          '-e',
+          `require('node:http').createServer((_,r)=>{r.setHeader('content-type','application/json');` +
+            `r.end(JSON.stringify({status:'ok',hash:process.env.JARVIS_CANDIDATE_QA_CREDENTIAL_HASH,` +
+            `origins:process.env.JARVIS_CONTROL_ORIGINS,env:Object.keys(process.env).join(',')}))})` +
+            `.listen(Number(process.env.TEST_PORT),'127.0.0.1');` +
+            `console.log('candidate env hash='+process.env.JARVIS_CANDIDATE_QA_CREDENTIAL_HASH);`,
+        ],
+      },
+      portEnvironment: 'TEST_PORT',
+      healthPath: '/health',
+    };
+    return base;
+  }
+
+  it('gives the child only the hash and trusts exactly its own web origin', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-qa-cred-'));
+    roots.push(root);
+    const config = loadConfig({ home: path.join(root, 'jarvis-home') });
+    let runtime: Awaited<ReturnType<typeof startCandidateRuntime>> | undefined;
+    try {
+      runtime = await startCandidateRuntime({
+        project: echoProject(root),
+        cwd: root,
+        jobId: 'job_qa_cred',
+        config,
+        timeoutMs: 10_000,
+      });
+      const credential = runtime.controlCredential();
+      expect(credential).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+      const body = (await (await fetch(runtime.healthUrl)).json()) as {
+        hash: string;
+        origins: string;
+        env: string;
+      };
+      // The child knows the hash and nothing else. The hash is not authority.
+      expect(body.hash).toBe(
+        createHash('sha256')
+          .update(credential as string, 'utf8')
+          .digest('hex'),
+      );
+      expect(body.hash).not.toBe(credential);
+      expect(body.env).not.toContain(credential as string);
+      expect(body.origins).toBe(runtime.baseUrl);
+      expect(body.origins).toBe(`http://127.0.0.1:${runtime.ports.web}`);
+      // Nothing anywhere echoes the raw credential back into logs or events.
+      expect(runtime.logs.join('')).toContain('candidate env hash=');
+      expect(runtime.logs.join('')).not.toContain(credential as string);
+
+      await runtime.stop();
+      // Stopping destroys the usable credential context.
+      expect(runtime.controlCredential()).toBeNull();
+      await expect(fetch(runtime.baseUrl, { signal: AbortSignal.timeout(1000) })).rejects.toThrow();
+    } finally {
+      await runtime?.stop().catch(() => undefined);
+    }
+  }, 30_000);
+
+  it('mints a distinct credential per candidate runtime', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-qa-cred2-'));
+    roots.push(root);
+    const config = loadConfig({ home: path.join(root, 'jarvis-home') });
+    const started: Awaited<ReturnType<typeof startCandidateRuntime>>[] = [];
+    try {
+      for (const jobId of ['job_a', 'job_b']) {
+        started.push(
+          await startCandidateRuntime({
+            project: echoProject(root),
+            cwd: root,
+            jobId,
+            config,
+            timeoutMs: 10_000,
+          }),
+        );
+      }
+      expect(started[0]?.controlCredential()).not.toBe(started[1]?.controlCredential());
+    } finally {
+      for (const runtime of started) await runtime.stop().catch(() => undefined);
+    }
+  }, 40_000);
+});

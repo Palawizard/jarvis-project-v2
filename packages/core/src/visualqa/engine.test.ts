@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from '../config.js';
 import { openDb } from '../db/index.js';
-import { validateVisualEvidence, VisualQaEngine } from './engine.js';
+import { randomBytes } from 'node:crypto';
+import { candidateControlHeader, validateVisualEvidence, VisualQaEngine } from './engine.js';
 
 const servers: http.Server[] = [];
 const roots: string[] = [];
@@ -397,3 +398,165 @@ function findPngs(root: string): string[] {
     .filter((entry) => entry.isFile() && entry.name.endsWith('.png'))
     .map((entry) => entry.name);
 }
+
+describe('candidate-runtime authenticated visual QA', () => {
+  const CANDIDATE_SCENARIOS = () => [
+    { name: 'command', route: '/', viewports: ['desktop' as const, 'mobile' as const] },
+    {
+      name: 'tools',
+      route: '/',
+      interactions: [
+        { action: 'click' as const, selector: "[data-testid='nav-tools']" },
+        { action: 'wait' as const, selector: "[data-testid='tools-view']" },
+      ],
+      viewports: ['desktop' as const, 'mobile' as const],
+    },
+  ];
+
+  /** A stand-in for the candidate UI: locked until /api/auth/status authenticates. */
+  async function candidateApp(credential: string) {
+    const seen: Array<{ url: string; control: string | undefined }> = [];
+    let locked = 0;
+    const server = http.createServer((request, response) => {
+      seen.push({
+        url: request.url ?? '',
+        control: request.headers['x-jarvis-control'] as string | undefined,
+      });
+      if (request.url?.startsWith('/api/auth/status')) {
+        if (request.headers['x-jarvis-control'] !== credential) {
+          locked += 1;
+          response.writeHead(401, { 'content-type': 'application/json' });
+          response.end('{"error":"human control authentication required"}');
+          return;
+        }
+        response.setHeader('content-type', 'application/json');
+        response.end('{"authenticated":true,"paired":true}');
+        return;
+      }
+      response.setHeader('content-type', 'text/html');
+      response.end(
+        `<!doctype html><div id="root">booting</div><script>
+        (async () => {
+          const root = document.getElementById('root');
+          const status = await fetch('/api/auth/status');
+          if (status.status !== 200) { root.innerHTML = '<h1>Human control locked</h1>'; return; }
+          root.innerHTML = "<div data-testid='command-view'><h1>Command</h1>" +
+            "<button data-testid='nav-tools'>Tools</button></div>";
+          document.querySelector("[data-testid='nav-tools']").addEventListener('click', () => {
+            root.innerHTML = "<div data-testid='tools-view'><h1>Tools</h1></div>";
+          });
+        })();
+        </script>`,
+      );
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test server did not bind');
+    return { baseUrl: `http://127.0.0.1:${address.port}`, seen, locked: () => locked };
+  }
+
+  function fixture() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-visual-auth-'));
+    roots.push(root);
+    const db = openDb(loadConfig({ home: root, dbPath: ':memory:' }));
+    db.prepare(
+      `INSERT INTO projects
+        (id,name,root_path,default_branch,stack,commands,is_self,config,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run('project-candidate', 'candidate', root, 'main', '{}', '{}', 1, '{}', 'now', 'now');
+    db.prepare(
+      `INSERT INTO jobs (id,project_id,request,goal,stage,status,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    ).run('job-candidate', 'project-candidate', 'qa', 'qa', 'visual_qa', 'running', 'now', 'now');
+    return { db, engine: new VisualQaEngine(db, path.join(root, 'artifacts')) };
+  }
+
+  it('attaches the control header to candidate-origin requests only', () => {
+    const credential = randomBytes(32).toString('base64url');
+    const origin = 'http://127.0.0.1:41234';
+    expect(candidateControlHeader(`${origin}/api/auth/status`, origin, credential)).toEqual({
+      'x-jarvis-control': credential,
+    });
+    // Foreign origins — including the same host on another port — get nothing.
+    expect(
+      candidateControlHeader('http://127.0.0.1:41235/x.js', origin, credential),
+    ).toBeUndefined();
+    expect(
+      candidateControlHeader('http://localhost:41234/x.js', origin, credential),
+    ).toBeUndefined();
+    expect(
+      candidateControlHeader('https://cdn.example.com/x.js', origin, credential),
+    ).toBeUndefined();
+    expect(candidateControlHeader('not a url', origin, credential)).toBeUndefined();
+    // Real Jarvis runs Visual QA without a candidate credential: never attached.
+    expect(candidateControlHeader(`${origin}/`, origin, null)).toBeUndefined();
+  });
+
+  it('captures the authenticated candidate UI for every scenario and viewport', async () => {
+    const credential = randomBytes(32).toString('base64url');
+    const app = await candidateApp(credential);
+    const { db, engine } = fixture();
+    try {
+      const shots = await engine.capture({
+        jobId: 'job-candidate',
+        projectId: 'project-candidate',
+        baseUrl: app.baseUrl,
+        controlCredential: credential,
+        routes: ['/'],
+        scenarios: CANDIDATE_SCENARIOS(),
+        headRef: 'b'.repeat(40),
+      });
+
+      expect(shots.filter((shot) => shot.status === 'captured')).toHaveLength(4);
+      expect(shots.filter((shot) => shot.status === 'failed')).toHaveLength(0);
+      expect(shots.map((shot) => `${shot.scenarioName}/${shot.viewport}`)).toEqual([
+        'command/desktop',
+        'command/mobile',
+        'tools/desktop',
+        'tools/mobile',
+      ]);
+      expect(shots.every((shot) => validateVisualEvidence(shot.screenshotPath))).toBe(true);
+      // No 401 and no console errors: the pairing screen was never rendered, so
+      // the screenshots can only show the authenticated Command/Tools UI.
+      expect(shots.flatMap((shot) => shot.networkFailures)).toEqual([]);
+      expect(shots.flatMap((shot) => shot.consoleErrors)).toEqual([]);
+      expect(app.locked()).toBe(0);
+      // Every candidate-origin request carried the credential — document included.
+      expect(app.seen.length).toBeGreaterThan(0);
+      expect(app.seen.every((entry) => entry.control === credential)).toBe(true);
+      // And no evidence row records it.
+      expect(JSON.stringify(shots)).not.toContain(credential);
+    } finally {
+      db.close();
+    }
+  }, 120_000);
+
+  it('still photographs the pairing screen when no candidate credential is supplied', async () => {
+    const app = await candidateApp(randomBytes(32).toString('base64url'));
+    const { db, engine } = fixture();
+    try {
+      const shots = await engine.capture({
+        jobId: 'job-candidate',
+        projectId: 'project-candidate',
+        baseUrl: app.baseUrl,
+        routes: ['/'],
+        scenarios: CANDIDATE_SCENARIOS(),
+        headRef: 'c'.repeat(40),
+      });
+      expect(app.seen.every((entry) => entry.control === undefined)).toBe(true);
+      expect(app.locked()).toBeGreaterThan(0);
+      expect(shots.flatMap((shot) => shot.networkFailures).some((f) => f.startsWith('401 '))).toBe(
+        true,
+      );
+      // Tools cannot be reached from the locked screen.
+      expect(
+        shots
+          .filter((shot) => shot.scenarioName === 'tools')
+          .every((shot) => shot.status === 'failed'),
+      ).toBe(true);
+    } finally {
+      db.close();
+    }
+  }, 120_000);
+});

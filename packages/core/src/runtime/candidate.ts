@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -16,6 +16,13 @@ export interface CandidateRuntime {
   home: string;
   ports: { web: number; api?: number };
   logs: string[];
+  /**
+   * Ephemeral human-control credential for THIS candidate runtime only, for
+   * trusted parent code (Visual QA). The child only ever received its hash, so
+   * this raw value exists in the parent process and nowhere else. Returns null
+   * once `stop()` has run: the credential dies with the runtime.
+   */
+  controlCredential(): string | null;
   stop(): Promise<void>;
 }
 
@@ -42,12 +49,22 @@ export async function startCandidateRuntime(opts: {
   const api = apiReservation?.port;
   const runtimeNonce = randomUUID();
   const baseUrl = `http://127.0.0.1:${web}`;
+  // Visual QA needs an authenticated candidate UI, and the real user's browser
+  // credential must never reach a candidate. So mint a fresh one scoped to this
+  // runtime: the child gets only the hash (useless for authenticating), the
+  // parent keeps the raw value, and both die when the runtime stops.
+  let qaCredential: string | null = randomBytes(32).toString('base64url');
+  const qaCredentialHash = createHash('sha256').update(qaCredential, 'utf8').digest('hex');
   const healthUrl = `http://127.0.0.1:${api ?? web}${runtime.healthPath ?? '/'}`;
   const env = {
     ...untrustedProcessEnv(),
     JARVIS_HOME: home,
     JARVIS_RUNTIME_NONCE: runtimeNonce,
     JARVIS_CANDIDATE_RUNTIME: '1',
+    JARVIS_CANDIDATE_QA_CREDENTIAL_HASH: qaCredentialHash,
+    // Candidate mutations must still present an exact Origin. Trust exactly the
+    // candidate's own dynamic web origin — candidate-only config, not authority.
+    JARVIS_CONTROL_ORIGINS: baseUrl,
     FORCE_COLOR: '0',
     BROWSER: 'none',
     [runtime.portEnvironment]: String(web),
@@ -86,6 +103,7 @@ export async function startCandidateRuntime(opts: {
   let stopPromise: Promise<void> | undefined;
   const stop = () =>
     (stopPromise ??= (async () => {
+      qaCredential = null;
       await killTree(child);
       const ownedPorts = [web, ...(api ? [api] : [])];
       if (!(await waitForPortsClosed(ownedPorts, 3_000))) {
@@ -142,6 +160,7 @@ export async function startCandidateRuntime(opts: {
       home,
       ports: { web, ...(api ? { api } : {}) },
       logs,
+      controlCredential: () => qaCredential,
       stop,
     };
   } catch (error) {

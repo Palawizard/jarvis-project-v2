@@ -90,6 +90,11 @@ export class VisualQaEngine {
     signal?: AbortSignal;
     headRef?: string | null;
     cycle?: number;
+    /**
+     * Ephemeral candidate-runtime control credential. Attached as
+     * `X-Jarvis-Control` to same-origin candidate requests only.
+     */
+    controlCredential?: string | null;
   }): Promise<VisualQaShot[]> {
     const viewports = opts.viewports ?? ['desktop', 'mobile'];
     const scenarios: VisualQaScenario[] = opts.scenarios?.length
@@ -191,6 +196,7 @@ export class VisualQaEngine {
       interactions?: VisualInteraction[];
       headRef?: string | null;
       cycle?: number;
+      controlCredential?: string | null;
     },
     scenario: VisualQaScenario,
     viewport: 'desktop' | 'mobile',
@@ -200,7 +206,12 @@ export class VisualQaEngine {
     const networkFailures: string[] = [];
     const screenshotPaths = new Set<string>();
     const page = await context.newPage();
-    const navigation = await confineNavigation(context, page, new URL(opts.baseUrl).origin);
+    const navigation = await confineNavigation(
+      context,
+      page,
+      new URL(opts.baseUrl).origin,
+      opts.controlCredential ?? null,
+    );
 
     page.on('console', (msg) => {
       if (msg.type() === 'error') consoleErrors.push(msg.text().slice(0, 500));
@@ -225,7 +236,7 @@ export class VisualQaEngine {
     const screenshotPath = path.join(outDir, safeName);
 
     try {
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 30_000 });
+      await gotoAndSettle(page, url);
       navigation.assert();
       await runInteractions(
         page,
@@ -426,6 +437,16 @@ function parseReview(raw: string | null): {
   }
 }
 
+/**
+ * Navigate, then let the network go quiet — best-effort. An authenticated
+ * candidate UI holds its SSE event stream open for as long as the page lives,
+ * so `waitUntil: 'networkidle'` would time out on every healthy capture.
+ */
+async function gotoAndSettle(page: import('playwright').Page, url: string): Promise<void> {
+  await page.goto(url, { waitUntil: 'load', timeout: 30_000 });
+  await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
+}
+
 async function runInteractions(
   page: import('playwright').Page,
   baseUrl: string,
@@ -441,10 +462,7 @@ async function runInteractions(
   for (const step of interactions) {
     switch (step.action) {
       case 'goto':
-        await page.goto(confinedCandidateUrl(baseUrl, step.route), {
-          waitUntil: 'networkidle',
-          timeout: 30_000,
-        });
+        await gotoAndSettle(page, confinedCandidateUrl(baseUrl, step.route));
         assertConfined();
         break;
       case 'click':
@@ -479,15 +497,39 @@ async function runInteractions(
   }
 }
 
+/**
+ * The candidate control header, for candidate-origin requests only. A
+ * context-wide `extraHTTPHeaders` would hand the ephemeral credential to every
+ * foreign subresource the page happens to request, so scope it here instead.
+ */
+export function candidateControlHeader(
+  url: string,
+  expectedOrigin: string,
+  credential: string | null | undefined,
+): Record<string, string> | undefined {
+  if (!credential) return undefined;
+  try {
+    if (new URL(url).origin !== expectedOrigin) return undefined;
+  } catch {
+    return undefined;
+  }
+  return { 'x-jarvis-control': credential };
+}
+
 async function confineNavigation(
   context: import('playwright').BrowserContext,
   page: import('playwright').Page,
   expectedOrigin: string,
+  controlCredential: string | null = null,
 ): Promise<{ assert(): void; settle(): Promise<void> }> {
   let violation: string | null = null;
   const pending = new Set<Promise<void>>();
   const reject = (url: string, kind: string) => {
     violation ??= `${kind} escaped candidate origin: ${url}`.slice(0, 500);
+  };
+  const controlHeaders = (request: import('playwright').Request) => {
+    const control = candidateControlHeader(request.url(), expectedOrigin, controlCredential);
+    return control ? { ...request.headers(), ...control } : undefined;
   };
   const cdp = await context.newCDPSession(page);
   await cdp.send('Page.enable');
@@ -530,7 +572,11 @@ async function confineNavigation(
           await route.abort('blockedbyclient');
           return;
         }
-        const response = await route.fetch({ maxRedirects: 0 });
+        const navigationHeaders = controlHeaders(request);
+        const response = await route.fetch({
+          maxRedirects: 0,
+          ...(navigationHeaders ? { headers: navigationHeaders } : {}),
+        });
         const location = response.headers().location;
         if (response.status() >= 300 && response.status() < 400 && location) {
           let target: string;
@@ -550,7 +596,8 @@ async function confineNavigation(
         await route.fulfill({ response });
         return;
       }
-      await route.continue();
+      const headers = controlHeaders(request);
+      await route.continue(headers ? { headers } : undefined);
     })();
     pending.add(task);
     void task.then(

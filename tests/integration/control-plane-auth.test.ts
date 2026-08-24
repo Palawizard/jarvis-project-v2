@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import type { Server } from 'node:http';
 import { serve } from '@hono/node-server';
@@ -231,5 +232,125 @@ describe('hostile loopback control-plane client', () => {
       ).status,
     ).toBe(200);
     expect(jarvis.tools.getExecution(pending.execution.id)?.status).toBe('succeeded');
+  });
+});
+
+describe('candidate-runtime Visual QA authority', () => {
+  /** Serve a Jarvis instance and return a fetch bound to it. */
+  async function servedRoutes(jarvis: Jarvis) {
+    const server = serve({ fetch: createRoutes(jarvis).fetch, port: 0, hostname: '127.0.0.1' });
+    servers.push(server);
+    await once(server, 'listening');
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test server did not bind');
+    return (route: string, init?: RequestInit) =>
+      fetch(`http://127.0.0.1:${address.port}${route}`, init);
+  }
+
+  function newHome(prefix: string): string {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    homes.push(home);
+    return home;
+  }
+
+  it('authenticates only its own isolated runtime and never the real control plane', async () => {
+    // The real Jarvis: paired with a browser credential the candidate never sees.
+    const realOrigin = 'http://127.0.0.1:5199';
+    const real = new Jarvis(
+      loadConfig({ home: newHome('jarvis-real-'), controlOrigins: [realOrigin] }),
+    );
+    open.push(real);
+    const realCredential = real.control.pair(real.control.createBootstrap());
+    if (!realCredential) throw new Error('real pairing fixture failed');
+    const realFetch = await servedRoutes(real);
+
+    // The candidate runtime: isolated home, seeded from ephemeral QA material only.
+    const qaCredential = randomBytes(32).toString('base64url');
+    const candidateOrigin = 'http://127.0.0.1:41999';
+    const candidate = new Jarvis(
+      loadConfig({ home: newHome('jarvis-candidate-'), controlOrigins: [candidateOrigin] }),
+    );
+    open.push(candidate);
+    expect(
+      candidate.control.initCandidateVisualQa({
+        JARVIS_CANDIDATE_RUNTIME: '1',
+        JARVIS_CANDIDATE_QA_CREDENTIAL_HASH: createHash('sha256')
+          .update(qaCredential, 'utf8')
+          .digest('hex'),
+      }),
+    ).toBe(true);
+    const candidateFetch = await servedRoutes(candidate);
+
+    // The candidate UI is authenticated against its own runtime.
+    expect(
+      await (
+        await candidateFetch('/api/auth/status', { headers: { 'x-jarvis-control': qaCredential } })
+      ).json(),
+    ).toMatchObject({ authenticated: true });
+    expect(
+      (
+        await candidateFetch('/api/projects', {
+          headers: { 'x-jarvis-control': qaCredential },
+        })
+      ).status,
+    ).toBe(200);
+    // And its mutations still require its own exact configured origin.
+    expect(
+      (
+        await candidateFetch('/api/tool-grants', {
+          method: 'POST',
+          headers: { 'x-jarvis-control': qaCredential, 'content-type': 'application/json' },
+          body: JSON.stringify({ toolName: 'memory.store' }),
+        })
+      ).status,
+    ).toBe(403);
+
+    // The candidate credential is worthless against the real control plane.
+    expect(
+      (await realFetch('/api/projects', { headers: { 'x-jarvis-control': qaCredential } })).status,
+    ).toBe(401);
+    expect(
+      (
+        await realFetch('/api/tool-grants', {
+          method: 'POST',
+          headers: {
+            'x-jarvis-control': qaCredential,
+            origin: realOrigin,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ toolName: 'memory.store' }),
+        })
+      ).status,
+    ).toBe(401);
+    // And the real credential is not copied into candidate state either.
+    expect(
+      (await candidateFetch('/api/projects', { headers: { 'x-jarvis-control': realCredential } }))
+        .status,
+    ).toBe(401);
+    const candidateRow = candidate.db
+      .prepare("SELECT credential_hash AS hash FROM human_control WHERE id='primary'")
+      .get() as { hash: string };
+    const realRow = real.db
+      .prepare("SELECT credential_hash AS hash FROM human_control WHERE id='primary'")
+      .get() as { hash: string };
+    expect(candidateRow.hash).not.toBe(realRow.hash);
+    expect(candidateRow.hash).not.toContain(realCredential);
+  });
+
+  it('leaves a real unpaired Jarvis locked to the pairing UI', async () => {
+    const jarvis = new Jarvis(loadConfig({ home: newHome('jarvis-unpaired-') }));
+    open.push(jarvis);
+    // Candidate material present but the runtime flag is not: nothing is seeded.
+    expect(
+      jarvis.control.initCandidateVisualQa({
+        JARVIS_CANDIDATE_QA_CREDENTIAL_HASH: 'a'.repeat(64),
+      }),
+    ).toBe(false);
+    const request = await servedRoutes(jarvis);
+    expect(await (await request('/api/auth/status')).json()).toEqual({
+      authenticated: false,
+      paired: false,
+    });
+    expect((await request('/api/projects')).status).toBe(401);
   });
 });

@@ -11,7 +11,12 @@ const log = createLogger('orchestrator');
 
 async function main(): Promise<void> {
   const jarvis = Jarvis.open();
-  if (process.env.JARVIS_CANDIDATE_RUNTIME !== '1' && !jarvis.control.paired()) {
+  if (process.env.JARVIS_CANDIDATE_RUNTIME === '1') {
+    // Isolated candidate home: adopt the ephemeral Visual-QA credential hash the
+    // parent minted for this runtime, so QA photographs the app and not the
+    // pairing screen. No-op without that material; never the real credential.
+    jarvis.control.initCandidateVisualQa();
+  } else if (!jarvis.control.paired()) {
     const bootstrap = jarvis.control.createBootstrap();
     process.stderr.write(
       `\nJarvis human pairing token (valid once for 10 minutes): ${bootstrap}\n` +

@@ -876,6 +876,7 @@ export class JobPipeline {
         jobId: opts.job.id,
         projectId: opts.project.id,
         baseUrl: server.baseUrl,
+        controlCredential: server.controlCredential(),
         routes: opts.config.scenarios.map((scenario) => scenario.route),
         scenarios: opts.config.scenarios,
         signal: opts.signal,

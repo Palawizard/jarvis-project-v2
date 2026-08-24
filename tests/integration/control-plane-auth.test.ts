@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import type { Server } from 'node:http';
 import { serve } from '@hono/node-server';
 import { afterEach, describe, expect, it } from 'vitest';
-import { Jarvis, loadConfig } from '../../packages/core/src/index.js';
+import { GitWorkspace, Jarvis, loadConfig, nowIso } from '../../packages/core/src/index.js';
 import { createRoutes } from '../../apps/orchestrator/src/routes.js';
 
 const homes: string[] = [];
@@ -25,6 +26,16 @@ describe('hostile loopback control-plane client', () => {
   it('rejects every private read and human-authority mutation, then permits a paired client', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-control-plane-'));
     homes.push(home);
+    const repo = path.join(home, 'repo');
+    fs.mkdirSync(repo);
+    const git = (args: string[]) =>
+      execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+    git(['init', '-q', '-b', 'main']);
+    git(['config', 'user.email', 'test@example.com']);
+    git(['config', 'user.name', 'Test']);
+    fs.writeFileSync(path.join(repo, 'README.md'), '# control plane fixture\n');
+    git(['add', '-A']);
+    git(['commit', '-qm', 'base']);
     const origin = 'http://127.0.0.1:5199';
     const jarvis = new Jarvis(loadConfig({ home, controlOrigins: [origin] }));
     open.push(jarvis);
@@ -34,7 +45,7 @@ describe('hostile loopback control-plane client', () => {
         (id,name,root_path,default_branch,stack,commands,is_self,config,created_at,updated_at)
        VALUES (?,?,?,?,?,?,?,?,?,?)`,
       )
-      .run('prj_known', 'known', home, 'main', '{}', '{}', 0, '{}', 'now', 'now');
+      .run('prj_known', 'known', repo, 'main', '{}', '{}', 0, '{}', 'now', 'now');
     const job = jarvis.jobs.create({ projectId: 'prj_known', request: 'known hostile target' });
     const pending = await jarvis.tools.execute(
       'memory.purge',
@@ -164,15 +175,49 @@ describe('hostile loopback control-plane client', () => {
         })
       ).status,
     ).toBe(200);
-    // Authentication succeeds before domain preconditions are evaluated.
-    expect(
-      (
-        await raw(`/api/jobs/${job.id}/approve`, {
-          method: 'POST',
-          headers: mutationHeaders,
-        })
-      ).status,
-    ).toBe(409);
+    jarvis.jobs.transition(job.id, 'planning');
+    const workspace = new GitWorkspace(jarvis.config.worktreesDir);
+    const worktree = await workspace.createWorktree({ repoRoot: repo, jobId: job.id });
+    fs.writeFileSync(path.join(worktree.path, 'candidate.txt'), 'reviewed\n');
+    const head = await workspace.commitPending(worktree.path, 'candidate');
+    if (!head) throw new Error('candidate fixture commit missing');
+    jarvis.jobs.patch(job.id, {
+      branch: worktree.branch,
+      worktreePath: worktree.path,
+      baseRef: worktree.baseRef,
+      headRef: head,
+      reviewedHead: head,
+    });
+    jarvis.jobs.transition(job.id, 'implementing');
+    jarvis.jobs.transition(job.id, 'verifying');
+    jarvis.db
+      .prepare(
+        `INSERT INTO verifications
+          (id,job_id,cycle,name,command,cwd,exit_code,status,output,duration_ms,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run('ver_known', job.id, 0, 'test', 'fixture', worktree.path, 0, 'passed', '', 1, nowIso());
+    jarvis.jobs.transition(job.id, 'reviewing');
+    jarvis.db
+      .prepare(
+        `INSERT INTO reviews
+          (id,job_id,provider,verdict,summary,findings,head_ref,blocking,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      )
+      .run('rev_known', job.id, 'fixture', 'approve', 'approved', '[]', head, 0, nowIso());
+    jarvis.jobs.transition(job.id, 'awaiting_user');
+    const approved = await raw(`/api/jobs/${job.id}/approve`, {
+      method: 'POST',
+      headers: mutationHeaders,
+    });
+    expect(approved.status).toBe(200);
+    expect((await approved.json()) as { status: string }).toMatchObject({ status: 'approved' });
+    const applied = await raw(`/api/jobs/${job.id}/apply`, {
+      method: 'POST',
+      headers: mutationHeaders,
+    });
+    expect(applied.status).toBe(200);
+    expect((await applied.json()) as { status: string }).toMatchObject({ status: 'applied' });
 
     expect(jarvis.tools.getExecution(pending.execution.id)?.status).toBe('pending_approval');
     expect(jarvis.tools.getGrant(existingGrant.id)?.revokedAt).toBeNull();

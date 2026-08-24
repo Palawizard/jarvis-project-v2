@@ -1070,7 +1070,7 @@ export class JobPipeline {
             type: 'agent.waiting',
             jobId: opts.jobId,
             runId: run.id,
-            payload: { note: event.note },
+            payload: { note: redactSecrets(event.note) },
           });
           break;
         default:
@@ -1103,10 +1103,16 @@ export class JobPipeline {
 
     agents.recordResult?.(opts.provider, result);
 
+    // Provider text crosses into prompts, recovery state, events and durable
+    // rows after this point. Keep the raw error only for local health
+    // classification above; everything leaving this boundary is redacted.
+    const safeResult = redactSecrets(result.result);
+    const safeError = result.error ? redactSecrets(result.error) : undefined;
+
     jobs.finishRun(run.id, {
       status: result.status === 'completed' ? 'completed' : result.status,
-      result: result.result,
-      error: result.error ?? null,
+      result: safeResult,
+      error: safeError ?? null,
       externalSessionId: result.sessionId ?? null,
       usage: result.usage ?? {},
     });
@@ -1120,15 +1126,15 @@ export class JobPipeline {
       runId: run.id,
       payload: {
         status: result.status,
-        error: result.error ? redactSecrets(result.error) : result.error,
+        error: safeError,
         sessionId: result.sessionId,
       },
     });
 
     return {
       status: result.status,
-      result: result.result,
-      error: result.error,
+      result: safeResult,
+      error: safeError,
       sessionId: result.sessionId,
       proposals: result.memoryProposals.map((p) =>
         proposalToInput(p, {
@@ -1143,6 +1149,7 @@ export class JobPipeline {
   }
 
   private pause(jobId: string, resumeStage: Job['stage'], reason: string): void {
+    reason = redactSecrets(reason);
     this.deps.jobs.transition(jobId, 'paused', {
       resumeStage,
       pauseReason: reason.slice(0, 20_000),

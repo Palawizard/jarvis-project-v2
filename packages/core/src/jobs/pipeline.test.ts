@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { AgentRegistry } from '../agents/registry.js';
 import type {
   AgentProvider,
+  AgentEvent,
   AgentRunResult,
   AgentStartOptions,
   ProviderCapabilities,
@@ -35,7 +36,10 @@ class FakeProvider implements AgentProvider {
 
   constructor(
     readonly id: ProviderId,
-    private readonly handler: (options: AgentStartOptions) => AgentRunResult,
+    private readonly handler: (
+      options: AgentStartOptions,
+      onEvent: (event: AgentEvent) => void,
+    ) => AgentRunResult,
     private readonly available = true,
   ) {}
 
@@ -52,9 +56,12 @@ class FakeProvider implements AgentProvider {
     };
   }
 
-  async run(options: AgentStartOptions): Promise<AgentRunResult> {
+  async run(
+    options: AgentStartOptions,
+    onEvent: (event: AgentEvent) => void,
+  ): Promise<AgentRunResult> {
     this.calls.push(options);
-    return this.handler(options);
+    return this.handler(options, onEvent);
   }
 }
 
@@ -464,6 +471,48 @@ async function pausedCandidate(
 }
 
 describe('job repair pipeline', () => {
+  it('redacts provider text before retries, recovery state, events, or later prompts', async () => {
+    const secret = 'Jarvis human pairing token: bootstrap-must-not-persist';
+    let calls = 0;
+    let reviewedSummary = '';
+    const provider = new FakeProvider('claude', (options, onEvent) => {
+      calls++;
+      onEvent({ kind: 'waiting', note: secret });
+      if (calls === 1) {
+        return { status: 'failed', result: '', error: secret, memoryProposals: [] };
+      }
+      fs.writeFileSync(path.join(options.cwd, 'change.txt'), 'safe\n');
+      return success(`completed ${secret}`);
+    });
+    const h = await harness({
+      provider,
+      review: (_call, opts) => {
+        reviewedSummary = opts.implementerSummary;
+        return {
+          runId: null,
+          provider: 'codex',
+          verdict: 'approve',
+          summary: 'approved',
+          findings: [],
+          headRef: opts.headRef,
+          blocking: false,
+        };
+      },
+    });
+
+    const job = await runToRest(h);
+    const persisted = JSON.stringify({
+      job,
+      runs: h.jobs.runs(job.id),
+      events: h.bus.list({ jobId: job.id, limit: 500 }),
+      reviewedSummary,
+    });
+    expect(job.stage).toBe('awaiting_user');
+    expect(persisted).not.toContain('bootstrap-must-not-persist');
+    expect(persisted).toContain('[redacted:jarvis_pairing_token]');
+    h.db.close();
+  });
+
   it('repairs a high code finding, verifies again, and obtains a fresh review', async () => {
     const h = await harness({
       selfDevelopment: true,

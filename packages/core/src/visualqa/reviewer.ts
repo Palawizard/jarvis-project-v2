@@ -8,6 +8,7 @@ import type { AgentEvent, ProviderId } from '../agents/types.js';
 import { validateVisualEvidence, type VisualQaShot, type VisualReviewFinding } from './engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 import type { AgentRunResult } from '../agents/types.js';
+import { redactSecrets } from '../memory/secrets.js';
 import { z } from 'zod';
 
 export interface VisualReview {
@@ -280,6 +281,7 @@ export class VisualReviewer {
     provider: ProviderId | null = null,
     model: string | null = null,
   ): VisualReview {
+    error = redactSecrets(error);
     this.bus?.emit({ type: 'visual_review.failed', jobId, payload: { error } });
     return { verdict: 'error', findings: [], provider, model, error };
   }

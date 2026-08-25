@@ -12,7 +12,7 @@ It rebuilds and restarts Jarvis, checks `/health`, and rolls back to the recorde
 
 ## Consequences
 
-- Jarvis cannot activate itself unless launched with `pnpm supervisor <config.json>`.
+- Jarvis cannot activate itself unless launched under the supervisor. `pnpm dev` bootstraps that supervisor — including the per-launch activation token, whose raw value only ever reaches the terminal — so normal self-updates need no terminal work; `pnpm supervisor <config.json>` stays as the low-level path.
 - The supervisor stays intentionally small and owns no product database or provider credentials.
 - Candidate runtime uses a separate `JARVIS_HOME` and dynamic ports.
 - Rollback behavior is tested against temporary repositories and processes, not the user's live checkout.

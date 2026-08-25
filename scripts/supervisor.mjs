@@ -63,6 +63,22 @@ const SECRET_PATTERNS = [
   /\bBearer\s+[A-Za-z0-9._~+/-]{24,}={0,2}/gi,
 ];
 
+/** Owned by the supervisor alone; a config may never pre-set or shadow them. */
+const SUPERVISOR_OWNED_ENV = new Set([
+  'JARVIS_SUPERVISED',
+  'JARVIS_UPGRADE_REQUEST_PATH',
+  'JARVIS_UPGRADE_SOCKET',
+  'JARVIS_UPGRADE_TOKEN_HASH',
+  'JARVIS_CANDIDATE_RUNTIME',
+  'JARVIS_RUNTIME_NONCE',
+]);
+/**
+ * Trust-boundary code that this process loaded at startup. An activation that
+ * changes it does not change the running supervisor — see the drift note in
+ * docs/self-development-and-visual-qa.md.
+ */
+const TRUST_BOUNDARY_FILES = ['supervisor.mjs', 'dev.mjs', 'windows-job-runner.ps1'];
+
 function untrustedEnv(extra = {}) {
   const env = {};
   for (const key of ENV_ALLOWLIST) if (process.env[key] !== undefined) env[key] = process.env[key];
@@ -173,6 +189,42 @@ function outsideRepository(repo, file, name) {
   return resolved;
 }
 
+/**
+ * Non-secret operational configuration the operator wants the supervised Jarvis
+ * to keep (provider selection, JARVIS_HOME, binary overrides…). Children still
+ * get an otherwise bare platform environment.
+ */
+function validateRuntimeEnv(raw) {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('runtimeEnv must be an object');
+  }
+  const env = {};
+  for (const [name, value] of Object.entries(raw)) {
+    if (typeof value !== 'string') throw new Error('runtimeEnv values must be strings');
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error(`invalid runtimeEnv name: ${name}`);
+    }
+    if (SECRET_ENV_NAME.test(name) || SUPERVISOR_OWNED_ENV.has(name)) {
+      throw new Error(`runtimeEnv must not carry ${name}`);
+    }
+    env[name] = value;
+  }
+  return env;
+}
+
+function trustBoundaryDigest(repo) {
+  const digest = createHash('sha256');
+  for (const name of TRUST_BOUNDARY_FILES) {
+    try {
+      digest.update(fs.readFileSync(path.join(repo, 'scripts', name)));
+    } catch {
+      digest.update(`missing:${name}`);
+    }
+  }
+  return digest.digest('hex');
+}
+
 function loadConfig(file) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
   const repo = fs.realpathSync(raw.repository);
@@ -188,6 +240,7 @@ function loadConfig(file) {
     startCommand: validateProcess('startCommand', raw.startCommand),
     buildCommand: validateProcess('buildCommand', raw.buildCommand),
     activationTokenHash: raw.activationTokenHash,
+    runtimeEnv: validateRuntimeEnv(raw.runtimeEnv),
     pollMs: Math.max(25, Number(raw.pollMs) || 250),
     healthTimeoutMs: Math.max(250, Number(raw.healthTimeoutMs) || 30_000),
     commandTimeoutMs: Math.max(1_000, Number(raw.commandTimeoutMs) || 10 * 60_000),
@@ -326,9 +379,9 @@ async function stopChild(child) {
   }
 }
 
-async function spawnProcess(spec, repo, supervised, stdio = 'inherit') {
+async function spawnProcess(spec, repo, supervised, stdio = 'inherit', runtimeEnv = {}) {
   const env = {
-    ...untrustedEnv(spec.env),
+    ...untrustedEnv({ ...runtimeEnv, ...spec.env }),
     ...(supervised
       ? {
           JARVIS_SUPERVISED: '1',
@@ -421,11 +474,13 @@ async function spawnProcess(spec, repo, supervised, stdio = 'inherit') {
 
 async function runBuild(config) {
   const started = Date.now();
-  const child = await spawnProcess(config.buildCommand, config.repository, null, [
-    'ignore',
-    'pipe',
-    'pipe',
-  ]);
+  const child = await spawnProcess(
+    config.buildCommand,
+    config.repository,
+    null,
+    ['ignore', 'pipe', 'pipe'],
+    config.runtimeEnv,
+  );
   let output = '';
   const append = (chunk) => {
     output = redactSecrets(`${output}${chunk}`).slice(-8_000);
@@ -486,7 +541,13 @@ function requireState(repo, head) {
 }
 
 async function startHealthy(config, sha) {
-  const child = await spawnProcess(config.startCommand, config.repository, config);
+  const child = await spawnProcess(
+    config.startCommand,
+    config.repository,
+    config,
+    'inherit',
+    config.runtimeEnv,
+  );
   try {
     return { child, health: await waitForHealth(config, child, sha) };
   } catch (error) {
@@ -655,10 +716,21 @@ async function activate(config, request, currentChild) {
     child = started.child;
     evidence.healthcheck = started.health;
     requireState(config.repository, request.candidateSha);
+    // This process still runs the supervisor/launcher code it loaded at startup.
+    // Say so instead of implying the activated one is already in force.
+    const supervisorRestartRequired =
+      trustBoundaryDigest(config.repository) !== config.trustBoundaryDigest;
+    if (supervisorRestartRequired) {
+      process.stdout.write(
+        'Jarvis supervisor: the activated candidate changes supervisor/launcher code. ' +
+          'The running supervisor is still the previous one; restart `pnpm dev` to adopt it.\n',
+      );
+    }
     return {
       child,
       evidence: {
         ...evidence,
+        supervisorRestartRequired,
         status: 'activated',
         headAfter: request.candidateSha,
         finishedAt: new Date().toISOString(),
@@ -745,6 +817,7 @@ async function main() {
   if (fs.existsSync(processing)) throw new Error(`ambiguous pending request: ${processing}`);
   const inbox = await createRequestInbox(config);
   config.upgradeSocket = inbox.endpoint;
+  config.trustBoundaryDigest = trustBoundaryDigest(config.repository);
 
   let stopping = false;
   let child = null;

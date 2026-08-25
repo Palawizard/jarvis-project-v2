@@ -175,7 +175,9 @@ export class Jarvis {
     const existing = this.projects.getSelf();
     const config: ProjectConfig = {
       candidateRuntime: {
-        command: { executable: process.execPath, args: ['scripts/dev.mjs'] },
+        // A candidate is never supervised: it must not bootstrap an upgrade
+        // supervisor, and it runs from source rather than the built dist.
+        command: { executable: process.execPath, args: ['scripts/dev.mjs', '--unsupervised'] },
         portEnvironment: 'JARVIS_WEB_PORT',
         apiPortEnvironment: 'JARVIS_PORT',
         healthPath: '/health',

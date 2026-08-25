@@ -11,6 +11,7 @@ const children: ChildProcess[] = [];
 const supervisor = path.resolve('scripts/supervisor.mjs');
 const ACTIVATION_TOKEN = 'human-held-supervisor-token-0123456789abcdef';
 const AMBIENT_TOKEN = 'ghp_abcdefghijklmnopqrstuvwxyz123456';
+const DISABLED_CODEX = path.join('C:', '__jarvis_codex_disabled__', 'codex.exe');
 
 function git(repo: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
@@ -38,12 +39,12 @@ function fixture(healthyCandidate: boolean) {
   fs.writeFileSync(path.join(repo, '.gitignore'), '.built\n.observed-env\n.daemon-pid\n');
   fs.writeFileSync(
     path.join(repo, 'build.mjs'),
-    `import {execFileSync,spawn} from 'node:child_process'; import fs from 'node:fs'; const observed=JSON.stringify({token:process.env.GITHUB_TOKEN,request:process.env.JARVIS_UPGRADE_REQUEST_PATH,socket:process.env.JARVIS_UPGRADE_SOCKET,hash:process.env.JARVIS_UPGRADE_TOKEN_HASH}); fs.writeFileSync('.observed-env',observed); console.error(process.env.GITHUB_TOKEN??'no-token'); if(process.env.DAEMONIZE_BUILD==='1'){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});fs.writeFileSync('.daemon-pid',String(c.pid));c.unref();} fs.writeFileSync('.built', execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n`,
+    `import {execFileSync,spawn} from 'node:child_process'; import fs from 'node:fs'; const observed=JSON.stringify({token:process.env.GITHUB_TOKEN,request:process.env.JARVIS_UPGRADE_REQUEST_PATH,socket:process.env.JARVIS_UPGRADE_SOCKET,hash:process.env.JARVIS_UPGRADE_TOKEN_HASH,codexBin:process.env.JARVIS_CODEX_BIN}); fs.writeFileSync('.observed-env',observed); console.error(process.env.GITHUB_TOKEN??'no-token'); if(process.env.DAEMONIZE_BUILD==='1'){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});fs.writeFileSync('.daemon-pid',String(c.pid));c.unref();} fs.writeFileSync('.built', execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n`,
   );
   fs.writeFileSync(
     path.join(repo, 'server.mjs'),
     `import http from 'node:http'; import fs from 'node:fs'; import {execFileSync} from 'node:child_process';
-http.createServer((req,res)=>{ if(req.url!=='/health'){res.statusCode=404; return res.end();} const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(); const built=fs.readFileSync('.built','utf8').trim(); const healthy=fs.readFileSync('healthy.txt','utf8').trim()==='yes' && built===commit; res.statusCode=healthy?200:503; res.setHeader('content-type','application/json'); res.end(JSON.stringify({status:healthy?'ok':'error',commit,version:fs.readFileSync('version.txt','utf8').trim(),supervised:process.env.JARVIS_SUPERVISED,requestPath:process.env.JARVIS_UPGRADE_REQUEST_PATH,upgradeSocket:process.env.JARVIS_UPGRADE_SOCKET})); }).listen(Number(process.env.PORT),'127.0.0.1');\n`,
+http.createServer((req,res)=>{ if(req.url!=='/health'){res.statusCode=404; return res.end();} const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(); const built=fs.readFileSync('.built','utf8').trim(); const healthy=fs.readFileSync('healthy.txt','utf8').trim()==='yes' && built===commit; res.statusCode=healthy?200:503; res.setHeader('content-type','application/json'); res.end(JSON.stringify({status:healthy?'ok':'error',commit,version:fs.readFileSync('version.txt','utf8').trim(),supervised:process.env.JARVIS_SUPERVISED,requestPath:process.env.JARVIS_UPGRADE_REQUEST_PATH,upgradeSocket:process.env.JARVIS_UPGRADE_SOCKET,implementer:process.env.JARVIS_IMPLEMENTER_PROVIDER,codexBin:process.env.JARVIS_CODEX_BIN})); }).listen(Number(process.env.PORT),'127.0.0.1');\n`,
   );
   fs.writeFileSync(path.join(repo, 'healthy.txt'), 'yes\n');
   fs.writeFileSync(path.join(repo, 'version.txt'), 'old\n');
@@ -148,6 +149,9 @@ async function runActivation(
       healthUrl,
       startCommand,
       buildCommand,
+      // What `pnpm dev` forwards: non-secret operator configuration that must
+      // survive every supervised start, including the post-activation restart.
+      runtimeEnv: { JARVIS_IMPLEMENTER_PROVIDER: 'claude', JARVIS_CODEX_BIN: DISABLED_CODEX },
       pollMs: 30,
       healthTimeoutMs: 1_200,
       commandTimeoutMs: 5_000,
@@ -275,6 +279,9 @@ describe('external self-upgrade supervisor', () => {
           version: 'new',
           supervised: '1',
           requestPath: path.join(result.stateDir, 'activate.json'),
+          // Operator runtime configuration survives the activation restart.
+          implementer: 'claude',
+          codexBin: DISABLED_CODEX,
         },
       },
     });
@@ -295,6 +302,8 @@ describe('external self-upgrade supervisor', () => {
     );
     expect(processed).not.toContain(ACTIVATION_TOKEN);
     const observed = fs.readFileSync(path.join(result.repo, '.observed-env'), 'utf8');
+    expect(JSON.parse(observed).codexBin).toBe(DISABLED_CODEX);
+    expect(observed).not.toContain(ACTIVATION_TOKEN);
     expect(observed).not.toContain(AMBIENT_TOKEN);
     expect(observed).not.toContain('activate.json');
     expect(observed).not.toContain('jarvis-upgrade-');
@@ -345,6 +354,35 @@ describe('external self-upgrade supervisor', () => {
     });
     expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.previousSha);
     expect(git(result.repo, 'status', '--porcelain')).toBe('');
+  });
+
+  it('rejects operator runtime configuration that carries a secret', async () => {
+    const setup = fixture(true);
+    const configFile = path.join(setup.stateDir, 'supervisor.json');
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        repository: setup.repo,
+        requestFile: path.join(setup.stateDir, 'activate.json'),
+        activationTokenHash: createHash('sha256').update(ACTIVATION_TOKEN).digest('hex'),
+        healthUrl: 'http://127.0.0.1:4319/health',
+        startCommand: { executable: process.execPath, args: ['server.mjs'] },
+        buildCommand: { executable: process.execPath, args: ['build.mjs'] },
+        runtimeEnv: { GITHUB_TOKEN: AMBIENT_TOKEN },
+      }),
+    );
+    const child = spawn(process.execPath, [supervisor, configFile], {
+      cwd: setup.repo,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    children.push(child);
+    let logs = '';
+    child.stderr?.on('data', (chunk) => (logs += chunk));
+    expect(await waitForExit(child)).toBe(1);
+    children.splice(children.indexOf(child), 1);
+    expect(logs).toContain('runtimeEnv must not carry GITHUB_TOKEN');
+    expect(logs).not.toContain(AMBIENT_TOKEN);
   });
 
   it('rejects a self-asserted approval without the out-of-band human token', async () => {

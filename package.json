@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "dev:unsupervised": "node scripts/dev.mjs --unsupervised",
     "dev:orchestrator": "pnpm --filter @jarvis/orchestrator dev",
     "dev:web": "pnpm --filter @jarvis/web dev",
     "supervisor": "node scripts/supervisor.mjs",

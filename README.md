@@ -21,6 +21,8 @@ pnpm dev
 
 Open <http://localhost:5199>. Runtime data defaults to `~/.jarvis`; set `JARVIS_HOME` to keep a separate instance. The API binds only to `127.0.0.1:4319`.
 
+`pnpm dev` is the supervised developer experience: it builds core and the orchestrator, generates a per-launch supervisor session outside the repository, starts `scripts/supervisor.mjs` (which owns the orchestrator) and Vite, and prints — exactly once — the self-upgrade activation token for that session. Keep it: activating a self-upgrade later asks for it in the browser. It is never written to disk, an environment variable, the database, or an API. Ctrl+C stops the whole tree. `pnpm dev:unsupervised` keeps the old two-process loop, which cannot activate anything.
+
 On every orchestrator start, the controlling terminal prints a one-use pairing secret valid for ten minutes. Enter it in the locked UI. The resulting high-entropy control credential stays in that exact browser origin's `localStorage`; private API and authenticated fetch-stream event requests attach it in `X-Jarvis-Control`. Jarvis stores only its SHA-256 hash. It deliberately does not use an authentication cookie: HTTP cookies are not port-scoped, while candidate runtimes share the host on other ports.
 
 If one subscription is temporarily quota-limited, set `JARVIS_IMPLEMENTER_PROVIDER` and `JARVIS_REVIEWER_PROVIDER` to `claude` or `codex` before launch. The default remains Claude-first, and unavailable CLIs still fail closed.
@@ -61,7 +63,7 @@ The suite performs one tiny real edit per available CLI, strips API-key variable
 7. Jarvis stores one compact project episode and validated memory proposals.
 8. The user approves the exact reviewed candidate, then separately applies it. Application is clean-target, exact-ancestry, FF-only, idempotent, persisted, and never pushes.
 
-For Jarvis itself, normal application is disabled. Run Jarvis through `pnpm supervisor <config.json>`; an approved candidate must pass isolated preflight, then a second explicit activation request lets the external supervisor apply, rebuild, restart, healthcheck, and roll back on failure.
+For Jarvis itself, normal application is disabled. `pnpm dev` already runs Jarvis under the external supervisor; an approved candidate must pass isolated preflight, then a second explicit activation request — confirmed in the browser and authorised with the startup activation token — lets the supervisor apply, rebuild, restart, healthcheck, and roll back on failure. `pnpm supervisor <config.json>` remains the low-level entry point for tests and debugging.
 
 Recoverable provider exhaustion, repair-budget exhaustion, and orchestrator restart pause the same Job with its worktree and checkpoint preserved. Resume validates repository/base/exact expected HEAD/cleanliness before rerunning the exact persisted repair kind and evidence. An uncheckpointed planning worktree is reusable only at the pinned base SHA. Raw messages/events are audit history, not default model context.
 

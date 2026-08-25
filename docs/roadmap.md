@@ -23,7 +23,8 @@
 ## Partial
 
 - Procedures share the durable record lifecycle but learned structured procedure capture is not implemented.
-- Supervisor activation requires Jarvis to have been launched through `pnpm supervisor <config.json>`; existing unsupervised processes can prepare but not activate.
+- Supervisor activation requires Jarvis to have been launched under the external supervisor, which `pnpm dev` now does by default; `pnpm dev:unsupervised`, candidate runtimes, and any other unsupervised process can prepare but not activate.
+- The running supervisor is never hot-replaced: activating a candidate that changes `scripts/supervisor.mjs`, `scripts/dev.mjs`, or the Windows job runner flags `supervisorRestartRequired` in the signed evidence and takes effect only at the next `pnpm dev`.
 - Runtime port reservation has an unavoidable narrow handoff race for arbitrary frameworks; Jarvis self-candidates close it with a per-launch nonce and commit check, while generic projects rely on their configured health contract.
 - Provider cooldowns are runtime-local; restarting Jarvis clears them. Within a run, recoverable provider failures are recorded and rerouted with a bounded stage budget.
 - Route/interaction configuration is deterministic and deliberately small, not a browser agent.

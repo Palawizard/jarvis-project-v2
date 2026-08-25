@@ -285,8 +285,16 @@ describe('pnpm dev supervised runtime', () => {
     });
     const api: { home: string; providers: Capability[] } = await apiResponse.json();
     expect(api.home).toBe(instance.home);
-    expect(api.providers.find((provider) => provider.id === 'claude')?.available).toBe(true);
-    expect(api.providers.find((provider) => provider.id === 'codex')?.available).toBe(false);
+    // The Claude override was resolved and executed by the supervised process:
+    // `--version` on the binary it names. Availability itself is a real login,
+    // which a deterministic test must not require.
+    const claude = api.providers.find((provider) => provider.id === 'claude');
+    expect(claude?.version).toBe(process.version);
+    // The invalid Codex override stays authoritative: unavailable, not found,
+    // and never rediscovered from PATH.
+    const codex = api.providers.find((provider) => provider.id === 'codex');
+    expect(codex?.available).toBe(false);
+    expect(codex?.reason).toContain('Codex CLI not found');
 
     // Ctrl+C tears the whole tree down and releases both ports, silently.
     instance.child.stdin?.end();
@@ -346,6 +354,8 @@ describe('pnpm dev supervised runtime', () => {
 interface Capability {
   id: string;
   available: boolean;
+  version?: string;
+  reason?: string;
 }
 
 interface SupervisorConfig {

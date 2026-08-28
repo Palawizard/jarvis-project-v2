@@ -146,12 +146,14 @@ interface Harness {
 async function harness(options: {
   review: (call: number, opts: ReviewOptions) => Omit<Review, 'id' | 'jobId' | 'createdAt'>;
   provider?: FakeProvider;
+  providers?: FakeProvider[];
   maxReviewFixCycles?: number;
   visual?: 'repair' | 'infrastructure' | 'advisory' | 'insufficient_evidence' | 'unrelated';
   selfDevelopment?: boolean;
   verification?: VerificationReport[];
   realVerification?: boolean;
   verificationInfraRetries?: number;
+  agentStageRetries?: number;
   commands?: ProjectCommands;
   packageManifestForInstall?: boolean;
 }): Promise<Harness> {
@@ -179,7 +181,7 @@ async function harness(options: {
       ...baseConfig.pipeline,
       maxReviewFixCycles: options.maxReviewFixCycles ?? 2,
       maxVisualFixCycles: 2,
-      agentStageRetries: 1,
+      agentStageRetries: options.agentStageRetries ?? 1,
       verificationInfraRetries:
         options.verificationInfraRetries ?? baseConfig.pipeline.verificationInfraRetries,
     },
@@ -214,7 +216,7 @@ async function harness(options: {
         fs.appendFileSync(path.join(call.cwd, 'change.txt'), 'visual fixed\n');
       return success(`${call.role} completed`, `session-${call.role}`);
     });
-  const agents = new AgentRegistry(config, { providers: [provider], db, bus });
+  const agents = new AgentRegistry(config, { providers: options.providers ?? [provider], db, bus });
   const verificationCalls: number[] = [];
   const realVerification = new VerificationEngine(db, config.artifactsDir, bus);
   const verification = {
@@ -653,7 +655,21 @@ describe('job repair pipeline', () => {
     expect(h.provider.calls).toHaveLength(0);
     expect(h.verificationCalls).toHaveLength(1);
     expect(h.reviewHeads).toHaveLength(1);
-    expect(h.visualHeads).toHaveLength(1);
+    // The pinned source changes no rendered self UI, so no parent-authored
+    // self scenario is borrowed and no evidence is captured.
+    expect(h.visualHeads).toHaveLength(0);
+    // The decision is persisted as an explicit plan so the approval gate does
+    // not inherit the self project's standing required:true and block forever.
+    expect(job.visualQaPlan).toMatchObject({ required: false, scenarios: [] });
+    expect(
+      h.bus
+        .list({ jobId: job.id, limit: 200 })
+        .some(
+          (event) =>
+            event.type === 'visual_qa.plan.resolved' &&
+            event.payload.skipped === 'no changed rendered self UI',
+        ),
+    ).toBe(true);
     if (!job.worktreePath) throw new Error('import worktree missing');
     expect(
       execFileSync('git', ['rev-parse', `${job.headRef}^{tree}`], {
@@ -877,6 +893,38 @@ describe('job repair pipeline', () => {
     const job = await runToRest(h);
     expect(job.visualQaPlan?.source).toBe('project_default');
     expect(job.visualQaPlan?.scenarios.map((scenario) => scenario.name)).toEqual(['tools']);
+    h.db.close();
+  });
+
+  it('pauses as infrastructure, without a source fixer, when candidate planning fails', async () => {
+    const provider = new FakeProvider('claude', (call) => {
+      if (call.role === 'implementer') {
+        const views = path.join(call.cwd, 'apps', 'web', 'src', 'views');
+        fs.mkdirSync(views, { recursive: true });
+        fs.writeFileSync(path.join(views, 'Chat.tsx'), 'export const Chat = () => null;\n');
+      }
+      return success(`${call.role} completed`, `session-${call.role}`);
+    });
+    const h = await harness({
+      visual: 'advisory',
+      selfDevelopment: true,
+      provider,
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve',
+        summary: 'code approved',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('paused');
+    expect(job.resumeStage).toBe('visual_qa');
+    expect(job.pauseReason).toContain('Visual-QA planning infrastructure');
+    expect(job.visualQaPlan).toBeNull();
+    expect(h.provider.calls.filter((call) => call.role === 'visual_fixer')).toHaveLength(0);
     h.db.close();
   });
 
@@ -1370,6 +1418,150 @@ describe('job repair pipeline', () => {
 
     expect(h.jobs.get(job.id)?.stage).toBe('awaiting_user');
     expect(h.jobs.list({ projectId: h.project.id })).toHaveLength(1);
+    h.db.close();
+  });
+});
+
+describe('provider-scoped session recovery', () => {
+  const review = (_call: number, opts: ReviewOptions) => ({
+    runId: null,
+    provider: 'codex' as const,
+    verdict: 'approve' as const,
+    summary: 'approved',
+    findings: [],
+    headRef: opts.headRef,
+    blocking: false,
+  });
+  const failure = (error: string): AgentRunResult => ({
+    status: 'failed',
+    result: '',
+    error,
+    memoryProposals: [],
+  });
+
+  async function runStage(h: Harness, provider: ProviderId, resumeSessionId: string) {
+    const created = h.jobs.create({ projectId: h.project.id, request: 'resume provider session' });
+    const pipeline = h.pipeline as unknown as {
+      runAgentStage(opts: {
+        jobId: string;
+        role: 'implementer';
+        cwd: string;
+        prompt: string;
+        contextPackId: string;
+        signal: AbortSignal;
+        preferredProvider: ProviderId;
+        resumeSessionId: string;
+      }): Promise<{ status: string; provider?: ProviderId }>;
+    };
+    const result = await pipeline.runAgentStage({
+      jobId: created.id,
+      role: 'implementer',
+      cwd: h.repo,
+      prompt: 'continue the same work',
+      contextPackId: 'pack',
+      signal: new AbortController().signal,
+      preferredProvider: provider,
+      resumeSessionId,
+    });
+    return { created, result };
+  }
+
+  it('retires a broken Codex resume and retries exactly once with fresh Codex context', async () => {
+    const codex = new FakeProvider('codex', (options) =>
+      options.resumeSessionId
+        ? failure('Codex exited without a terminal structured event')
+        : success('fresh context completed', 'codex-fresh'),
+    );
+    const h = await harness({ review, providers: [codex] });
+    const { created, result } = await runStage(h, 'codex', 'codex-broken');
+
+    expect(result.status).toBe('completed');
+    expect(codex.calls).toHaveLength(2);
+    expect(codex.calls.map((call) => call.resumeSessionId)).toEqual(['codex-broken', undefined]);
+    expect(codex.calls.every((call) => call.prompt === 'continue the same work')).toBe(true);
+    expect(codex.calls.every((call) => call.cwd === h.repo && call.role === 'implementer')).toBe(
+      true,
+    );
+    expect(h.jobs.get(created.id)?.resumeSessionId).toBe('codex-fresh');
+    expect(
+      h.bus
+        .list({ jobId: created.id, limit: 100 })
+        .filter(
+          (event) =>
+            event.type === 'agent.stage.retry' && event.payload.recovery === 'fresh_context',
+        ),
+    ).toHaveLength(1);
+    h.db.close();
+  });
+
+  it.each([
+    ['claude', 'codex'],
+    ['codex', 'claude'],
+  ] as const)('never sends a %s session id to fallback %s', async (preferredId, fallbackId) => {
+    const preferred = new FakeProvider(preferredId, () =>
+      failure(`${preferredId} exited without a terminal structured event`),
+    );
+    const fallback = new FakeProvider(fallbackId, () => success('fallback completed'));
+    const h = await harness({ review, providers: [preferred, fallback], agentStageRetries: 2 });
+    const { result } = await runStage(h, preferredId, `${preferredId}-session`);
+    const preferredResumeIds = preferred.calls.map((call) => call.resumeSessionId);
+    const fallbackResumeId = fallback.calls[0]?.resumeSessionId;
+    const fallbackCalls = fallback.calls.length;
+    const preferredCalls = preferred.calls.length;
+    h.db.close();
+
+    expect(result.status).toBe('completed');
+    expect(preferredResumeIds).toEqual([`${preferredId}-session`, undefined]);
+    expect(fallbackCalls).toBe(1);
+    expect(fallbackResumeId).toBeUndefined();
+    expect(preferredCalls).toBe(2);
+  });
+
+  it('never sends a session id to a provider chosen on the first attempt', async () => {
+    // The preferred provider is unavailable, so routing falls back immediately
+    // and the session id is still live. Only the (provider === preferred) pairing
+    // guard suppresses it here: the later reset has not run yet.
+    const preferred = new FakeProvider('claude', () => success('unused'), false);
+    const fallback = new FakeProvider('codex', () => success('fallback completed'));
+    const h = await harness({ review, providers: [preferred, fallback] });
+    const { result } = await runStage(h, 'claude', 'claude-session');
+    const fallbackResumeIds = fallback.calls.map((call) => call.resumeSessionId);
+    const preferredCalls = preferred.calls.length;
+    h.db.close();
+
+    expect(result.status).toBe('completed');
+    expect(preferredCalls).toBe(0);
+    expect(fallbackResumeIds).toEqual([undefined]);
+  });
+
+  it('counts a failed fresh-context recovery inside the configured attempt budget', async () => {
+    const codex = new FakeProvider('codex', () =>
+      failure('Codex exited without a terminal structured event'),
+    );
+    const claude = new FakeProvider('claude', () => failure('Claude protocol failure'));
+    const h = await harness({
+      review,
+      providers: [codex, claude],
+      agentStageRetries: 2,
+    });
+    const { result } = await runStage(h, 'codex', 'codex-broken');
+
+    expect(result.status).toBe('failed');
+    expect(codex.calls.map((call) => call.resumeSessionId)).toEqual(['codex-broken', undefined]);
+    expect(claude.calls.map((call) => call.resumeSessionId)).toEqual([undefined]);
+    expect(codex.calls.length + claude.calls.length).toBe(3);
+    h.db.close();
+  });
+
+  it('does not exceed a zero-retry budget for a broken resumed session', async () => {
+    const codex = new FakeProvider('codex', () =>
+      failure('Codex exited without a terminal structured event'),
+    );
+    const h = await harness({ review, providers: [codex], agentStageRetries: 0 });
+    const { result } = await runStage(h, 'codex', 'codex-broken');
+
+    expect(result.status).toBe('failed');
+    expect(codex.calls.map((call) => call.resumeSessionId)).toEqual(['codex-broken']);
     h.db.close();
   });
 });

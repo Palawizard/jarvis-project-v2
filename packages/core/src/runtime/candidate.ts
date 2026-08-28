@@ -47,6 +47,8 @@ export async function startCandidateRuntime(opts: {
   config: JarvisConfig;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Exact reviewed commit this self-project runtime must remain bound to. */
+  expectedCommit?: string;
   /** Visual-QA fixture profiles the candidate may seed in its isolated home. */
   fixtures?: readonly string[];
 }): Promise<CandidateRuntime> {
@@ -55,6 +57,19 @@ export async function startCandidateRuntime(opts: {
     throw new CandidateRuntimeUnsupportedError('candidate runtime isolation unsupported');
   }
   validateRuntimeConfig(runtime.command.executable, runtime.command.args);
+  // A fixture profile is an identifier the candidate resolves for itself, and it
+  // may name a profile this version has never heard of. Bounding it here is what
+  // keeps it from becoming a path, a command, or a second environment variable.
+  for (const fixture of opts.fixtures ?? []) {
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(fixture)) {
+      throw new Error(`invalid visual QA fixture identifier: ${fixture.slice(0, 40)}`);
+    }
+  }
+  const expectedCommit = opts.project.isSelf ? opts.expectedCommit : undefined;
+  if (opts.project.isSelf && !expectedCommit) {
+    throw new Error('candidate runtime expected commit is required');
+  }
+  if (expectedCommit) await assertExpectedCommit(opts.cwd, expectedCommit);
 
   const webReservation = await reservePort();
   const apiReservation = runtime.apiPortEnvironment ? await reservePort() : undefined;
@@ -130,6 +145,7 @@ export async function startCandidateRuntime(opts: {
           `candidate runtime ports remain reachable after stop: ${ownedPorts.join(', ')}`,
         );
       }
+      if (expectedCommit) await assertExpectedCommit(opts.cwd, expectedCommit);
     })());
   const terminated = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
     (resolve) => child.once('exit', (code, signal) => resolve({ code, signal })),
@@ -145,10 +161,6 @@ export async function startCandidateRuntime(opts: {
       child.once('spawn', resolve);
       child.once('error', reject);
     });
-    const expectedCommit = opts.project.isSelf ? (await repoStatus(opts.cwd)).head : null;
-    if (opts.project.isSelf && !expectedCommit) {
-      throw new Error('candidate runtime commit identity is unavailable');
-    }
     const waiting = {
       logs,
       deadline,
@@ -164,7 +176,7 @@ export async function startCandidateRuntime(opts: {
       probe: () =>
         probeHealth(
           healthUrl,
-          opts.project.isSelf ? { runtimeNonce, commit: expectedCommit as string } : undefined,
+          expectedCommit ? { runtimeNonce, commit: expectedCommit } : undefined,
         ),
       failure: `candidate runtime did not pass healthcheck at ${healthUrl}`,
     });
@@ -196,6 +208,13 @@ export async function startCandidateRuntime(opts: {
   } catch (error) {
     await stop();
     throw error;
+  }
+}
+
+async function assertExpectedCommit(cwd: string, expectedCommit: string): Promise<void> {
+  const status = await repoStatus(cwd);
+  if (!status.isRepo || status.head !== expectedCommit || status.dirty) {
+    throw new Error('candidate runtime source changed from the expected clean commit');
   }
 }
 

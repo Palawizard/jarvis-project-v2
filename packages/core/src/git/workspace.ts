@@ -1,11 +1,105 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
+import { untrustedProcessEnv } from '../agents/spawn.js';
 import { createLogger } from '../logger.js';
 
 const exec = promisify(execFile);
 const log = createLogger('git');
+const disabledHooksPath = path.join(process.cwd(), `.jarvis-no-git-hooks-${randomUUID()}`);
+const NULL_DEVICE = process.platform === 'win32' ? 'NUL' : '/dev/null';
+// Git refuses NUL/dev/null as an exclude file, so point it at a path that
+// simply does not exist: a missing excludes file contributes no patterns.
+const disabledExcludesPath = path.join(process.cwd(), `.jarvis-no-git-excludes-${randomUUID()}`);
+export const trustedGitArgs = (cwd: string, args: string[]) => [
+  '--no-replace-objects',
+  `--work-tree=${fs.realpathSync.native(path.resolve(cwd))}`,
+  '-c',
+  'core.bare=false',
+  '-c',
+  'core.fsmonitor=false',
+  '-c',
+  'status.showUntrackedFiles=all',
+  '-c',
+  `core.hooksPath=${disabledHooksPath}`,
+  '-c',
+  `core.attributesFile=${NULL_DEVICE}`,
+  // Untracked work hidden from status is unreviewed work. `core.excludesFile`
+  // is candidate-writable and never appears in a reviewed diff, so it is
+  // pinned away here; `<git-common-dir>/info/exclude` has no such switch and is
+  // handled by hiddenExcludedFiles below.
+  '-c',
+  `core.excludesFile=${disabledExcludesPath}`,
+  ...args,
+];
+
+/**
+ * Git runs candidate-reachable code of its own: a `filter` attribute bound to a
+ * tracked path makes `status`, `add` and `checkout` execute the configured
+ * driver. Hooks and fsmonitor are disabled above, and a candidate that plants a
+ * filter anyway already holds a shell in its worktree -- but it must not also
+ * inherit this process's environment, which carries provider credentials and
+ * control tokens the agent env allowlist exists to withhold.
+ */
+export const trustedGitEnv = (): NodeJS.ProcessEnv => ({
+  ...untrustedProcessEnv(),
+  GIT_TERMINAL_PROMPT: '0',
+  // The one attribute source `core.attributesFile` cannot disable. Writing it
+  // needs administrator rights, so this is not a candidate-reachable path --
+  // but the guarantee should be true rather than nearly true.
+  GIT_ATTR_NOSYSTEM: '1',
+});
+
+/**
+ * The one synchronous shape for spawning Git. Two consecutive reviews found the
+ * same hazard re-introduced by a caller that built its own invocation, so the
+ * trusted arguments and the sanitized environment are applied here rather than
+ * left for each call site to remember. Returns raw bytes: callers that want
+ * text decode it themselves, and callers reading blobs must not.
+ */
+export function trustedGitSync(
+  cwd: string,
+  args: string[],
+  maxBuffer = 32 * 1024 * 1024,
+  input?: string | Buffer,
+): Buffer {
+  return execFileSync('git', trustedGitArgs(cwd, args), {
+    cwd,
+    env: trustedGitEnv(),
+    ...(input === undefined ? {} : { input }),
+    maxBuffer,
+    stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+}
+
+/** The asynchronous counterpart, so no caller has to assemble the shape itself. */
+export async function trustedGitAsync(
+  cwd: string,
+  args: string[],
+  maxBuffer = 32 * 1024 * 1024,
+): Promise<string> {
+  const { stdout } = await exec('git', trustedGitArgs(cwd, args), {
+    cwd,
+    env: trustedGitEnv(),
+    maxBuffer,
+  });
+  return stdout.trim();
+}
+
+/**
+ * Git's empty tree. Passing it as the attribute source means no worktree
+ * `.gitattributes` can bind a `filter` driver for that one invocation. Only
+ * safe for reads: it would also disable legitimate eol normalisation, so it
+ * must never be used for `add` or `checkout`.
+ *
+ * Requires Git >= 2.40 and a SHA-1 repository. Neither holds on an exotic host,
+ * and there every guarded read fails rather than silently losing the guard:
+ * planning pauses as infrastructure and activation reports inspection required.
+ */
+export const NO_TREE_ATTRIBUTES = '--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 export class GitError extends Error {
   constructor(
@@ -20,7 +114,11 @@ export class GitError extends Error {
 
 async function git(cwd: string, args: string[]): Promise<string> {
   try {
-    const { stdout } = await exec('git', args, { cwd, maxBuffer: 32 * 1024 * 1024 });
+    const { stdout } = await exec('git', trustedGitArgs(cwd, args), {
+      cwd,
+      env: trustedGitEnv(),
+      maxBuffer: 32 * 1024 * 1024,
+    });
     return stdout.trim();
   } catch (error) {
     const err = error as { stderr?: string; message?: string };
@@ -34,7 +132,11 @@ async function git(cwd: string, args: string[]): Promise<string> {
 
 async function gitRaw(cwd: string, args: string[]): Promise<string> {
   try {
-    const { stdout } = await exec('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await exec('git', trustedGitArgs(cwd, args), {
+      cwd,
+      env: trustedGitEnv(),
+      maxBuffer: 64 * 1024 * 1024,
+    });
     return stdout;
   } catch (error) {
     const err = error as { stderr?: string; message?: string };
@@ -44,7 +146,12 @@ async function gitRaw(cwd: string, args: string[]): Promise<string> {
 
 function gitWithInput(cwd: string, args: string[], input: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', args, { cwd, stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true });
+    const child = spawn('git', trustedGitArgs(cwd, args), {
+      cwd,
+      env: trustedGitEnv(),
+      stdio: ['pipe', 'ignore', 'pipe'],
+      windowsHide: true,
+    });
     const errors: Buffer[] = [];
     child.stderr.on('data', (chunk: Buffer) => errors.push(chunk));
     child.once('error', reject);
@@ -73,13 +180,41 @@ export interface RepoStatus {
   dirtyFiles: string[];
 }
 
+/**
+ * Resolves the registered checkout that owns `dir` by walking up to the nearest
+ * `.git` entry, which is a directory in a primary checkout and a file in a
+ * linked worktree.
+ *
+ * Git cannot answer this question for us. `core.worktree` is candidate-writable
+ * and moves Git's idea of the work tree, and the trusted invocation pins
+ * `--work-tree` precisely so it cannot, which leaves `rev-parse --show-toplevel`
+ * echoing back whatever it was handed. Reading the filesystem keeps the
+ * identity checks that compare this root against the caller's expected path
+ * meaningful, and keeps a project registered at a subdirectory resolving to the
+ * repository that actually contains it.
+ */
+export function registeredRoot(dir: string): string | null {
+  let current = path.resolve(dir);
+  for (;;) {
+    if (fs.existsSync(path.join(current, '.git'))) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
 export async function repoStatus(dir: string): Promise<RepoStatus> {
   if (!fs.existsSync(dir)) {
     return { isRepo: false, root: null, branch: null, head: null, dirty: false, dirtyFiles: [] };
   }
-  let root: string;
+  const root = registeredRoot(dir);
+  if (!root) {
+    return { isRepo: false, root: null, branch: null, head: null, dirty: false, dirtyFiles: [] };
+  }
   try {
-    root = await git(dir, ['rev-parse', '--show-toplevel']);
+    // A `.git` entry is not proof of a usable repository; make Git confirm it
+    // before any caller treats the rest of this record as authoritative.
+    await git(root, ['rev-parse', '--git-dir']);
   } catch {
     return { isRepo: false, root: null, branch: null, head: null, dirty: false, dirtyFiles: [] };
   }
@@ -87,11 +222,20 @@ export async function repoStatus(dir: string): Promise<RepoStatus> {
   const head = await git(root, ['rev-parse', 'HEAD']).catch(() => null);
   // A failed status command is never evidence of a clean tree. Mutation callers
   // must fail closed rather than risk overwriting work Git could not inspect.
-  const porcelain = await git(root, ['status', '--porcelain']);
+  const porcelain = await git(root, [
+    NO_TREE_ATTRIBUTES,
+    'status',
+    '--porcelain',
+    '--untracked-files=all',
+  ]);
   const dirtyFiles = porcelain
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean);
+  for (const hidden of await hiddenExcludedFiles(root)) {
+    // Reported like an untracked entry so every existing dirty check sees it.
+    if (!dirtyFiles.includes(`?? ${hidden}`)) dirtyFiles.push(`?? ${hidden}`);
+  }
   return {
     isRepo: true,
     root: path.resolve(root),
@@ -100,6 +244,46 @@ export async function repoStatus(dir: string): Promise<RepoStatus> {
     dirty: dirtyFiles.length > 0,
     dirtyFiles,
   };
+}
+
+/**
+ * Untracked files hidden behind `<git-common-dir>/info/exclude`.
+ *
+ * `.gitignore` is tracked, so hiding work behind it changes a reviewed diff.
+ * `info/exclude` is neither tracked nor per-worktree: a candidate can write it
+ * from its own job worktree and silently drop planted files out of
+ * `status --untracked-files=all`, which every clean-tree check depends on.
+ * Git offers no switch to disable it, so the patterns are applied deliberately
+ * to find what they are concealing and the results are reported as dirty.
+ *
+ * Git's own default file contains only comments, so an untouched repository
+ * costs one `existsSync` and one small read.
+ */
+async function hiddenExcludedFiles(root: string): Promise<string[]> {
+  let exclude: string;
+  try {
+    const common = await git(root, ['rev-parse', '--git-common-dir']);
+    exclude = path.resolve(root, common, 'info', 'exclude');
+    const patterns = fs
+      .readFileSync(exclude, 'utf8')
+      .split(/\r?\n/)
+      .some((line) => line.trim() !== '' && !line.trim().startsWith('#'));
+    if (!patterns) return [];
+  } catch {
+    // No exclude file, or an unreadable one: nothing is being hidden by it.
+    return [];
+  }
+  const hidden = await git(root, [
+    NO_TREE_ATTRIBUTES,
+    'ls-files',
+    '--others',
+    '--ignored',
+    `--exclude-from=${exclude}`,
+  ]);
+  return hidden
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
 }
 
 export interface Worktree {
@@ -245,6 +429,8 @@ export class GitWorkspace {
     await requireAncestor(worktreePath, baseSha, sourceSha, 'candidate_source_base_mismatch');
     const patch = await gitRaw(worktreePath, [
       'diff',
+      '--no-ext-diff',
+      '--no-textconv',
       '--binary',
       '--full-index',
       '--find-renames',
@@ -334,6 +520,7 @@ export class GitWorkspace {
     head: string;
     commits: { sha: string; subject: string }[];
     files: { path: string; added: number; removed: number }[];
+    deleted: string[];
     diff: string;
     diffTruncated: boolean;
     uncommitted: string[];
@@ -346,27 +533,62 @@ export class GitWorkspace {
       .map((line) => ({ sha: line.slice(0, 40), subject: line.slice(41) }));
 
     // Include uncommitted worker changes: agents do not always commit.
-    const uncommitted = (await git(worktreePath, ['status', '--porcelain']))
+    const uncommitted = (await git(worktreePath, [NO_TREE_ATTRIBUTES, 'status', '--porcelain']))
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean);
 
-    const numstat = await git(worktreePath, ['diff', '--numstat', baseRef]);
+    // Keep paths literal and unambiguous. In particular, Git's default rename
+    // display can synthesize "{old => new}" paths that do not exist and must
+    // never become Visual-QA catalog inputs.
+    const numstat = await gitRaw(worktreePath, [
+      'diff',
+      '--no-ext-diff',
+      '--no-textconv',
+      '--numstat',
+      '--no-renames',
+      '-z',
+      baseRef,
+    ]);
+    // Deletions must be distinguishable: a removed view is a changed rendered
+    // path that no candidate catalog can legitimately still map.
+    const nameStatus = await gitRaw(worktreePath, [
+      'diff',
+      '--no-ext-diff',
+      '--no-textconv',
+      '--name-status',
+      '--no-renames',
+      '-z',
+      baseRef,
+    ]);
+    const records = nameStatus.split('\0').filter(Boolean);
+    const deleted: string[] = [];
+    for (let index = 0; index + 1 < records.length; index += 2) {
+      if (records[index]?.startsWith('D')) deleted.push(records[index + 1] as string);
+    }
+
     const files = numstat
-      .split('\n')
+      .split('\0')
       .filter(Boolean)
-      .map((line) => {
-        const [added = '0', removed = '0', file = ''] = line.split('\t');
-        return { path: file, added: Number(added) || 0, removed: Number(removed) || 0 };
+      .map((record) => {
+        const firstTab = record.indexOf('\t');
+        const secondTab = record.indexOf('\t', firstTab + 1);
+        const added = record.slice(0, firstTab);
+        const removed = record.slice(firstTab + 1, secondTab);
+        return {
+          path: record.slice(secondTab + 1),
+          added: Number(added) || 0,
+          removed: Number(removed) || 0,
+        };
       });
 
     const MAX_DIFF = 220_000; // ~60k tokens; reviewer prompt caps it further
-    let diff = await git(worktreePath, ['diff', baseRef]);
+    let diff = await git(worktreePath, ['diff', '--no-ext-diff', '--no-textconv', baseRef]);
     const diffTruncated = diff.length > MAX_DIFF;
     if (diffTruncated)
       diff = `${diff.slice(0, MAX_DIFF)}\n\n[diff truncated at ${MAX_DIFF} characters]`;
 
-    return { head, commits, files, diff, diffTruncated, uncommitted };
+    return { head, commits, files, deleted, diff, diffTruncated, uncommitted };
   }
 
   /** Fail closed unless the candidate is a clean, optionally expected Git identity. */
@@ -410,6 +632,19 @@ export class GitWorkspace {
     baseRef: string;
     expectedHead: string;
   }): Promise<FastForwardPreflight> {
+    if (!/^[0-9a-f]{40}$/.test(opts.expectedHead)) {
+      throw new GitError('candidate HEAD must be an exact SHA', 'candidate_head_invalid');
+    }
+    // `.git/info/attributes` is shared by linked worktrees and remains active
+    // even with an explicit tree attribute source. Reject it before any status
+    // or candidate inspection can bind a configured driver.
+    await rejectSharedAttributes(opts.targetRoot);
+    await rejectSharedAttributes(opts.worktreePath);
+    // Inspect committed attribute data before status/diff: those commands can
+    // themselves invoke a required checkout filter if rejection comes later.
+    const targetHeadBeforeInspection = await git(opts.targetRoot, ['rev-parse', 'HEAD']);
+    rejectCheckoutFilters(opts.targetRoot, targetHeadBeforeInspection);
+    rejectCheckoutFilters(opts.targetRoot, opts.expectedHead);
     const target = await repoStatus(opts.targetRoot);
     if (!target.isRepo || !target.root || !samePath(target.root, opts.targetRoot)) {
       throw new GitError(
@@ -440,6 +675,13 @@ export class GitWorkspace {
       );
     }
     await requireAncestor(target.root, target.head, changes.head, 'target_diverged');
+    // Bind the already-inspected names to the identities validation established.
+    if (target.head !== targetHeadBeforeInspection || changes.head !== opts.expectedHead) {
+      throw new GitError(
+        'candidate identity changed during application preflight',
+        'identity_race',
+      );
+    }
 
     return {
       targetRoot: target.root,
@@ -459,7 +701,13 @@ export class GitWorkspace {
   }): Promise<FastForwardPreflight & { targetHeadAfter: string }> {
     const preflight = await this.preflightFastForward(opts);
     if (preflight.targetHead !== preflight.candidateHead) {
-      await git(preflight.targetRoot, ['merge', '--ff-only', preflight.candidateHead]);
+      await rejectSharedAttributes(preflight.targetRoot);
+      await git(preflight.targetRoot, [
+        `--attr-source=${preflight.candidateHead}`,
+        'merge',
+        '--ff-only',
+        preflight.candidateHead,
+      ]);
     }
     const after = await repoStatus(preflight.targetRoot);
     if (
@@ -477,7 +725,7 @@ export class GitWorkspace {
 
   /** Commit whatever the worker left uncommitted, so the candidate is a real ref. */
   async commitPending(worktreePath: string, message: string): Promise<string | null> {
-    const dirty = await git(worktreePath, ['status', '--porcelain']);
+    const dirty = await git(worktreePath, [NO_TREE_ATTRIBUTES, 'status', '--porcelain']);
     if (!dirty.trim()) return null;
     await git(worktreePath, ['add', '-A']);
     await git(worktreePath, [
@@ -498,6 +746,35 @@ export class GitWorkspace {
       .split('\n')
       .filter((l) => l.startsWith('worktree '))
       .map((l) => l.slice('worktree '.length));
+  }
+}
+
+/** Refuse every executable checkout filter in both trees before moving HEAD. */
+function rejectCheckoutFilters(repo: string, sha: string): void {
+  const paths = trustedGitSync(repo, ['ls-tree', '-r', '-z', '--name-only', sha], 64 * 1024 * 1024);
+  const attributes = trustedGitSync(
+    repo,
+    [`--attr-source=${sha}`, 'check-attr', '-z', '--stdin', 'filter'],
+    64 * 1024 * 1024,
+    paths,
+  )
+    .toString('utf8')
+    .split('\0');
+  for (let index = 0; index + 2 < attributes.length; index += 3) {
+    const [file, , value] = attributes.slice(index, index + 3);
+    if (value !== 'unspecified' && value !== 'unset') {
+      throw new GitError(`checkout filter is prohibited for ${file}`, 'checkout_filter_prohibited');
+    }
+  }
+}
+
+async function rejectSharedAttributes(repo: string): Promise<void> {
+  const common = await git(repo, ['rev-parse', '--git-common-dir']);
+  if (fs.existsSync(path.resolve(repo, common, 'info', 'attributes'))) {
+    throw new GitError(
+      'shared Git info attributes are prohibited during candidate application',
+      'shared_attributes_prohibited',
+    );
   }
 }
 

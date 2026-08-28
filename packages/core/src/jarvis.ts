@@ -182,9 +182,10 @@ export class Jarvis {
         apiPortEnvironment: 'JARVIS_PORT',
         healthPath: '/health',
       },
-      // Self visual QA is planned from the candidate diff (see
-      // visualqa/surfaces.ts). These defaults are only the last-resort fallback
-      // for a change that maps to no known surface.
+      // Self visual QA is planned from the candidate's own committed catalog
+      // (see visualqa/candidate-plan.ts), which never falls back to these
+      // defaults: the running parent's scenarios describe the running parent's
+      // UI. They remain only for the legacy pre-plan approval path.
       visualQa: { required: true, scenarios: [selfSurfaceScenario('command')] },
       verification: {
         steps: [

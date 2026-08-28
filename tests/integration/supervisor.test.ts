@@ -12,6 +12,17 @@ const supervisor = path.resolve('scripts/supervisor.mjs');
 const ACTIVATION_TOKEN = 'human-held-supervisor-token-0123456789abcdef';
 const AMBIENT_TOKEN = 'ghp_abcdefghijklmnopqrstuvwxyz123456';
 const DISABLED_CODEX = path.join('C:', '__jarvis_codex_disabled__', 'codex.exe');
+/**
+ * These tests assert what the supervisor *does*, not how fast it does it: each
+ * one spawns a real supervisor that installs and builds a temporary repository.
+ * The deadline exists so a hung supervisor fails instead of hanging the suite,
+ * so it has to clear the slowest legitimate run rather than the typical one.
+ * A plain `pnpm verify` finishes these well inside a minute; the same suite run
+ * while a supervised Jarvis is live -- which is exactly what happens when Jarvis
+ * validates a candidate of itself -- shares the machine with an orchestrator, a
+ * Vite server and that job's own builds, and repeatedly overran 120s there.
+ */
+const SUPERVISOR_TIMEOUT_MS = 300_000;
 
 function git(repo: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
@@ -42,6 +53,14 @@ function fixture(healthyCandidate: boolean) {
     `import {execFileSync,spawn} from 'node:child_process'; import fs from 'node:fs'; const observed=JSON.stringify({token:process.env.GITHUB_TOKEN,request:process.env.JARVIS_UPGRADE_REQUEST_PATH,socket:process.env.JARVIS_UPGRADE_SOCKET,hash:process.env.JARVIS_UPGRADE_TOKEN_HASH,codexBin:process.env.JARVIS_CODEX_BIN}); fs.writeFileSync('.observed-env',observed); console.error(process.env.GITHUB_TOKEN??'no-token'); if(process.env.DAEMONIZE_BUILD==='1'){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});fs.writeFileSync('.daemon-pid',String(c.pid));c.unref();} fs.writeFileSync('.built', execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n`,
   );
   fs.writeFileSync(
+    path.join(repo, 'poison-build.mjs'),
+    `import {execFileSync} from 'node:child_process'; import fs from 'node:fs'; import path from 'node:path'; execFileSync(process.execPath,['build.mjs'],{stdio:'inherit'}); if(fs.readFileSync('version.txt','utf8').trim()==='broken'){const gitDir=path.resolve(execFileSync('git',['rev-parse','--git-dir'],{encoding:'utf8'}).trim()); const driver=path.join(gitDir,'rollback-filter.mjs'); fs.writeFileSync(driver,"import fs from 'node:fs'; fs.writeFileSync(process.argv[2],'yes'); process.stdin.pipe(process.stdout);\\n"); fs.mkdirSync(path.join(gitDir,'info'),{recursive:true}); fs.writeFileSync(path.join(gitDir,'info','attributes'),'version.txt filter=evil\\n'); execFileSync('git',['config','filter.evil.smudge',\`node \${JSON.stringify(driver)} \${JSON.stringify(path.join(gitDir,'rollback-filter-ran'))}\`]); execFileSync('git',['config','filter.evil.required','true']); fs.writeFileSync('.gitattributes','version.txt filter=evil\\n'); fs.writeFileSync(path.join(gitDir,'info','exclude'),'.gitattributes\\n'); fs.writeFileSync('version.txt',fs.readFileSync('version.txt')); if(process.env.POISON_THEN_FAIL==='1'){process.exit(1);}} if(process.env.CORRUPT_GIT_HEAD==='1'){const gitDir=path.resolve(execFileSync('git',['rev-parse','--git-dir'],{encoding:'utf8'}).trim()); fs.writeFileSync(path.join(gitDir,'HEAD'),'not a ref');}\n`,
+  );
+  fs.writeFileSync(
+    path.join(repo, 'worktree-poison-build.mjs'),
+    `import {execFileSync} from 'node:child_process'; import fs from 'node:fs'; import path from 'node:path'; execFileSync(process.execPath,['build.mjs'],{stdio:'inherit'}); if(fs.readFileSync('version.txt','utf8').trim()==='broken'){const gitDir=path.resolve(execFileSync('git',['rev-parse','--git-dir'],{encoding:'utf8'}).trim()); const decoy=path.join(path.dirname(path.dirname(gitDir)),'build-worktree-decoy'); fs.mkdirSync(decoy,{recursive:true}); execFileSync('git',['config','core.worktree',decoy]); process.exit(1);}\n`,
+  );
+  fs.writeFileSync(
     path.join(repo, 'server.mjs'),
     `import http from 'node:http'; import fs from 'node:fs'; import {execFileSync} from 'node:child_process';
 http.createServer((req,res)=>{ if(req.url!=='/health'){res.statusCode=404; return res.end();} const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(); const built=fs.readFileSync('.built','utf8').trim(); const healthy=fs.readFileSync('healthy.txt','utf8').trim()==='yes' && built===commit; res.statusCode=healthy?200:503; res.setHeader('content-type','application/json'); res.end(JSON.stringify({status:healthy?'ok':'error',commit,version:fs.readFileSync('version.txt','utf8').trim(),supervised:process.env.JARVIS_SUPERVISED,requestPath:process.env.JARVIS_UPGRADE_REQUEST_PATH,upgradeSocket:process.env.JARVIS_UPGRADE_SOCKET,implementer:process.env.JARVIS_IMPLEMENTER_PROVIDER,codexBin:process.env.JARVIS_CODEX_BIN})); }).listen(Number(process.env.PORT),'127.0.0.1');\n`,
@@ -67,7 +86,7 @@ http.createServer((req,res)=>{ if(req.url!=='/health'){res.statusCode=404; retur
 
 async function waitFor<T>(
   read: () => Promise<T | null> | T | null,
-  timeoutMs = 20_000,
+  timeoutMs = SUPERVISOR_TIMEOUT_MS,
   what = 'supervisor evidence',
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
@@ -84,7 +103,10 @@ async function waitFor<T>(
  * child often exits before we get here (the event would never fire again), and
  * a supervisor that never exits must fail the test rather than hang it.
  */
-function waitForExit(child: ChildProcess, timeoutMs = 20_000): Promise<number | string> {
+function waitForExit(
+  child: ChildProcess,
+  timeoutMs = SUPERVISOR_TIMEOUT_MS,
+): Promise<number | string> {
   return waitFor(() => child.exitCode ?? child.signalCode, timeoutMs, 'supervisor exit');
 }
 
@@ -94,6 +116,12 @@ async function submit(
 ): Promise<{ accepted?: boolean; error?: string }> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(endpoint);
+    // Generous on purpose: this only exists to turn a hung socket into a failure
+    // rather than a stalled suite. A tight bound turns CPU contention into a
+    // false negative, which is how this suite first failed.
+    socket.setTimeout(SUPERVISOR_TIMEOUT_MS, () =>
+      socket.destroy(new Error('timed out waiting for supervisor')),
+    );
     socket.setEncoding('utf8');
     let pending = '';
     socket.once('connect', () => socket.write(`${JSON.stringify(request)}\n`));
@@ -118,6 +146,13 @@ async function runActivation(
   tamperCommand = false,
   activationToken = ACTIVATION_TOKEN,
   daemonizeBuild = false,
+  poisonGit = false,
+  checkoutFilter: 'smudge' | 'process' | null = null,
+  mixedCaseGitEnv = false,
+  poisonRollbackFilter: boolean | 'fail' = false,
+  corruptGitHead = false,
+  poisonWorktree = false,
+  concealTargetResidue = false,
 ) {
   const setup = fixture(healthyCandidate);
   const selectedPort = await port();
@@ -136,8 +171,16 @@ async function runActivation(
   };
   const buildCommand = {
     executable: process.execPath,
-    args: ['build.mjs'],
+    args: [
+      poisonWorktree
+        ? 'worktree-poison-build.mjs'
+        : poisonRollbackFilter || corruptGitHead
+          ? 'poison-build.mjs'
+          : 'build.mjs',
+    ],
     ...(daemonizeBuild ? { env: { DAEMONIZE_BUILD: '1' } } : {}),
+    ...(corruptGitHead ? { env: { CORRUPT_GIT_HEAD: '1' } } : {}),
+    ...(poisonRollbackFilter === 'fail' ? { env: { POISON_THEN_FAIL: '1' } } : {}),
   };
   const configFile = path.join(setup.stateDir, 'supervisor.json');
   fs.writeFileSync(
@@ -159,9 +202,73 @@ async function runActivation(
     }),
   );
 
+  let candidateWorktree: string | null = null;
+  if (poisonGit || checkoutFilter) {
+    candidateWorktree = path.join(setup.root, 'candidate-worktree');
+    git(setup.repo, 'worktree', 'add', candidateWorktree, 'candidate');
+  }
+
+  if (poisonGit && candidateWorktree) {
+    const forged = git(
+      candidateWorktree,
+      'commit-tree',
+      `${setup.previousSha}^{tree}`,
+      '-p',
+      setup.previousSha,
+      '-m',
+      'forged replacement',
+    );
+    git(candidateWorktree, 'replace', setup.candidateSha, forged);
+    const fsmonitor = path.join(setup.root, 'fsmonitor.mjs');
+    const hook = path.join(setup.root, 'hook.mjs');
+    fs.writeFileSync(
+      fsmonitor,
+      `import fs from 'node:fs'; fs.writeFileSync('.fsmonitor-ran','yes'); process.stdout.write('0\\0');\n`,
+    );
+    fs.writeFileSync(hook, `import fs from 'node:fs'; fs.writeFileSync('.hook-ran','yes');\n`);
+    const hooks = path.join(setup.root, 'hooks');
+    fs.mkdirSync(hooks);
+    const postMerge = path.join(hooks, 'post-merge');
+    fs.writeFileSync(postMerge, `#!/bin/sh\nnode ${JSON.stringify(hook)}\n`);
+    fs.chmodSync(postMerge, 0o755);
+    git(candidateWorktree, 'config', 'core.fsmonitor', `node ${JSON.stringify(fsmonitor)}`);
+    git(candidateWorktree, 'config', 'core.hooksPath', hooks);
+    const decoy = path.join(setup.root, 'configured-worktree-decoy');
+    fs.mkdirSync(decoy);
+    fs.writeFileSync(path.join(decoy, 'version.txt'), 'decoy\n');
+    git(candidateWorktree, 'config', 'core.worktree', decoy);
+  }
+
+  if (checkoutFilter && candidateWorktree) {
+    fs.writeFileSync(path.join(candidateWorktree, '.gitattributes'), 'filtered.txt filter=evil\n');
+    fs.writeFileSync(path.join(candidateWorktree, 'filtered.txt'), 'exact candidate bytes\n');
+    git(candidateWorktree, 'add', '.gitattributes', 'filtered.txt');
+    git(candidateWorktree, 'commit', '--amend', '--no-edit');
+    setup.candidateSha = git(candidateWorktree, 'rev-parse', 'HEAD');
+    const marker = path.join(setup.repo, `.${checkoutFilter}-ran`);
+    const driver = path.join(setup.root, `${checkoutFilter}-filter.mjs`);
+    fs.writeFileSync(
+      driver,
+      checkoutFilter === 'smudge'
+        ? `import fs from 'node:fs'; fs.writeFileSync(process.argv[2],'yes'); process.stdin.pipe(process.stdout);\n`
+        : `import fs from 'node:fs'; fs.writeFileSync(process.argv[2],'yes'); setTimeout(()=>process.exit(1),1000);\n`,
+    );
+    git(
+      candidateWorktree,
+      'config',
+      `filter.evil.${checkoutFilter}`,
+      `node ${JSON.stringify(driver)} ${JSON.stringify(marker)}`,
+    );
+    git(candidateWorktree, 'config', 'filter.evil.required', 'true');
+  }
+
   const child = spawn(process.execPath, [supervisor, configFile], {
     cwd: setup.repo,
-    env: { ...process.env, GITHUB_TOKEN: AMBIENT_TOKEN },
+    env: {
+      ...process.env,
+      GITHUB_TOKEN: AMBIENT_TOKEN,
+      ...(mixedCaseGitEnv ? { Git_CONFIG_COUNT: '1' } : {}),
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
@@ -172,7 +279,7 @@ async function runActivation(
 
   const initialHealth = await waitFor(async () => {
     try {
-      const response = await fetch(healthUrl);
+      const response = await fetch(healthUrl, { signal: AbortSignal.timeout(1_000) });
       const body = (await response.json()) as { commit?: string; upgradeSocket?: string };
       return response.ok && body.commit === setup.previousSha && body.upgradeSocket ? body : null;
     } catch {
@@ -197,6 +304,13 @@ async function runActivation(
     evidencePrivateKey,
   };
   if (tamperCommand) request.buildCommand = { ...buildCommand, args: ['malicious.mjs'] };
+  if (concealTargetResidue) {
+    // Unreviewed bytes in the target, hidden from status by a shared exclude
+    // that is neither tracked nor visible in any reviewed diff.
+    fs.mkdirSync(path.join(setup.repo, '.git', 'info'), { recursive: true });
+    fs.writeFileSync(path.join(setup.repo, '.git', 'info', 'exclude'), 'unreviewed.js\n');
+    fs.writeFileSync(path.join(setup.repo, 'unreviewed.js'), 'throw new Error("unreviewed");\n');
+  }
   const response = await submit(initialHealth.upgradeSocket as string, request);
 
   if (tamperCommand || activationToken !== ACTIVATION_TOKEN) {
@@ -240,7 +354,23 @@ function stableJson(value: unknown): string {
 }
 
 afterEach(async () => {
-  for (const child of children.splice(0)) child.kill();
+  // `child.kill()` reaps only the supervisor itself. Its build and runtime
+  // grandchildren survive on Windows, and a leaked fixture server answering
+  // /health with a stale commit starves every later activation test.
+  for (const child of children.splice(0)) {
+    if (process.platform === 'win32' && child.pid !== undefined) {
+      try {
+        execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+          stdio: 'ignore',
+          windowsHide: true,
+        });
+        continue;
+      } catch {
+        // Already gone: fall through to the portable kill below.
+      }
+    }
+    child.kill();
+  }
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -317,6 +447,153 @@ describe('external self-upgrade supervisor', () => {
       .join('\n');
     expect(persistedState).not.toContain(ACTIVATION_TOKEN);
     expect(persistedState).not.toContain('BEGIN PRIVATE KEY');
+  });
+
+  it('ignores shared replacement refs and executable Git configuration', async () => {
+    const result = await runActivation(true, false, ACTIVATION_TOKEN, false, true);
+    expect(result.evidence).toMatchObject({
+      status: 'activated',
+      headAfter: result.candidateSha,
+      healthcheck: { body: { commit: result.candidateSha, version: 'new' } },
+    });
+    expect(fs.existsSync(path.join(result.repo, '.fsmonitor-ran'))).toBe(false);
+    expect(fs.existsSync(path.join(result.repo, '.hook-ran'))).toBe(false);
+  });
+
+  it('rolls back the real commit graph despite poisoned shared Git state', async () => {
+    const result = await runActivation(false, false, ACTIVATION_TOKEN, false, true);
+    expect(result.evidence).toMatchObject({
+      status: 'rolled_back',
+      rollbackSha: result.previousSha,
+      headAfter: result.previousSha,
+      rollbackHealthcheck: { body: { commit: result.previousSha, version: 'old' } },
+    });
+    expect(fs.existsSync(path.join(result.repo, '.fsmonitor-ran'))).toBe(false);
+    expect(fs.existsSync(path.join(result.repo, '.hook-ran'))).toBe(false);
+  });
+
+  it('scrubs mixed-case inherited Git configuration on Windows', async () => {
+    if (process.platform !== 'win32') return;
+    const result = await runActivation(true, false, ACTIVATION_TOKEN, false, false, null, true);
+    expect(result.evidence).toMatchObject({ status: 'activated', headAfter: result.candidateSha });
+  });
+
+  it.each(['smudge', 'process'] as const)(
+    'rejects a candidate tree that requests an executable %s filter',
+    async (filter) => {
+      const result = await runActivation(true, false, ACTIVATION_TOKEN, false, false, filter);
+      expect(result.evidence).toMatchObject({
+        status: 'rejected',
+        error: 'checkout filter is prohibited for filtered.txt',
+      });
+      expect(git(result.repo, 'rev-parse', 'HEAD')).toBe(result.previousSha);
+      expect(fs.existsSync(path.join(result.repo, `.${filter}-ran`))).toBe(false);
+    },
+  );
+
+  it('ignores a filter planted by the failed candidate build during rollback', async () => {
+    const result = await runActivation(
+      false,
+      false,
+      ACTIVATION_TOKEN,
+      false,
+      false,
+      null,
+      false,
+      true,
+    );
+    expect(result.evidence).toMatchObject({
+      status: 'rolled_back',
+      rollbackSha: result.previousSha,
+      headAfter: result.previousSha,
+    });
+    const gitDir = path.resolve(result.repo, git(result.repo, 'rev-parse', '--git-dir'));
+    expect(fs.existsSync(path.join(gitDir, 'rollback-filter-ran'))).toBe(false);
+  });
+
+  it('rolls back after a build that plants attributes and then fails', async () => {
+    const result = await runActivation(
+      false,
+      false,
+      ACTIVATION_TOKEN,
+      false,
+      false,
+      null,
+      false,
+      'fail',
+    );
+    // The planted filter must be quarantined before state is read, or this
+    // rollback is reported blocked instead of being performed.
+    expect(result.evidence).toMatchObject({
+      status: 'rolled_back',
+      rollbackSha: result.previousSha,
+      headAfter: result.previousSha,
+    });
+    const gitDir = path.resolve(result.repo, git(result.repo, 'rev-parse', '--git-dir'));
+    expect(fs.existsSync(path.join(gitDir, 'rollback-filter-ran'))).toBe(false);
+  });
+
+  it('refuses a target whose unreviewed files are hidden by a shared exclude', async () => {
+    // The quarantine of build-planted excludes is only sound because activation
+    // cannot start from a tree that is already concealing something.
+    const result = await runActivation(
+      true,
+      false,
+      ACTIVATION_TOKEN,
+      false,
+      false,
+      null,
+      false,
+      false,
+      false,
+      false,
+      true,
+    );
+    expect(result.evidence).toMatchObject({ status: 'rejected' });
+    expect(String(result.evidence.error)).toContain('dirty');
+    expect(fs.readFileSync(path.join(result.repo, 'version.txt'), 'utf8').trim()).toBe('old');
+  });
+
+  it('rolls back the registered checkout after a build plants core.worktree', async () => {
+    const result = await runActivation(
+      false,
+      false,
+      ACTIVATION_TOKEN,
+      false,
+      false,
+      null,
+      false,
+      false,
+      false,
+      true,
+    );
+    expect(result.evidence).toMatchObject({
+      status: 'rolled_back',
+      rollbackSha: result.previousSha,
+      headAfter: result.previousSha,
+    });
+    expect(fs.readFileSync(path.join(result.repo, 'version.txt'), 'utf8').trim()).toBe('old');
+    expect(fs.existsSync(path.join(result.root, 'build-worktree-decoy', 'version.txt'))).toBe(
+      false,
+    );
+  });
+
+  it('still signs evidence when the candidate build makes repository state unreadable', async () => {
+    const result = await runActivation(
+      true,
+      false,
+      ACTIVATION_TOKEN,
+      false,
+      false,
+      null,
+      false,
+      false,
+      true,
+    );
+    // Without a guarded state read the exception escapes activate(), kills the
+    // supervisor and leaves the transaction pending with no evidence at all.
+    expect(result.evidence).toMatchObject({ status: 'rollback_blocked', headAfter: null });
+    expect(String(result.evidence.error)).toMatch(/clean=false/);
   });
 
   it('restores and restarts the old revision after candidate health fails', async () => {

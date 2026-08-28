@@ -48,11 +48,105 @@ describe('repo status', () => {
     expect(status.head).toHaveLength(40);
   });
 
+  it('resolves a subdirectory to the repository that contains it', async () => {
+    const nested = path.join(repo, 'packages', 'nested');
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(path.join(nested, 'index.ts'), 'export const x = 1;\n');
+    git(['add', '-A']);
+    git(['commit', '-qm', 'nested']);
+
+    const status = await repoStatus(nested);
+
+    // Registering a project at a subdirectory must describe the whole
+    // repository, not treat every file outside the subdirectory as deleted.
+    expect(status.isRepo).toBe(true);
+    expect(status.root).toBe(fs.realpathSync.native(repo));
+    expect(status.dirty).toBe(false);
+    expect(status.dirtyFiles).toEqual([]);
+  });
+
+  it('detects untracked work hidden by shared info excludes', async () => {
+    const common = git(['rev-parse', '--git-common-dir']);
+    const info = path.resolve(repo, common, 'info');
+    fs.mkdirSync(info, { recursive: true });
+    // Neither tracked nor per-worktree, so hiding work here never shows up in
+    // a reviewed diff the way a .gitignore change would.
+    fs.writeFileSync(path.join(info, 'exclude'), '# comment\nplanted.js\n');
+    fs.writeFileSync(path.join(repo, 'planted.js'), 'throw new Error("unreviewed");\n');
+
+    const status = await repoStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.dirtyFiles.join(' ')).toContain('planted.js');
+  });
+
+  it('detects untracked work hidden by a configured excludes file', async () => {
+    const excludes = path.join(home, 'candidate-excludes');
+    fs.writeFileSync(excludes, 'planted.js\n');
+    git(['config', 'core.excludesFile', excludes]);
+    fs.writeFileSync(path.join(repo, 'planted.js'), 'throw new Error("unreviewed");\n');
+
+    const status = await repoStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.dirtyFiles.join(' ')).toContain('planted.js');
+  });
+
+  it('stays clean when the default comment-only info exclude is present', async () => {
+    const common = git(['rev-parse', '--git-common-dir']);
+    const info = path.resolve(repo, common, 'info');
+    fs.mkdirSync(info, { recursive: true });
+    fs.writeFileSync(path.join(info, 'exclude'), '# git ls-files --others --exclude-from=..\n#\n');
+
+    const status = await repoStatus(repo);
+
+    expect(status.dirty).toBe(false);
+    expect(status.dirtyFiles).toEqual([]);
+  });
+
   it('detects uncommitted work', async () => {
     fs.writeFileSync(path.join(repo, 'scratch.txt'), 'work in progress');
     const status = await repoStatus(repo);
     expect(status.dirty).toBe(true);
     expect(status.dirtyFiles.length).toBe(1);
+  });
+
+  it('detects untracked work hidden by repository status configuration', async () => {
+    git(['config', 'status.showUntrackedFiles', 'no']);
+    fs.writeFileSync(path.join(repo, 'hidden-runtime.js'), 'throw new Error("unreviewed");\n');
+
+    const status = await repoStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.dirtyFiles.some((file) => file.includes('hidden-runtime.js'))).toBe(true);
+  });
+
+  it('does not hand the parent environment to a Git filter driver', async () => {
+    // A `filter` attribute makes Git execute the configured driver. An agent
+    // holding a shell in a worktree can plant one; it must not thereby read the
+    // credentials the untrusted-process allowlist exists to withhold.
+    process.env.JARVIS_CONTROL_TOKEN = 'control-token-must-not-leak';
+    try {
+      const captured = path.join(home, 'captured.txt');
+      const driver = path.join(home, 'driver.mjs');
+      fs.writeFileSync(
+        driver,
+        `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(captured)}, String(process.env.JARVIS_CONTROL_TOKEN)); process.stdin.pipe(process.stdout);\n`,
+      );
+      fs.writeFileSync(path.join(repo, '.gitattributes'), 'README.md filter=harvest\n');
+      git(['add', '-A']);
+      git(['commit', '-qm', 'attributes']);
+      git(['config', 'filter.harvest.clean', `node ${JSON.stringify(driver)}`]);
+      // Invalidate the index stat cache so Git must re-hash and run the driver.
+      fs.writeFileSync(path.join(repo, 'README.md'), fs.readFileSync(path.join(repo, 'README.md')));
+
+      await repoStatus(repo);
+
+      const leaked = fs.existsSync(captured) ? fs.readFileSync(captured, 'utf8') : '';
+      expect(leaked).not.toContain('control-token-must-not-leak');
+    } finally {
+      delete process.env.JARVIS_CONTROL_TOKEN;
+    }
   });
 
   it('reports a non-repository without throwing', async () => {
@@ -167,6 +261,38 @@ describe('collecting the candidate change', () => {
     expect(changes.commits[0]?.sha).toHaveLength(40);
     expect(changes.files.map((f) => f.path).sort()).toEqual(['README.md', 'feature.ts']);
     expect(changes.diff).toContain('export const answer = 42;');
+  });
+
+  it('reports rename endpoints as literal paths', async () => {
+    const source = path.join(repo, 'Command.tsx');
+    fs.writeFileSync(source, 'export const Command = true;\n');
+    git(['add', '-A']);
+    git(['commit', '-qm', 'add command']);
+    const worktree = await workspace.createWorktree({ repoRoot: repo, jobId: 'job_rename' });
+    fs.renameSync(source.replace(repo, worktree.path), path.join(worktree.path, 'Chat.tsx'));
+    await workspace.commitPending(worktree.path, 'rename command to chat');
+
+    const paths = (await workspace.collectChanges(worktree.path, worktree.baseRef)).files.map(
+      (file) => file.path,
+    );
+    expect(paths.sort()).toEqual(['Chat.tsx', 'Command.tsx']);
+    expect(paths.join(' ')).not.toContain('{');
+  });
+
+  it('ignores candidate-controlled diff drivers when reading the change', async () => {
+    const worktree = await workspace.createWorktree({ repoRoot: repo, jobId: 'job_textconv' });
+    // A candidate can write .gitattributes and tamper with repository config; a
+    // diff driver must never turn a trusted read into candidate code execution.
+    fs.writeFileSync(path.join(worktree.path, '.gitattributes'), '*.tsx diff=evil\n');
+    fs.writeFileSync(path.join(worktree.path, 'View.tsx'), 'export const real = 1;\n');
+    git(['config', 'diff.evil.textconv', 'node -e "console.log(\'PWNED\')"'], worktree.path);
+    git(['config', 'diff.evil.command', 'node -e "console.log(\'PWNED\')"'], worktree.path);
+    await workspace.commitPending(worktree.path, 'add view');
+
+    const changes = await workspace.collectChanges(worktree.path, worktree.baseRef);
+    expect(changes.diff).toContain('export const real = 1;');
+    expect(changes.diff).not.toContain('PWNED');
+    expect(changes.files.map((f) => f.path)).toContain('View.tsx');
   });
 
   it('commits work an agent left uncommitted', async () => {
@@ -289,6 +415,102 @@ describe('immutable candidate materialization', () => {
     await expect(workspace.validateCandidateSource(repo, base, unrelated)).rejects.toMatchObject({
       code: 'candidate_source_base_mismatch',
     });
+  });
+});
+
+describe('candidate application', () => {
+  it('fast-forwards a clean candidate to its exact reviewed commit', async () => {
+    const base = git(['rev-parse', 'HEAD']);
+    const worktree = await workspace.createWorktree({ repoRoot: repo, jobId: 'apply-clean' });
+    fs.writeFileSync(path.join(worktree.path, 'candidate.txt'), 'candidate\n');
+    const candidate = await workspace.commitPending(worktree.path, 'candidate');
+    if (!candidate) throw new Error('setup failed');
+
+    await expect(
+      workspace.fastForward({
+        targetRoot: repo,
+        worktreePath: worktree.path,
+        baseRef: base,
+        expectedHead: candidate,
+      }),
+    ).resolves.toMatchObject({ targetHeadAfter: candidate });
+    expect(git(['rev-parse', 'HEAD'])).toBe(candidate);
+  });
+
+  it('updates the registered checkout instead of a configured worktree decoy', async () => {
+    const base = git(['rev-parse', 'HEAD']);
+    const worktree = await workspace.createWorktree({ repoRoot: repo, jobId: 'worktree-decoy' });
+    fs.writeFileSync(path.join(worktree.path, 'candidate.txt'), 'candidate\n');
+    const candidate = await workspace.commitPending(worktree.path, 'candidate');
+    if (!candidate) throw new Error('setup failed');
+    const decoy = path.join(home, 'decoy');
+    fs.mkdirSync(decoy);
+    fs.writeFileSync(path.join(decoy, 'README.md'), '# original\n');
+    git(['config', 'core.worktree', decoy], worktree.path);
+
+    await workspace.fastForward({
+      targetRoot: repo,
+      worktreePath: worktree.path,
+      baseRef: base,
+      expectedHead: candidate,
+    });
+
+    expect(fs.readFileSync(path.join(repo, 'candidate.txt'), 'utf8')).toBe('candidate\n');
+    expect(fs.existsSync(path.join(decoy, 'candidate.txt'))).toBe(false);
+  });
+
+  it.each(['smudge', 'process'])(
+    'rejects a candidate %s filter without running it',
+    async (kind) => {
+      const base = git(['rev-parse', 'HEAD']);
+      const worktree = await workspace.createWorktree({ repoRoot: repo, jobId: `filter-${kind}` });
+      fs.writeFileSync(path.join(worktree.path, '.gitattributes'), 'payload.txt filter=evil\n');
+      fs.writeFileSync(path.join(worktree.path, 'payload.txt'), 'candidate\n');
+      git(['add', '-A'], worktree.path);
+      git(['commit', '-qm', `candidate ${kind} filter`], worktree.path);
+      const candidate = git(['rev-parse', 'HEAD'], worktree.path);
+      const marker = path.join(home, `${kind}-ran`);
+      const driver = path.join(home, `${kind}.mjs`);
+      fs.writeFileSync(
+        driver,
+        `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'yes'); process.stdin.pipe(process.stdout);\n`,
+      );
+      git(['config', `filter.evil.${kind}`, `node ${JSON.stringify(driver)}`], worktree.path);
+      git(['config', 'filter.evil.required', 'true'], worktree.path);
+
+      await expect(
+        workspace.fastForward({
+          targetRoot: repo,
+          worktreePath: worktree.path,
+          baseRef: base,
+          expectedHead: candidate,
+        }),
+      ).rejects.toMatchObject({ code: 'checkout_filter_prohibited' });
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(git(['rev-parse', 'HEAD'])).toBe(base);
+    },
+  );
+
+  it('rejects shared info attributes before moving the target', async () => {
+    const base = git(['rev-parse', 'HEAD']);
+    const worktree = await workspace.createWorktree({ repoRoot: repo, jobId: 'shared-attributes' });
+    fs.writeFileSync(path.join(worktree.path, 'candidate.txt'), 'candidate\n');
+    const candidate = await workspace.commitPending(worktree.path, 'candidate');
+    if (!candidate) throw new Error('setup failed');
+    const common = git(['rev-parse', '--git-common-dir']);
+    const info = path.resolve(repo, common, 'info');
+    fs.mkdirSync(info, { recursive: true });
+    fs.writeFileSync(path.join(info, 'attributes'), 'candidate.txt filter=evil\n');
+
+    await expect(
+      workspace.fastForward({
+        targetRoot: repo,
+        worktreePath: worktree.path,
+        baseRef: base,
+        expectedHead: candidate,
+      }),
+    ).rejects.toMatchObject({ code: 'shared_attributes_prohibited' });
+    expect(git(['rev-parse', 'HEAD'])).toBe(base);
   });
 });
 

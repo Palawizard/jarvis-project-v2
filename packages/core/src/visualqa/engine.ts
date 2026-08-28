@@ -326,7 +326,10 @@ export class VisualQaEngine {
         await runInteractions(
           page,
           opts.baseUrl,
-          scenario.interactions ?? opts.interactions ?? [],
+          scenario.viewportInteractions?.[viewport] ??
+            scenario.interactions ??
+            opts.interactions ??
+            [],
           outDir,
           viewport,
           navigation.assert,
@@ -338,7 +341,7 @@ export class VisualQaEngine {
             .locator(scenario.expectedSelector)
             .first()
             .waitFor({
-              timeout: Math.min(Math.max(scenario.expectedSelectorTimeoutMs ?? 15_000, 0), 30_000),
+              timeout: Math.min(Math.max(scenario.expectedSelectorTimeoutMs ?? 15_000, 1), 30_000),
             });
         }
       } catch (error) {
@@ -582,12 +585,15 @@ async function runInteractions(
         assertConfined();
         break;
       case 'wait':
+        // Floor of 1, not 0: Playwright reads a zero timeout as "wait forever",
+        // so the runtime boundary must match the catalog boundary. Job and
+        // project configuration reach here too, and neither may hang a capture.
         if (step.selector) {
           await page.locator(step.selector).waitFor({
-            timeout: Math.min(Math.max(step.timeoutMs ?? 15_000, 0), 30_000),
+            timeout: Math.min(Math.max(step.timeoutMs ?? 15_000, 1), 30_000),
           });
         } else {
-          await page.waitForTimeout(Math.min(Math.max(step.timeoutMs ?? 250, 0), 30_000));
+          await page.waitForTimeout(Math.min(Math.max(step.timeoutMs ?? 250, 1), 30_000));
         }
         assertConfined();
         break;
@@ -768,7 +774,7 @@ function sealScreenshot(screenshotPath: string): string {
   return sealed;
 }
 
-function confinedCandidateUrl(baseUrl: string, route: string): string {
+export function confinedCandidateUrl(baseUrl: string, route: string): string {
   if (!/^\/(?!\/)/.test(route) || route.includes('\\')) {
     throw new Error(`visual QA route must be a same-origin absolute path: ${route}`);
   }

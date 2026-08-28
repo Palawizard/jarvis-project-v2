@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../config.js';
-import { AgentRegistry } from './registry.js';
+import { AgentRegistry, classifyAgentFailure } from './registry.js';
 import type {
   AgentEvent,
   AgentProvider,
@@ -126,5 +126,32 @@ describe('AgentRegistry v2', () => {
     ).toBeTruthy();
     now = new Date('2026-08-23T00:01:01.000Z');
     expect((await router.route('implementer')).provider?.id).toBe('claude');
+  });
+
+  it('keeps quota, broken-session, and protocol failures distinct', () => {
+    expect(classifyAgentFailure({ status: 'failed', error: 'monthly usage limit exceeded' })).toBe(
+      'quota',
+    );
+    expect(
+      classifyAgentFailure({ status: 'failed', error: 'thread could not be resumed: not found' }),
+    ).toBe('session_invalid');
+    expect(
+      classifyAgentFailure({
+        status: 'failed',
+        error: 'Codex exited without a terminal structured event',
+      }),
+    ).toBe('protocol');
+    // An auth outage is provider health, not a stale thread id, even when the
+    // provider phrases it with the word "session".
+    expect(
+      classifyAgentFailure({ status: 'failed', error: 'your session has expired, log in again' }),
+    ).toBe('unavailable');
+    expect(classifyAgentFailure({ status: 'failed', error: 'not logged in' })).toBe('unavailable');
+    // A resume failure keeps the cheap same-provider retry even when the
+    // provider decorates it with an authorization word: only the unambiguous
+    // login signals above are allowed to settle as provider health.
+    expect(
+      classifyAgentFailure({ status: 'failed', error: 'session not found: unauthorized' }),
+    ).toBe('session_invalid');
   });
 });

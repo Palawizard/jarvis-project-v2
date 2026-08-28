@@ -13,7 +13,19 @@ export interface VisualQaPlan {
   scenarios: VisualQaScenario[];
   /** Deterministic `<changed file> -> <surface>` lines; never model-authored. */
   reasons: string[];
-  fixtures: VisualFixtureProfile[];
+  /**
+   * Bounded fixture identifiers. Implementations live in the candidate runtime,
+   * so this is deliberately not narrowed to the profiles this parent knows.
+   */
+  fixtures: string[];
+  /** Who mapped the diff onto surfaces. */
+  plannerSource?: 'parent' | 'candidate_catalog';
+  /** Exact validated candidate HEAD a committed catalog plan is bound to. */
+  plannerHead?: string;
+  /** Version and immutable identities of the catalog blob read from that HEAD. */
+  catalogVersion?: number;
+  catalogBlobSha?: string;
+  catalogDigest?: string;
 }
 
 interface SelfSurface {
@@ -151,6 +163,13 @@ export function mapChangedFilesToSurfaces(
   };
 }
 
+/** Deduplicated fixture profiles a scenario set asks the candidate runtime for. */
+export function planFixtures(scenarios: VisualQaScenario[]): string[] {
+  return [
+    ...new Set(scenarios.flatMap((scenario) => (scenario.fixture ? [scenario.fixture] : []))),
+  ];
+}
+
 function projectDefaultScenarios(project: Project): VisualQaScenario[] {
   const visual = project.config.visualQa;
   if (!visual) return [];
@@ -187,12 +206,11 @@ export function resolveVisualPlan(
     required?: boolean,
   ): VisualQaPlan => ({
     source,
+    plannerSource: 'parent',
     ...(required === undefined ? {} : { required }),
     scenarios,
     reasons,
-    fixtures: [
-      ...new Set(scenarios.flatMap((scenario) => (scenario.fixture ? [scenario.fixture] : []))),
-    ] as VisualFixtureProfile[],
+    fixtures: planFixtures(scenarios),
   });
 
   if (job.visualQaConfig) {

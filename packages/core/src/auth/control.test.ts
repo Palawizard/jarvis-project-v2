@@ -27,6 +27,25 @@ describe('human control authentication', () => {
     expect(auth.authenticated(credential ?? undefined)).toBe(false);
     db.close();
   });
+
+  // What `pnpm repair-pairing` sells: a home whose browser credential is gone
+  // can be paired again from the terminal, and the lost credential stays dead.
+  it('lets a revoked home pair again without reviving the old credential', () => {
+    const db = openDb(loadConfig({ dbPath: ':memory:' }));
+    const auth = new HumanControlAuth(db);
+    const first = auth.pair(auth.createBootstrap());
+    expect(auth.paired()).toBe(true);
+
+    auth.revoke();
+    expect(auth.paired()).toBe(false);
+
+    const second = auth.pair(auth.createBootstrap());
+    expect(second).not.toBeNull();
+    expect(second).not.toBe(first);
+    expect(auth.authenticated(second ?? undefined)).toBe(true);
+    expect(auth.authenticated(first ?? undefined)).toBe(false);
+    db.close();
+  });
 });
 
 describe('candidate-runtime Visual QA control', () => {

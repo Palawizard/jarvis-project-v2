@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "name": "command",
+      "matchers": [{ "prefix": "apps/web/src/views/Command" }],
+      "route": "/",
+      "expectedSelector": "[data-testid='command-view']",
+      "viewports": ["desktop", "mobile"]
+    },
+    {
+      "name": "projects",
+      "matchers": [{ "prefix": "apps/web/src/views/Projects" }],
+      "route": "/",
+      "expectedSelector": "[data-testid='projects-view']",
+      "viewports": ["desktop", "mobile"],
+      "interactions": [
+        { "action": "click", "selector": "[data-testid='nav-projects']" },
+        { "action": "wait", "selector": "[data-testid='projects-view']" }
+      ]
+    },
+    {
+      "name": "jobs-list",
+      "matchers": [{ "exact": "apps/web/src/views/Jobs.tsx" }],
+      "route": "/",
+      "expectedSelector": "[data-testid='jobs-view']",
+      "viewports": ["desktop", "mobile"],
+      "interactions": [
+        { "action": "click", "selector": "[data-testid='nav-jobs']" },
+        { "action": "wait", "selector": "[data-testid='jobs-view']" }
+      ]
+    },
+    {
+      "name": "job-detail-paused",
+      "matchers": [{ "prefix": "apps/web/src/views/JobDetail" }],
+      "route": "/",
+      "expectedSelector": "[data-testid='pause-explanation']",
+      "viewports": ["desktop", "mobile"],
+      "fixture": "paused-job",
+      "interactions": [
+        { "action": "click", "selector": "[data-testid='nav-jobs']" },
+        { "action": "wait", "selector": "[data-testid='jobs-view']" },
+        { "action": "click", "selector": "[data-testid='job-row-job_qafixture_paused']" },
+        { "action": "wait", "selector": "[data-testid='job-detail-view']" },
+        { "action": "wait", "selector": "[data-testid='resume-job']" },
+        { "action": "wait", "selector": "[data-testid='pause-explanation']" }
+      ]
+    },
+    {
+      "name": "memory",
+      "matchers": [{ "prefix": "apps/web/src/views/Memory" }],
+      "route": "/",
+      "expectedSelector": "[data-testid='memory-view']",
+      "viewports": ["desktop", "mobile"],
+      "interactions": [
+        { "action": "click", "selector": "[data-testid='nav-memory']" },
+        { "action": "wait", "selector": "[data-testid='memory-view']" }
+      ]
+    },
+    {
+      "name": "tools",
+      "matchers": [{ "prefix": "apps/web/src/views/Tools" }],
+      "route": "/",
+      "expectedSelector": "[data-testid='tools-view']",
+      "viewports": ["desktop", "mobile"],
+      "interactions": [
+        { "action": "click", "selector": "[data-testid='nav-tools']" },
+        { "action": "wait", "selector": "[data-testid='tools-view']" }
+      ]
+    }
+  ],
+  "globalSmoke": [
+    {
+      "matchers": [
+        { "exact": "apps/web/src/App.tsx" },
+        { "exact": "apps/web/src/main.tsx" },
+        { "exact": "apps/web/src/components.tsx" },
+        { "exact": "apps/web/src/styles.css" },
+        { "exact": "apps/web/src/index.css" },
+        { "exact": "apps/web/index.html" },
+        { "exact": "apps/web/src/api.ts" },
+        { "exact": "apps/web/src/hooks.ts" },
+        { "exact": "apps/web/vite.config.ts" },
+        { "exact": "apps/web/package.json" },
+        { "exact": "apps/web/tsconfig.json" }
+      ],
+      "scenarios": ["command", "jobs-list", "job-detail-paused", "tools"]
+    }
+  ]
+}

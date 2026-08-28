@@ -78,6 +78,61 @@ const SUPERVISOR_OWNED_ENV = new Set([
  * docs/self-development-and-visual-qa.md.
  */
 const TRUST_BOUNDARY_FILES = ['supervisor.mjs', 'dev.mjs', 'windows-job-runner.ps1'];
+const DISABLED_GIT_HOOKS = path.join(os.tmpdir(), `.jarvis-no-git-hooks-${randomUUID()}`);
+// Git refuses NUL and /dev/null as an exclude file, so point it at a path that
+// simply does not exist: a missing excludes file contributes no patterns.
+const DISABLED_GIT_EXCLUDES = path.join(os.tmpdir(), `.jarvis-no-git-excludes-${randomUUID()}`);
+const NULL_DEVICE = process.platform === 'win32' ? 'NUL' : '/dev/null';
+/**
+ * Git's empty tree: as an attribute source it means no worktree `.gitattributes`
+ * can bind a `filter` driver for that invocation. Reads only -- `merge` and
+ * `reset` need real attributes, and they already pin a specific commit instead.
+ * Requires Git >= 2.40 and a SHA-1 repository, both of which activation already
+ * fails closed on if absent.
+ */
+const NO_TREE_ATTRIBUTES = '--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+function trustedGitArgs(repo, args) {
+  return [
+    '--no-replace-objects',
+    '--no-pager',
+    `--work-tree=${fs.realpathSync(repo)}`,
+    '-c',
+    'core.bare=false',
+    '-c',
+    'core.fsmonitor=false',
+    '-c',
+    'status.showUntrackedFiles=all',
+    '-c',
+    `core.hooksPath=${DISABLED_GIT_HOOKS}`,
+    '-c',
+    `core.attributesFile=${NULL_DEVICE}`,
+    // Untracked work hidden from status is unreviewed work, and a candidate
+    // build can write this config. `info/exclude` has no switch and is probed
+    // by hiddenExcludedFiles instead.
+    '-c',
+    `core.excludesFile=${DISABLED_GIT_EXCLUDES}`,
+    ...args,
+  ];
+}
+
+/**
+ * A `filter` attribute makes Git execute a configured driver, and the candidate
+ * build can write `.git/config` in the live repository. Inheriting this
+ * process's environment would hand that driver the operator's whole shell, so
+ * Git gets the same allowlist every other untrusted command gets. The allowlist
+ * carries no `GIT_*`, which also drops `GIT_ATTR_SOURCE` and friends.
+ */
+function trustedGitEnv() {
+  return {
+    ...untrustedEnv(),
+    GIT_TERMINAL_PROMPT: '0',
+    // The system attributes file is the one source `core.attributesFile` cannot
+    // disable. It needs administrator rights to write, but claiming every
+    // source is closed should be true rather than nearly true.
+    GIT_ATTR_NOSYSTEM: '1',
+  };
+}
 
 function untrustedEnv(extra = {}) {
   const env = {};
@@ -131,22 +186,182 @@ function signedEvidence(evidence, privateKey) {
   };
 }
 
+function gitRaw(repo, args, input) {
+  // eslint-disable-next-line no-restricted-syntax -- this is the supervisor's own copy of the trusted shape
+  return execFileSync('git', trustedGitArgs(repo, args), {
+    cwd: repo,
+    env: trustedGitEnv(),
+    input,
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+}
+
 function git(repo, args) {
-  return clean(
-    execFileSync('git', args, {
-      cwd: repo,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    }),
+  return clean(gitRaw(repo, args).toString('utf8'));
+}
+
+function rejectCheckoutFilters(repo, sha) {
+  const paths = gitRaw(repo, ['ls-tree', '-r', '-z', '--name-only', sha]);
+  const attributes = gitRaw(
+    repo,
+    [`--attr-source=${sha}`, 'check-attr', '-z', '--stdin', 'filter'],
+    paths,
+  )
+    .toString('utf8')
+    .split('\0');
+  for (let index = 0; index + 2 < attributes.length; index += 3) {
+    const [file, , value] = attributes.slice(index, index + 3);
+    if (value !== 'unspecified' && value !== 'unset') {
+      throw new Error(`checkout filter is prohibited for ${file}`);
+    }
+  }
+}
+
+function infoAttributes(repo) {
+  const commonDir = git(repo, ['rev-parse', '--git-common-dir']);
+  return path.join(path.resolve(repo, commonDir), 'info', 'attributes');
+}
+
+function rejectSharedAttributes(repo) {
+  if (fs.existsSync(infoAttributes(repo))) {
+    throw new Error('shared Git info attributes are prohibited during activation');
+  }
+}
+
+function quarantineSharedAttributes(repo, destination) {
+  const source = infoAttributes(repo);
+  if (fs.existsSync(source)) fs.renameSync(source, destination);
+}
+
+function infoExclude(repo) {
+  const commonDir = git(repo, ['rev-parse', '--git-common-dir']);
+  return path.join(path.resolve(repo, commonDir), 'info', 'exclude');
+}
+
+/**
+ * Preflight requires a clean tree and `clean` refuses concealed files, so
+ * anything `info/exclude` is hiding by the time the build has run was planted
+ * by that build. Move the concealment and what it concealed aside, so the
+ * candidate's own residue cannot block a rollback that is still possible.
+ * Files are renamed into the quarantine, never deleted.
+ */
+function quarantinePlantedExcludes(repo, request) {
+  const hidden = hiddenExcludedFiles(repo);
+  if (hidden.length === 0) return;
+  const source = infoExclude(repo);
+  if (fs.existsSync(source)) {
+    fs.renameSync(source, `${request.resultPath}.${randomUUID()}.candidate-info-exclude`);
+  }
+  const root = path.resolve(repo);
+  for (const file of hidden) {
+    const from = path.resolve(root, file);
+    // Never follow a concealed path back out of the repository.
+    if (from !== root && !from.startsWith(root + path.sep)) continue;
+    if (!fs.existsSync(from)) continue;
+    fs.renameSync(from, `${request.resultPath}.${randomUUID()}.candidate-hidden-file`);
+  }
+  const remaining = hiddenExcludedFiles(repo);
+  if (remaining.length > 0) {
+    throw new Error(`concealed candidate files remain: ${remaining.join(', ')}`);
+  }
+}
+
+/**
+ * Build commands run candidate-authored code. `core.attributesFile` only
+ * neutralises the *global* attributes file, so a build that writes
+ * `.git/info/attributes` can still bind a `required` filter driver to a tracked
+ * path and make every later `git status` fatal -- or execute the driver.
+ * Preflight rejects a pre-existing file, so anything here was planted by the
+ * build and is quarantined before the next Git command reads it.
+ */
+function quarantinePlantedAttributes(repo, request, { bestEffort = false } = {}) {
+  try {
+    quarantineSharedAttributes(
+      repo,
+      `${request.resultPath}.${randomUUID()}.candidate-info-attributes`,
+    );
+    // Same residue, different lever: a build can also hide what it planted from
+    // every clean-tree check by writing `info/exclude`.
+    quarantinePlantedExcludes(repo, request);
+    // A rename that silently failed to remove the file would otherwise bless an
+    // activation that leaves candidate-controlled attributes in the live repo.
+    rejectSharedAttributes(repo);
+  } catch (error) {
+    // Only the activation catch tolerates this: it runs before the guarded state
+    // read, so a repository too broken to locate its own Git directory must
+    // still reach that read rather than throw out of the failure path.
+    if (!bestEffort) throw error;
+  }
+}
+
+/**
+ * Reading repository state must never throw out of the activation failure path:
+ * losing the exception there would kill the supervisor with the transaction
+ * still marked processing and no signed evidence written at all.
+ */
+function safeState(repo) {
+  try {
+    return state(repo);
+  } catch (error) {
+    return {
+      head: null,
+      branch: null,
+      clean: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Untracked files a candidate build hid behind `<git-common-dir>/info/exclude`.
+ * `.gitignore` is tracked so hiding work there changes a reviewed diff, but
+ * `info/exclude` is neither tracked nor per-worktree and Git offers no switch
+ * to disable it. Apply its patterns deliberately to see what they conceal.
+ */
+function hiddenExcludedFiles(repo) {
+  const exclude = path.resolve(
+    repo,
+    git(repo, ['rev-parse', '--git-common-dir']),
+    'info',
+    'exclude',
   );
+  let contents;
+  try {
+    contents = fs.readFileSync(exclude, 'utf8');
+  } catch {
+    return [];
+  }
+  const patterns = contents
+    .split(/\r?\n/)
+    .some((line) => line.trim() !== '' && !line.trim().startsWith('#'));
+  if (!patterns) return [];
+  return git(repo, [
+    NO_TREE_ATTRIBUTES,
+    'ls-files',
+    '--others',
+    '--ignored',
+    `--exclude-from=${exclude}`,
+  ])
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 function state(repo) {
+  // `--work-tree` is pinned to `repo` by trustedGitArgs, so every read below
+  // describes the registered checkout even when a candidate build left a
+  // `core.worktree` pointing at a clean decoy.
   return {
     head: git(repo, ['rev-parse', 'HEAD']),
     branch: git(repo, ['symbolic-ref', '--short', 'HEAD']),
-    clean: git(repo, ['status', '--porcelain', '--untracked-files=normal']) === '',
+    // Runs immediately after the candidate build, whose code executes with this
+    // repository as its cwd: it must not be able to bind a driver to this read,
+    // nor hide what it left behind from it.
+    clean:
+      git(repo, [NO_TREE_ATTRIBUTES, 'status', '--porcelain=v1', '--untracked-files=all']) === '' &&
+      hiddenExcludedFiles(repo).length === 0,
   };
 }
 
@@ -228,8 +443,11 @@ function trustBoundaryDigest(repo) {
 function loadConfig(file) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
   const repo = fs.realpathSync(raw.repository);
-  const root = fs.realpathSync(git(repo, ['rev-parse', '--show-toplevel']));
-  if (root !== repo) throw new Error(`repository must be the Git root: ${root}`);
+  // Asking Git would only echo the pinned `--work-tree` back. A registered
+  // checkout is the directory that actually holds the `.git` entry.
+  if (!fs.existsSync(path.join(repo, '.git'))) {
+    throw new Error(`repository must be the Git root: ${repo}`);
+  }
   if (!/^[0-9a-f]{64}$/.test(raw.activationTokenHash ?? '')) {
     throw new Error('activationTokenHash must be a lowercase SHA-256 hash');
   }
@@ -312,6 +530,7 @@ function validateRequest(raw, config) {
 }
 
 function preflight(request) {
+  rejectSharedAttributes(request.repository);
   const current = state(request.repository);
   if (!current.clean) throw new Error('target repository is dirty');
   if (current.branch !== request.branch) {
@@ -336,6 +555,8 @@ function preflight(request) {
   } catch {
     throw new Error('candidate does not fast-forward from the expected current SHA');
   }
+  rejectCheckoutFilters(request.repository, request.previousSha);
+  rejectCheckoutFilters(request.repository, request.candidateSha);
   return current;
 }
 
@@ -708,9 +929,16 @@ async function activate(config, request, currentChild) {
   let child = null;
   try {
     preflight(request); // Close the approval-to-mutation TOCTOU window.
-    git(config.repository, ['merge', '--ff-only', '--no-edit', request.candidateSha]);
+    git(config.repository, [
+      `--attr-source=${request.candidateSha}`,
+      'merge',
+      '--ff-only',
+      '--no-edit',
+      request.candidateSha,
+    ]);
     requireState(config.repository, request.candidateSha);
     evidence.build = await runBuild(runtime);
+    quarantinePlantedAttributes(config.repository, request);
     requireState(config.repository, request.candidateSha);
     const started = await startHealthy(runtime, request.candidateSha);
     child = started.child;
@@ -740,14 +968,24 @@ async function activate(config, request, currentChild) {
     evidence.activationError = error instanceof Error ? error.message : String(error);
     await stopChild(child);
     child = null;
-    const failedState = state(config.repository);
+    // Before reading state, not after: a build that planted attributes and then
+    // failed would otherwise make this very read fatal and block a rollback
+    // that is actually still possible.
+    quarantinePlantedAttributes(config.repository, request, { bestEffort: true });
+    const failedState = safeState(config.repository);
 
     if (failedState.clean && failedState.head === request.candidateSha) {
       evidence.rollbackStartedAt = new Date().toISOString();
       try {
-        git(config.repository, ['reset', '--hard', request.previousSha]);
+        git(config.repository, [
+          `--attr-source=${request.previousSha}`,
+          'reset',
+          '--hard',
+          request.previousSha,
+        ]);
         requireState(config.repository, request.previousSha);
         evidence.rollbackBuild = await runBuild(runtime);
+        quarantinePlantedAttributes(config.repository, request);
         requireState(config.repository, request.previousSha);
         const restarted = await startHealthy(runtime, request.previousSha);
         child = restarted.child;
@@ -769,7 +1007,7 @@ async function activate(config, request, currentChild) {
             ...evidence,
             status: 'rollback_failed',
             error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
-            headAfter: state(config.repository).head,
+            headAfter: safeState(config.repository).head,
             finishedAt: new Date().toISOString(),
           },
         };
@@ -801,7 +1039,7 @@ async function activate(config, request, currentChild) {
       evidence: {
         ...evidence,
         status: 'rollback_blocked',
-        error: `rollback requires clean HEAD ${request.candidateSha}; found ${failedState.head}, clean=${failedState.clean}`,
+        error: `rollback requires clean HEAD ${request.candidateSha}; found ${failedState.head}, clean=${failedState.clean}${failedState.error ? `: ${failedState.error}` : ''}`,
         headAfter: failedState.head,
         finishedAt: new Date().toISOString(),
       },

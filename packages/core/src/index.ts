@@ -125,8 +125,15 @@ export {
   FIXTURE_PAUSED_JOB_ID,
   selfSurfaceScenario,
   type VisualQaPlan,
+  planFixtures,
   type VisualFixtureProfile,
 } from './visualqa/surfaces.js';
+export {
+  resolveVisualPlanForCandidate,
+  validateCatalog,
+  VisualQaPlanningError,
+  VISUAL_QA_CATALOG_PATH,
+} from './visualqa/candidate-plan.js';
 export {
   startCandidateRuntime,
   CandidateRuntimeUnsupportedError,

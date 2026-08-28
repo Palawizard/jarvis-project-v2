@@ -35,6 +35,13 @@ export interface VisualQaScenario {
   name: string;
   route: string;
   interactions?: VisualInteraction[];
+  /**
+   * Real setup steps for a viewport that exposes a different navigation
+   * affordance (a mobile drawer instead of a visible sidebar). Same bounded
+   * DSL as `interactions`; it replaces them for that viewport, never adds
+   * scripting authority.
+   */
+  viewportInteractions?: Partial<Record<'desktop' | 'mobile', VisualInteraction[]>>;
   viewports?: ('desktop' | 'mobile')[];
   /**
    * Selector that proves the intended surface actually rendered. Failing to
@@ -43,8 +50,13 @@ export interface VisualQaScenario {
   expectedSelector?: string;
   /** Bound for the expected-selector wait, like any other declared wait. */
   expectedSelectorTimeoutMs?: number;
-  /** Candidate-only fixture state this scenario needs to exist at all. */
-  fixture?: 'paused-job';
+  /**
+   * Candidate-only fixture state this scenario needs to exist at all. A bounded
+   * identifier, never a path or a command: the implementation lives inside the
+   * candidate runtime, so a newer candidate may name a profile this parent has
+   * never heard of. An unknown name is simply not seeded.
+   */
+  fixture?: string;
 }
 
 export interface VerificationStep {

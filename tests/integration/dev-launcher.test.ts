@@ -12,6 +12,7 @@ import {
   mintActivationToken,
   preservedRuntimeEnv,
   readyBanner,
+  repositoryClean,
   repositoryRoot,
   supervisorConfig,
 } from '../../scripts/dev.mjs';
@@ -161,6 +162,50 @@ function gitRoot(): string {
 }
 
 describe('pnpm dev supervisor bootstrap', () => {
+  it('ignores executable fsmonitor residue before the supervisor starts', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-dev-poison-'));
+    temporary.push(root);
+    const marker = path.join(root, 'fsmonitor-ran');
+    const monitor = path.join(root, 'fsmonitor.mjs');
+    fs.writeFileSync(
+      monitor,
+      `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'yes'); process.stdout.write('0\\0');\n`,
+    );
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root });
+    execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: root });
+    fs.writeFileSync(path.join(root, 'tracked.txt'), 'safe\n');
+    execFileSync('git', ['add', '.'], { cwd: root });
+    execFileSync('git', ['commit', '-qm', 'base'], { cwd: root });
+    execFileSync('git', ['config', 'core.fsmonitor', `node ${JSON.stringify(monitor)}`], {
+      cwd: root,
+    });
+
+    expect(repositoryClean(root)).toBe(true);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('checks the registered checkout instead of a configured worktree decoy', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-dev-worktree-'));
+    temporary.push(root);
+    const decoy = path.join(root, 'decoy');
+    fs.mkdirSync(decoy);
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root });
+    execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: root });
+    fs.writeFileSync(path.join(root, 'tracked.txt'), 'safe\n');
+    execFileSync('git', ['add', 'tracked.txt'], { cwd: root });
+    execFileSync('git', ['commit', '-qm', 'base'], { cwd: root });
+    // The decoy must look like a clean checkout of the same commit, otherwise
+    // Git reports the tracked file as deleted and the assertion below passes
+    // whether or not the work tree is actually pinned.
+    fs.copyFileSync(path.join(root, 'tracked.txt'), path.join(decoy, 'tracked.txt'));
+    execFileSync('git', ['config', 'core.worktree', decoy], { cwd: root });
+    fs.writeFileSync(path.join(root, 'unreviewed.txt'), 'dirty\n');
+
+    expect(repositoryClean(root)).toBe(false);
+  });
+
   it('mints a fresh 32-byte activation token and publishes only its hash', () => {
     const first = mintActivationToken();
     const second = mintActivationToken();

@@ -17,7 +17,7 @@
  * also forced for candidate runtimes, which must never bootstrap a supervisor.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -88,9 +88,79 @@ export function mintActivationToken() {
   return { token, hash: createHash('sha256').update(token, 'utf8').digest('hex') };
 }
 
+/** Platform only: no provider keys, no control tokens, no `GIT_*` overrides. */
+const GIT_ENV_ALLOWLIST = [
+  'PATH',
+  'Path',
+  'PATHEXT',
+  'SystemRoot',
+  'SYSTEMROOT',
+  'WINDIR',
+  'ComSpec',
+  'COMSPEC',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'HOME',
+  'USERPROFILE',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'PROGRAMDATA',
+  'ProgramFiles',
+  'ProgramFiles(x86)',
+];
+
+function gitEnv() {
+  const env = { GIT_TERMINAL_PROMPT: '0', GIT_ATTR_NOSYSTEM: '1' };
+  for (const name of GIT_ENV_ALLOWLIST) {
+    if (process.env[name] !== undefined) env[name] = process.env[name];
+  }
+  return env;
+}
+
+const DISABLED_GIT_HOOKS = path.join(os.tmpdir(), `.jarvis-no-git-hooks-${randomUUID()}`);
+// Git refuses NUL and /dev/null as an exclude file, so point it at a path that
+// simply does not exist: a missing excludes file contributes no patterns.
+const DISABLED_GIT_EXCLUDES = path.join(os.tmpdir(), `.jarvis-no-git-excludes-${randomUUID()}`);
+const NULL_DEVICE = process.platform === 'win32' ? 'NUL' : '/dev/null';
+const NO_TREE_ATTRIBUTES = '--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+function trustedGitArgs(cwd, args) {
+  return [
+    '--no-replace-objects',
+    `--work-tree=${fs.realpathSync(path.resolve(cwd))}`,
+    '-c',
+    'core.bare=false',
+    '-c',
+    'core.fsmonitor=false',
+    '-c',
+    'status.showUntrackedFiles=all',
+    '-c',
+    `core.hooksPath=${DISABLED_GIT_HOOKS}`,
+    '-c',
+    `core.attributesFile=${NULL_DEVICE}`,
+    // Untracked work hidden from status is unreviewed work, and a failed
+    // activation can leave this config behind. `info/exclude` has no switch and
+    // is probed by hiddenExcludedFiles instead.
+    '-c',
+    `core.excludesFile=${DISABLED_GIT_EXCLUDES}`,
+    NO_TREE_ATTRIBUTES,
+    ...args,
+  ];
+}
+
+/**
+ * A failed activation can leave a candidate build's `.gitattributes` and
+ * `filter.*` config behind in the repository, and this runs before anything has
+ * cleaned up. Resolve attributes against the empty tree so no driver is bound,
+ * and hand Git the same allowlist untrusted commands get rather than the
+ * operator's shell, so a driver that does run somewhere learns nothing.
+ */
 function gitOut(cwd, args) {
-  return execFileSync('git', args, {
+  // eslint-disable-next-line no-restricted-syntax -- this is the launcher's own copy of the trusted shape
+  return execFileSync('git', trustedGitArgs(cwd, args), {
     cwd,
+    env: gitEnv(),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
@@ -98,7 +168,52 @@ function gitOut(cwd, args) {
 }
 
 export function repositoryRoot(from = path.resolve(scriptsDir, '..')) {
-  return fs.realpathSync(gitOut(from, ['rev-parse', '--show-toplevel']));
+  // Asking Git would only echo the pinned `--work-tree` back. Walk up to the
+  // directory that actually holds the `.git` entry instead.
+  let current = path.resolve(from);
+  for (;;) {
+    if (fs.existsSync(path.join(current, '.git'))) return fs.realpathSync(current);
+    const parent = path.dirname(current);
+    if (parent === current) throw new Error(`not a Git repository: ${from}`);
+    current = parent;
+  }
+}
+
+/**
+ * Untracked files hidden behind `<git-common-dir>/info/exclude`. `.gitignore`
+ * is tracked so hiding work there changes a reviewed diff, but `info/exclude`
+ * is neither tracked nor per-worktree and Git offers no switch to disable it.
+ * Apply its patterns deliberately to see what they conceal.
+ */
+function hiddenExcludedFiles(repository) {
+  const exclude = path.resolve(
+    repository,
+    gitOut(repository, ['rev-parse', '--git-common-dir']),
+    'info',
+    'exclude',
+  );
+  let contents;
+  try {
+    contents = fs.readFileSync(exclude, 'utf8');
+  } catch {
+    return [];
+  }
+  const patterns = contents
+    .split(/\r?\n/)
+    .some((line) => line.trim() !== '' && !line.trim().startsWith('#'));
+  if (!patterns) return [];
+  return gitOut(repository, ['ls-files', '--others', '--ignored', `--exclude-from=${exclude}`])
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+export function repositoryClean(repository) {
+  // `--work-tree` is pinned to `repository` by trustedGitArgs, so this status
+  // describes the registered checkout even when a candidate left a
+  // `core.worktree` pointing somewhere clean.
+  if (hiddenExcludedFiles(repository).length > 0) return false;
+  return gitOut(repository, ['status', '--porcelain', '--untracked-files=normal']) === '';
 }
 
 export function supervisorConfig({ repository, sessionDir, activationTokenHash, apiPort, env }) {
@@ -278,17 +393,13 @@ function unsupervised(apiPort, webPort) {
 async function supervised(apiPort, webPort) {
   const repository = repositoryRoot();
   try {
-    execFileSync('git', ['symbolic-ref', '--quiet', 'HEAD'], {
-      cwd: repository,
-      stdio: 'ignore',
-      windowsHide: true,
-    });
+    gitOut(repository, ['symbolic-ref', '--quiet', 'HEAD']);
   } catch {
     throw new Error(`${repository} has a detached HEAD; check out a branch first`);
   }
   // Dirty is fine for development — activation is where it fails closed — but
   // say so now rather than at the end of a self-upgrade.
-  if (gitOut(repository, ['status', '--porcelain', '--untracked-files=normal'])) {
+  if (!repositoryClean(repository)) {
     process.stdout.write('\n  Note: this checkout is dirty; self-upgrade will refuse to run.\n');
   }
   await requireFreePort('API', apiPort);

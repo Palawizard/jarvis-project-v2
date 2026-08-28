@@ -25,7 +25,8 @@
     "test:all": "vitest run --configLoader runner",
     "test:e2e": "pnpm build && playwright test",
     "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:all && pnpm build && playwright test",
-    "verify:full": "pnpm verify"
+    "verify:full": "pnpm verify",
+    "repair-pairing": "node scripts/repair-pairing.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

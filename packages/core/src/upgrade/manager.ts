@@ -1,4 +1,3 @@
-import { execFile, execFileSync } from 'node:child_process';
 import {
   createHash,
   generateKeyPairSync,
@@ -8,18 +7,21 @@ import {
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
-import { promisify } from 'node:util';
 import type { CandidateApplicationService } from '../application/service.js';
 import type { JarvisConfig } from '../config.js';
 import type { Db } from '../db/index.js';
 import type { EventBus } from '../events/bus.js';
-import { GitWorkspace, repoStatus } from '../git/workspace.js';
+import {
+  GitWorkspace,
+  NO_TREE_ATTRIBUTES,
+  repoStatus,
+  trustedGitAsync,
+  trustedGitSync,
+} from '../git/workspace.js';
 import { newId, nowIso } from '../ids.js';
 import type { JobService } from '../jobs/service.js';
 import type { ProjectService } from '../projects/service.js';
 import { startCandidateRuntime } from '../runtime/candidate.js';
-
-const exec = promisify(execFile);
 
 export type UpgradeStatus =
   | 'planned'
@@ -145,6 +147,7 @@ export class UpgradeManager {
         cwd: job.worktreePath,
         jobId: `${jobId}-upgrade-preflight`,
         config: this.config,
+        expectedCommit: application.candidateHead,
       });
       await this.git.validateCandidate(
         job.worktreePath,
@@ -561,18 +564,21 @@ function stableJson(value: unknown): string {
 
 function exactRepositoryState(repository: string, branch: string, head: string): boolean {
   try {
-    const currentHead = execFileSync('git', ['rev-parse', 'HEAD'], {
-      cwd: repository,
-      encoding: 'utf8',
-    }).trim();
-    const currentBranch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], {
-      cwd: repository,
-      encoding: 'utf8',
-    }).trim();
-    const dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=normal'], {
-      cwd: repository,
-      encoding: 'utf8',
-    }).trim();
+    const currentHead = trustedGitSync(repository, ['rev-parse', 'HEAD']).toString('utf8').trim();
+    const currentBranch = trustedGitSync(repository, ['symbolic-ref', '--short', 'HEAD'])
+      .toString('utf8')
+      .trim();
+    // Runs in the live repository right after the supervisor moved it to the
+    // candidate SHA, so no worktree `.gitattributes` may bind a filter driver
+    // to it. The supervisor's own `requireState` guards the same way, earlier.
+    const dirty = trustedGitSync(repository, [
+      NO_TREE_ATTRIBUTES,
+      'status',
+      '--porcelain',
+      '--untracked-files=normal',
+    ])
+      .toString('utf8')
+      .trim();
     return currentHead === head && currentBranch === branch && dirty === '';
   } catch {
     return false;
@@ -580,8 +586,7 @@ function exactRepositoryState(repository: string, branch: string, head: string):
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await exec('git', args, { cwd, maxBuffer: 4 * 1024 * 1024 });
-  return stdout.trim();
+  return trustedGitAsync(cwd, args, 4 * 1024 * 1024);
 }
 
 function rowToUpgrade(row: Row): UpgradeTransaction {

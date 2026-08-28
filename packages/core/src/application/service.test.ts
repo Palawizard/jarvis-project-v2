@@ -381,6 +381,37 @@ describe('approval validates the persisted visual QA plan', () => {
     expect(approved.candidateHead).toBe(prepared.head);
   });
 
+  it('approves an explicit no-evidence-required plan with no captures at all', async () => {
+    // A self candidate that changes no rendered UI persists an empty plan
+    // recording required:false; approval must read that instead of inheriting
+    // the project's standing required:true and demanding a visualHead.
+    const prepared = await candidate();
+    projectDefaults();
+    setPlan(prepared.job.id, {
+      source: 'changed_surface',
+      plannerSource: 'candidate_catalog',
+      plannerHead: prepared.head,
+      required: false,
+      scenarios: [],
+      reasons: ['no changed rendered self UI'],
+      fixtures: [],
+    });
+
+    const approved = await service.approve(prepared.job.id);
+    expect(approved.status).toBe('approved');
+    expect(jobs.get(prepared.job.id)?.visualHead).toBeNull();
+  });
+
+  it('still rejects an empty scenario list while evidence is required', async () => {
+    const prepared = await candidate();
+    projectDefaults();
+    jobs.patch(prepared.job.id, { visualHead: prepared.head });
+    setPlan(prepared.job.id, { source: 'changed_surface', required: true, scenarios: [] });
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(
+      'persisted visual QA plan is malformed',
+    );
+  });
+
   it('A: rejects when only project-default evidence exists for a planned job', async () => {
     const prepared = await candidate();
     projectDefaults();

@@ -3,6 +3,7 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     globals: false,
+    maxWorkers: 1,
     // Unit tests are fast and isolated; integration tests touch the filesystem,
     // git and (optionally) real agent CLIs, so they run serially and separately.
     projects: [
@@ -21,8 +22,10 @@ export default defineConfig({
           name: 'integration',
           include: ['tests/integration/**/*.test.ts'],
           environment: 'node',
-          testTimeout: 180_000,
-          hookTimeout: 180_000,
+          // Must stay above the supervisor suite's own deadline, or vitest
+          // kills the test before that deadline can report what went wrong.
+          testTimeout: 420_000,
+          hookTimeout: 420_000,
           fileParallelism: false,
         },
       },

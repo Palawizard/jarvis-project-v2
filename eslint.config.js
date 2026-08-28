@@ -75,4 +75,31 @@ export default tseslint.config(
     files: ['**/*.test.ts', 'scripts/**/*.mjs', 'tests/**/*.ts'],
     rules: { 'no-console': 'off', '@typescript-eslint/no-explicit-any': 'off' },
   },
+  {
+    /**
+     * Spawning Git is a trust boundary: a `filter` attribute makes Git execute
+     * a configured driver, and a candidate can write both the attribute and the
+     * driver. Three consecutive reviews found this hazard re-introduced by a
+     * caller that built its own invocation, so the shape is enforced here
+     * instead of being remembered. `git/workspace.ts` defines it; the launcher
+     * and supervisor run before it is importable and carry their own copies,
+     * so `scripts/**` is covered too and each copy carries a single explicit
+     * exemption at the one line that actually spawns Git.
+     */
+    files: ['packages/**/*.ts', 'apps/**/*.{ts,tsx}', 'scripts/**/*.mjs'],
+    ignores: ['packages/core/src/git/workspace.ts', '**/*.test.ts', '**/*.test.tsx', '**/dist/**'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          // Both callee shapes: a bare `execFileSync('git', …)` and a member
+          // call such as `cp.execFileSync('git', …)` or `child_process.spawn`.
+          selector:
+            "CallExpression:matches([callee.name=/^(exec|execSync|execFile|execFileSync|spawn|spawnSync)$/], [callee.property.name=/^(exec|execSync|execFile|execFileSync|spawn|spawnSync)$/]) > Literal[value='git']",
+          message:
+            'Spawn Git through trustedGitSync (or the helpers in git/workspace.ts): they apply the trusted arguments and the sanitized environment together.',
+        },
+      ],
+    },
+  },
 );

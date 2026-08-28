@@ -101,6 +101,59 @@ describe('deterministic visual interactions', () => {
     }
   });
 
+  it('runs the declared per-viewport interactions instead of the shared ones', async () => {
+    // Mobile hides the sidebar behind a real drawer, exactly as a candidate UI
+    // may. Clicking the desktop nav on mobile would time out, so the two paths
+    // must be declared separately rather than forced through hidden elements.
+    const server = http.createServer((_request, response) => {
+      response.setHeader('content-type', 'text/html');
+      response.end(
+        `<!doctype html><style>@media (max-width: 800px){#desktop-nav{display:none}}</style>` +
+          `<button id="desktop-nav" onclick="document.body.dataset.view='jobs'">Jobs</button>` +
+          `<button id="drawer-open" onclick="document.body.dataset.drawer='open'">Menu</button>` +
+          // A zero-size element is never "visible" to Playwright, so the drawer
+          // needs real extent for the wait step to mean what it says.
+          `<div id="drawer" style="display:none;width:200px;height:60px">Navigation</div>` +
+          `<button id="mobile-nav" onclick="document.body.dataset.view='jobs'">Jobs</button>` +
+          `<script>new MutationObserver(()=>{if(document.body.dataset.drawer==='open')` +
+          `document.getElementById('drawer').style.display='block'}).observe(document.body,{attributes:true})</script>`,
+      );
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test server did not bind');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-visual-'));
+    roots.push(root);
+    const db = openDb(loadConfig({ home: root, dbPath: ':memory:' }));
+    try {
+      const shots = await new VisualQaEngine(db, path.join(root, 'artifacts')).capture({
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        routes: ['/'],
+        scenarios: [
+          {
+            name: 'jobs',
+            route: '/',
+            interactions: [{ action: 'click', selector: '#desktop-nav' }],
+            viewportInteractions: {
+              mobile: [
+                { action: 'click', selector: '#drawer-open' },
+                { action: 'wait', selector: '#drawer:visible' },
+                { action: 'click', selector: '#mobile-nav' },
+              ],
+            },
+            expectedSelector: 'body[data-view="jobs"]',
+            viewports: ['desktop', 'mobile'],
+          },
+        ],
+      });
+      expect(shots.map((shot) => shot.status)).toEqual(['captured', 'captured']);
+      expect(shots.map((shot) => shot.error)).toEqual([null, null]);
+    } finally {
+      db.close();
+    }
+  });
+
   it.each([
     ['initial redirect', '/redirect-cross', []],
     ['link click', '/click', [{ action: 'click', selector: '#escape' }]],

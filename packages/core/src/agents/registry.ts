@@ -22,7 +22,14 @@ interface HealthState {
 }
 
 export type AgentFailureKind =
-  'cancelled' | 'quota' | 'cooldown' | 'unavailable' | 'timeout' | 'protocol' | 'agent_failure';
+  | 'cancelled'
+  | 'quota'
+  | 'cooldown'
+  | 'session_invalid'
+  | 'unavailable'
+  | 'timeout'
+  | 'protocol'
+  | 'agent_failure';
 
 export function classifyAgentFailure(
   result: Pick<AgentRunResult, 'status' | 'error'>,
@@ -33,6 +40,16 @@ export function classifyAgentFailure(
   if (/rate[ -]?limit|usage limit|spend limit|session limit|too many requests|quota/i.test(error))
     return 'quota';
   if (/cooldown/i.test(error)) return 'cooldown';
+  // Auth outages are provider health, not a stale thread id: "your session has
+  // expired" would otherwise read as session_invalid and skip the cooldown.
+  if (/not logged in|log ?in again/i.test(error)) return 'unavailable';
+  if (
+    /(?:session|conversation|thread|resume)[^.\n]{0,40}(?:not found|invalid|expired|no longer|(?:can ?not|could not|can't|couldn't) be resumed|does not exist)/i.test(
+      error,
+    ) ||
+    /(?:no|unknown) (?:such )?(?:session|conversation|thread)\b/i.test(error)
+  )
+    return 'session_invalid';
   if (/not found|could not start|could not be executed|not logged in|unavailable/i.test(error))
     return 'unavailable';
   if (/malformed JSONL|without a terminal structured event|protocol/i.test(error))
@@ -155,7 +172,7 @@ export class AgentRegistry {
   recordResult(provider: ProviderId, result: Pick<AgentRunResult, 'status' | 'error'>): void {
     const at = this.now();
     if (result.status === 'completed') {
-      this.health.set(provider, { ...this.health.get(provider), lastSuccessAt: at.toISOString() });
+      this.health.set(provider, { lastSuccessAt: at.toISOString() });
       return;
     }
     const next: HealthState = {

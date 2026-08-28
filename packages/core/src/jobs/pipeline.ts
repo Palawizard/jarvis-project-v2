@@ -8,11 +8,20 @@ import type { ProjectService, Project } from '../projects/service.js';
 import type { SessionService } from '../sessions/service.js';
 import type { MemoryService } from '../memory/service.js';
 import type { ContextPackBuilder } from '../context/pack.js';
-import type { AgentRegistry } from '../agents/registry.js';
+import {
+  classifyAgentFailure,
+  type AgentFailureKind,
+  type AgentRegistry,
+} from '../agents/registry.js';
 import type { VerificationEngine, VerificationReport } from '../verification/engine.js';
 import type { ReviewEngine, Review, ReviewFinding } from '../review/engine.js';
 import { VisualQaEngine, isEvidenceCoverageFailure } from '../visualqa/engine.js';
-import { resolveVisualPlan, type VisualQaPlan } from '../visualqa/surfaces.js';
+import type { VisualQaPlan } from '../visualqa/surfaces.js';
+import {
+  isSelfUiFile,
+  resolveVisualPlanForCandidate,
+  VisualQaPlanningError,
+} from '../visualqa/candidate-plan.js';
 import { VisualReviewer } from '../visualqa/reviewer.js';
 import { startCandidateRuntime } from '../runtime/candidate.js';
 import { GitWorkspace } from '../git/workspace.js';
@@ -29,6 +38,17 @@ import type { AgentRole } from '../agents/types.js';
 import type { VisualReview } from '../visualqa/reviewer.js';
 
 const log = createLogger('pipeline');
+
+interface AgentStageOutcome {
+  status: string;
+  result: string;
+  error?: string | undefined;
+  failureKind?: AgentFailureKind | undefined;
+  sessionId?: string | undefined;
+  provider?: ProviderId;
+  proposals: ReturnType<typeof proposalToInput>[];
+  runId: string;
+}
 
 export interface PipelineDeps {
   db: Db;
@@ -369,9 +389,69 @@ export class JobPipeline {
       // The plan comes from the diff, not from a static default list. Capturing
       // surfaces the candidate never touched is what let unrelated findings
       // block narrow jobs and sent the visual fixer at innocent source.
-      const visualPlan = resolveVisualPlan(job, input.project, changedFiles);
+      // For a Jarvis self-candidate the catalog that matters is the CANDIDATE's,
+      // not this running version's: a candidate that deletes a view would
+      // otherwise be photographed against a surface it no longer has.
+      let visualPlan: VisualQaPlan | null = null;
+      try {
+        visualPlan = await resolveVisualPlanForCandidate({
+          job,
+          project: input.project,
+          changedFiles,
+          deletedFiles: changes.deleted,
+          head: changes.head,
+          signal: input.signal,
+        });
+      } catch (error) {
+        if (!(error instanceof VisualQaPlanningError)) throw error;
+        // Planning infrastructure, not a product defect: no source fixer runs.
+        jobs.transition(jobId, 'visual_qa');
+        this.pause(
+          jobId,
+          'visual_qa',
+          `Visual-QA planning infrastructure: ${error.message}. ` +
+            'The candidate could not be mapped onto its own visual surfaces, so no ' +
+            'evidence was captured and no source fix was attempted.',
+        );
+        return;
+      }
+      if (visualPlan === null && input.project.isSelf) {
+        // A self candidate with nothing rendered in its diff plans no evidence
+        // rather than borrowing the running parent's stale self scenarios. That
+        // decision is persisted as an explicit plan, so approval reads
+        // "no evidence required" as a recorded fact rather than an absence.
+        const emptyPlan: VisualQaPlan = {
+          source: 'changed_surface',
+          plannerSource: 'candidate_catalog',
+          plannerHead: changes.head,
+          required: false,
+          scenarios: [],
+          reasons: ['no changed rendered self UI'],
+          fixtures: [],
+        };
+        jobs.patch(jobId, { visualQaPlan: emptyPlan });
+        this.deps.bus.emit({
+          type: 'visual_qa.plan.resolved',
+          jobId,
+          payload: {
+            plannerSource: 'candidate_catalog',
+            plannerHead: changes.head,
+            skipped: 'no changed rendered self UI',
+            changedFiles,
+            scenarios: [],
+            reasons: emptyPlan.reasons,
+            fixtures: [],
+          },
+        });
+      }
+      // For the self project, share the planner's own predicate: a narrower gate
+      // here would resolve a self plan and then silently drop it for UI the
+      // planner does recognise. Other projects keep the original heuristic --
+      // widening it would photograph every repo that happens to hold a .tsx.
       const uiChanged = changedFiles.some((file) =>
-        /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i.test(file),
+        input.project.isSelf
+          ? isSelfUiFile(file)
+          : /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i.test(file),
       );
       const shouldVisualQa = Boolean(
         visualPlan && (visualPlan.required === true || uiChanged || job.visualQaConfig),
@@ -383,6 +463,12 @@ export class JobPipeline {
           jobId,
           payload: {
             source: visualPlan.source,
+            plannerSource: visualPlan.plannerSource ?? 'parent',
+            ...(visualPlan.plannerHead ? { plannerHead: visualPlan.plannerHead } : {}),
+            ...(visualPlan.catalogVersion ? { catalogVersion: visualPlan.catalogVersion } : {}),
+            ...(visualPlan.catalogBlobSha ? { catalogBlobSha: visualPlan.catalogBlobSha } : {}),
+            ...(visualPlan.catalogDigest ? { catalogDigest: visualPlan.catalogDigest } : {}),
+            changedFiles,
             scenarios: visualPlan.scenarios.map((scenario) => ({
               name: scenario.name,
               viewports: scenario.viewports ?? ['desktop', 'mobile'],
@@ -890,6 +976,7 @@ export class JobPipeline {
         config: this.config,
         signal: opts.signal,
         fixtures: opts.plan.fixtures,
+        expectedCommit: opts.headRef,
       });
       const shots = await this.visualQa.capture({
         jobId: opts.job.id,
@@ -977,12 +1064,14 @@ export class JobPipeline {
     preferredProvider?: ProviderId;
     resumeSessionId?: string;
     imagePaths?: string[];
-  }): Promise<Awaited<ReturnType<JobPipeline['runAgent']>> & { provider?: ProviderId }> {
+  }): Promise<AgentStageOutcome> {
     let preferred = opts.preferredProvider;
-    let resumeSessionId = opts.resumeSessionId;
-    let last:
-      (Awaited<ReturnType<JobPipeline['runAgent']>> & { provider?: ProviderId }) | undefined;
-    for (let attempt = 0; attempt <= this.config.pipeline.agentStageRetries; attempt++) {
+    // A provider session has authority only as the pair (provider, id). A legacy
+    // id without an owner is retired by omission rather than guessed.
+    let resumeSessionId = preferred ? opts.resumeSessionId : undefined;
+    let last: AgentStageOutcome | undefined;
+    const maxAttempts = this.config.pipeline.agentStageRetries;
+    for (let attempt = 0; attempt <= maxAttempts; attempt++) {
       const routed = await this.deps.agents.route(opts.role, {
         ...(preferred ? { prefer: preferred } : {}),
         jobId: opts.jobId,
@@ -1005,10 +1094,41 @@ export class JobPipeline {
           ...opts,
           provider,
           model: routed.decision.model ?? undefined,
-          ...(resumeSessionId && provider === preferred ? { resumeSessionId } : {}),
+          resumeSessionId: resumeSessionId && provider === preferred ? resumeSessionId : undefined,
         });
         last = { ...result, provider };
         if (result.status === 'completed' || result.status === 'cancelled') return last;
+        if (
+          resumeSessionId &&
+          provider === preferred &&
+          attempt < maxAttempts &&
+          (result.failureKind === 'session_invalid' || result.failureKind === 'protocol')
+        ) {
+          this.deps.jobs.patch(opts.jobId, { resumeSessionId: null });
+          this.deps.bus.emit({
+            type: 'agent.stage.retry',
+            jobId: opts.jobId,
+            payload: {
+              stage: opts.role,
+              attempt: attempt + 1,
+              provider,
+              recovery: 'fresh_context',
+              failureKind: result.failureKind,
+              error: result.error,
+            },
+          });
+          const fresh = await this.runAgent({
+            ...opts,
+            provider,
+            model: routed.decision.model ?? undefined,
+            resumeSessionId: undefined,
+          });
+          last = { ...fresh, provider };
+          if (fresh.status === 'completed' || fresh.status === 'cancelled') return last;
+          // The fresh-context recovery is a real provider execution and consumes
+          // the next attempt in the existing stage budget.
+          attempt += 1;
+        }
         preferred = undefined;
         resumeSessionId = undefined;
       }
@@ -1023,7 +1143,7 @@ export class JobPipeline {
         },
       });
     }
-    return last as Awaited<ReturnType<JobPipeline['runAgent']>> & { provider?: ProviderId };
+    return last as AgentStageOutcome;
   }
 
   private async runAgent(opts: {
@@ -1037,14 +1157,7 @@ export class JobPipeline {
     signal: AbortSignal;
     resumeSessionId?: string | undefined;
     imagePaths?: string[];
-  }): Promise<{
-    status: string;
-    result: string;
-    error?: string | undefined;
-    sessionId?: string | undefined;
-    proposals: ReturnType<typeof proposalToInput>[];
-    runId: string;
-  }> {
+  }): Promise<Omit<AgentStageOutcome, 'provider'>> {
     const { jobs, agents, bus } = this.deps;
     const provider = agents.get(opts.provider);
     const run = jobs.startRun({
@@ -1136,6 +1249,7 @@ export class JobPipeline {
     }
 
     agents.recordResult?.(opts.provider, result);
+    const failureKind = result.status === 'completed' ? undefined : classifyAgentFailure(result);
 
     // Provider text crosses into prompts, recovery state, events and durable
     // rows after this point. Keep the raw error only for local health
@@ -1160,6 +1274,7 @@ export class JobPipeline {
       runId: run.id,
       payload: {
         status: result.status,
+        ...(failureKind ? { failureKind } : {}),
         error: safeError,
         sessionId: result.sessionId,
       },
@@ -1169,6 +1284,7 @@ export class JobPipeline {
       status: result.status,
       result: safeResult,
       error: safeError,
+      ...(failureKind ? { failureKind } : {}),
       sessionId: result.sessionId,
       proposals: result.memoryProposals.map((p) =>
         proposalToInput(p, {

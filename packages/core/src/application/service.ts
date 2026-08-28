@@ -336,7 +336,9 @@ export class CandidateApplicationService {
       !plan ||
       typeof plan !== 'object' ||
       !Array.isArray(plan.scenarios) ||
-      plan.scenarios.length === 0 ||
+      // An explicit "no evidence is required" decision is a valid plan; an
+      // empty scenario list with evidence still required is malformed.
+      (plan.scenarios.length === 0 && plan.required !== false) ||
       (plan.required !== undefined && typeof plan.required !== 'boolean') ||
       !plan.scenarios.every(
         (scenario) =>

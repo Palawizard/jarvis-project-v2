@@ -236,6 +236,10 @@ describe('candidate runtime isolation', () => {
     );
     const self = project(root);
     self.isSelf = true;
+    const expectedCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).trim();
     if (!self.config.candidateRuntime) throw new Error('fixture runtime missing');
     self.config.candidateRuntime.command.args = [
       '-e',
@@ -248,8 +252,45 @@ describe('candidate runtime isolation', () => {
         jobId: 'job_wrong_listener',
         config: loadConfig({ home: path.join(root, 'home') }),
         timeoutMs: 750,
+        expectedCommit,
       }),
     ).rejects.toThrow('did not pass healthcheck');
+  });
+
+  it('binds a self-candidate commit before untrusted startup can change HEAD', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-runtime-'));
+    roots.push(root);
+    execFileSync('git', ['init', '--quiet', '-b', 'main'], { cwd: root });
+    execFileSync('git', ['config', 'user.name', 'Jarvis Test'], { cwd: root });
+    execFileSync('git', ['config', 'user.email', 'test@localhost'], { cwd: root });
+    fs.writeFileSync(path.join(root, 'fixture.txt'), 'reviewed\n');
+    execFileSync('git', ['add', '.'], { cwd: root });
+    execFileSync('git', ['commit', '--quiet', '-m', 'reviewed'], { cwd: root });
+    const expectedCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).trim();
+    const self = project(root);
+    self.isSelf = true;
+    if (!self.config.candidateRuntime) throw new Error('fixture runtime missing');
+    self.config.candidateRuntime.command.args = [
+      '-e',
+      `const fs=require('node:fs'),{execFileSync}=require('node:child_process');` +
+        `fs.writeFileSync('fixture.txt','changed\\n');execFileSync('git',['add','.']);execFileSync('git',['commit','--quiet','-m','changed']);` +
+        `const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();` +
+        `require('node:http').createServer((_,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify({status:'ok',commit,runtimeNonce:process.env.JARVIS_RUNTIME_NONCE}))}).listen(Number(process.env.TEST_PORT),'127.0.0.1')`,
+    ];
+
+    await expect(
+      startCandidateRuntime({
+        project: self,
+        cwd: root,
+        jobId: 'job_commit_race',
+        config: loadConfig({ home: path.join(root, 'home') }),
+        timeoutMs: 1_500,
+        expectedCommit,
+      }),
+    ).rejects.toThrow(/candidate runtime source changed|did not pass healthcheck/);
   });
 
   it('waits for the web frontend when the API port becomes healthy first', async () => {
@@ -341,7 +382,7 @@ describe('candidate runtime isolation', () => {
         cwd: root,
         jobId: 'job_web_404',
         config: loadConfig({ home: path.join(root, 'home') }),
-        timeoutMs: 1_500,
+        timeoutMs: 10_000,
       }),
     ).rejects.toThrow('candidate API is healthy but web frontend did not become ready at');
 

@@ -10,7 +10,7 @@ React/Vite UI (origin-scoped control credential)
 Hono orchestrator
     |
 Core composition root (Jarvis)
-    |-- projects / sessions / jobs
+    |-- conversations (sessions) / chat / projects / jobs
     |-- Claude and Codex provider adapters
     |-- Git workspace / verification / review / visual QA
     |-- tool permission policy / execution audit / recovery
@@ -25,7 +25,9 @@ External Jarvis Supervisor
 
 ## Persistence and events
 
-SQLite schema version 5 stores routing decisions, candidate-application transactions, self-upgrade transactions, hashed human-control verification material, tool/grant integrity metadata, exact repair checkpoints, verification failure classification, review HEAD identities, and scenario-based visual evidence. `schema.sql` remains the version-1 baseline; ordered transactional migrations preserve v1-v4 records, expire unverifiable legacy pending approvals, revoke legacy grants lacking risk/revision identity, and reject unknown/newer versions.
+SQLite schema version 8 stores conversations (pinned/archived state, message status, metadata and Job links), project aliases and archived lifecycle, Job archive/predecessor/origin-message metadata, Job deletion tombstones, tool-execution originating actor and typed escalation reason, routing decisions, candidate-application transactions, self-upgrade transactions, hashed human-control verification material, tool/grant integrity metadata, exact repair checkpoints, verification failure classification, review HEAD identities, and scenario-based visual evidence. `schema.sql` remains the version-1 baseline; ordered transactional migrations preserve v1-v7 records, expire unverifiable legacy pending approvals, revoke legacy grants lacking risk/revision identity, and reject unknown/newer versions.
+
+Migration 7 evolves the existing `sessions`/`messages` tables into conversations rather than recreating them: renaming the tables would rewrite every row and every foreign key for an aesthetic gain, while the product-level name is what actually matters. Existing sessions keep their ids, transcripts and Job links, and are titled deterministically from their first user message. `jobs.session_id` is `ON DELETE SET NULL`, so deleting a conversation detaches its Jobs instead of cascading them away.
 
 The event log supports live UI updates and post-restart inspection. Startup marks agent runs interrupted and their running jobs paused while retaining the exact repair kind/evidence and recording restart separately. An explicit resume validates the existing worktree and exact checkpointed HEAD; before a HEAD checkpoint exists, only the pinned base SHA is accepted. Unexpected descendants and dirty state are preserved for inspection, never adopted or reset.
 
@@ -67,13 +69,13 @@ human-control authentication. See `docs/tool-permissions.md`.
 
 - `packages/core`: product domain and infrastructure adapters.
 - `apps/orchestrator`: thin validation/API/SSE layer and static production UI serving.
-- `apps/web`: user-facing command, project, job, memory, and tool-permission views.
+- `apps/web`: the conversation workspace plus project, job, memory, and tool-permission views.
 - `.jarvis` or `JARVIS_HOME`: runtime state, never source control.
 
 PostgreSQL migration is possible at the repository layer. Domain records use portable scalar/JSON fields; FTS5 and embedding BLOB access are deliberately isolated.
 
 ## Implemented versus planned
 
-Implemented: text command flow, project registration/detection, durable jobs/events, Claude/Codex CLI adapters, inspectable routing/cooldowns/model profiles, Git worktrees, deterministic checks, independent code and image review, isolated candidate runtime, explicit approval, FF-only application, and supervised self-upgrade foundations.
+Implemented: persistent multi-conversation chat with a dedicated non-editing chat agent path, structured intent/action routing, deterministic project resolution from natural language, project registration/detection, durable jobs/events, Claude/Codex CLI adapters, inspectable routing/cooldowns/model profiles, Git worktrees, deterministic checks, independent code and image review, isolated candidate runtime, explicit approval, FF-only application, and supervised self-upgrade foundations.
 
 Planned: voice, wake word, screen understanding, desktop control, Gmail/Calendar, learned procedure capture, richer automation triggers, PostgreSQL deployment, and broader trusted policies.

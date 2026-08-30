@@ -16,12 +16,23 @@ export interface Project {
   devUrl: string | null;
   summary: string | null;
   isSelf: boolean;
+  aliases: string[];
+  archivedAt: string | null;
   config: {
     candidateRuntime?: unknown;
     visualQa?: { required?: boolean; routes?: string[] };
   };
   createdAt: string;
   updatedAt: string;
+}
+
+export interface UnregisterPreflight {
+  eligible: boolean;
+  mode: 'hard' | 'soft';
+  reason: string;
+  activeJobs: number;
+  historicalJobs: number;
+  memories: number;
 }
 
 export type JobStage =
@@ -68,9 +79,36 @@ export interface Job {
     reasons: string[];
   } | null;
   episodeId: string | null;
+  archivedAt: string | null;
+  predecessorJobId: string | null;
+  originMessageId: string | null;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
+}
+
+export interface JobTombstone {
+  id: string;
+  sessionId: string | null;
+  projectId: string | null;
+  goal: string;
+  reason: string;
+  deletedAt: string;
+}
+
+export interface StaleJobReport {
+  stale: boolean;
+  reason: string;
+  jobBase: string | null;
+  targetHead: string | null;
+  detail: string;
+}
+
+export interface JobDeletionPlan {
+  eligible: boolean;
+  reason: string;
+  removes: string[];
+  preserves: string[];
 }
 
 export interface Memory {
@@ -226,6 +264,8 @@ export interface JobDetail {
   episode: Memory | null;
   contextPacks: ContextPack[];
   project: Project | null;
+  staleness: StaleJobReport | null;
+  deletionPlan: JobDeletionPlan;
 }
 
 export interface CandidateApplication {
@@ -325,13 +365,16 @@ export interface ToolExecution {
   toolName: string;
   risk: RiskLevel;
   actor: ToolActor;
+  originatingActor: ToolActor;
   decision: PolicyDecision;
+  reasonCode: string;
   status: ToolExecutionStatus;
   reason: string;
   sessionId: string | null;
   projectId: string | null;
   jobId: string | null;
   agentRunId: string | null;
+  parentExecutionId: string | null;
   input: unknown;
   inputValidated: boolean;
   effectUnknown: boolean;
@@ -389,14 +432,74 @@ export interface Session {
     activeJobIds: string[];
     artifacts: string[];
   };
-  status: string;
+  status: 'active' | 'archived';
+  pinned: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
+
+export type Conversation = Session;
+
+export interface ConversationSummary extends Session {
+  preview: string | null;
+  messageCount: number;
+  jobIds: string[];
+}
+
+export type MessageStatus =
+  'complete' | 'pending' | 'streaming' | 'failed' | 'stopped' | 'interrupted';
 
 export interface Message {
   id: string;
+  sessionId: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  status: MessageStatus;
+  jobId: string | null;
+  metadata: {
+    error?: string;
+    activity?: string;
+    jobIds?: string[];
+    executionId?: string;
+    tool?: string;
+    /** Server-resolved name for a pending action target. */
+    target?: string;
+  };
   createdAt: string;
+}
+
+export interface ConversationDetail {
+  conversation: Conversation;
+  rendered: string;
+  messages: Message[];
+  toolExecutions: ToolExecution[];
+  jobs: Job[];
+  tombstones: JobTombstone[];
+  responding: boolean;
+}
+
+export interface ChatTurn {
+  conversationId: string;
+  kind: 'memory' | 'chat' | 'action' | 'clarification' | 'confirmation_required' | 'error';
+  reply: string;
+  userMessage: Message | null;
+  assistantMessage: Message | null;
+  action?: {
+    name: string;
+    status: 'executed' | 'confirmation_required' | 'refused';
+    executionId?: string;
+    error?: string;
+  };
+  job?: Job | null;
+  memoryCandidates?: Memory[];
+  projectCandidates?: Project[];
+}
+
+export interface SearchHit {
+  type: 'conversation' | 'project' | 'job';
+  id: string;
+  title: string;
+  subtitle: string;
 }
 
 export interface AuthStatus {
@@ -405,6 +508,12 @@ export interface AuthStatus {
 }
 
 const CONTROL_STORAGE_KEY = 'jarvis-human-control';
+
+function clean(values: Record<string, string | undefined>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(values).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
+}
 
 export function controlCredential(): string | null {
   return typeof localStorage === 'undefined' ? null : localStorage.getItem(CONTROL_STORAGE_KEY);
@@ -459,7 +568,8 @@ export const api = {
   },
   health: () => request<Health>('/api/health'),
 
-  projects: () => request<Project[]>('/api/projects'),
+  projects: (params: { status?: string; search?: string } = {}) =>
+    request<Project[]>(`/api/projects?${new URLSearchParams(clean(params))}`),
   project: (id: string) =>
     request<{
       project: Project;
@@ -473,9 +583,58 @@ export const api = {
       body: JSON.stringify({ rootPath, name, devUrl }),
     }),
   refreshProject: (id: string) =>
-    request<Project>(`/api/projects/${id}/refresh`, { method: 'POST' }),
+    request<ToolOutcome>(`/api/projects/${id}/refresh`, { method: 'POST' }),
+  updateProject: (
+    id: string,
+    patch: Partial<Pick<Project, 'name' | 'aliases' | 'devUrl' | 'summary'>>,
+  ) =>
+    request<ToolOutcome>(`/api/projects/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  archiveProject: (id: string, archived: boolean) =>
+    request<ToolOutcome>(`/api/projects/${id}/archive`, {
+      method: 'POST',
+      body: JSON.stringify({ archived }),
+    }),
+  unregisterPreflight: (id: string) =>
+    request<UnregisterPreflight>(`/api/projects/${id}/unregister-preflight`),
+  unregisterProject: (id: string) =>
+    request<ToolOutcome>(`/api/projects/${id}`, { method: 'DELETE' }),
   purgeProjectMemory: (id: string) =>
     request<ToolOutcome>(`/api/projects/${id}/memory`, { method: 'DELETE' }),
+
+  conversations: (params: { status?: string; search?: string } = {}) =>
+    request<ConversationSummary[]>(`/api/conversations?${new URLSearchParams(clean(params))}`),
+  conversation: (id: string) => request<ConversationDetail>(`/api/conversations/${id}`),
+  createConversation: (title?: string) =>
+    request<Conversation>('/api/conversations', {
+      method: 'POST',
+      body: JSON.stringify(title ? { title } : {}),
+    }),
+  updateConversation: (
+    id: string,
+    patch: { title?: string; pinned?: boolean; archived?: boolean; projectId?: string | null },
+  ) =>
+    request<Conversation>(`/api/conversations/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  deleteConversation: (id: string) =>
+    request<ToolOutcome>(`/api/conversations/${id}`, { method: 'DELETE' }),
+  sendMessage: (id: string, text: string) =>
+    request<ChatTurn>(`/api/conversations/${id}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    }),
+  stopResponse: (id: string) =>
+    request<{ stopped: boolean }>(`/api/conversations/${id}/stop`, { method: 'POST' }),
+  retryResponse: (id: string) =>
+    request<ChatTurn>(`/api/conversations/${id}/retry`, { method: 'POST' }),
+  editLastMessage: (id: string, text: string) =>
+    request<ChatTurn>(`/api/conversations/${id}/edit-last`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    }),
+
+  search: (query: string) => request<SearchHit[]>(`/api/search?q=${encodeURIComponent(query)}`),
 
   session: () =>
     request<{ session: Session; rendered: string; messages: Message[] }>('/api/session'),
@@ -485,14 +644,18 @@ export const api = {
       body: JSON.stringify({ projectId }),
     }),
 
-  command: (text: string, sessionId: string, projectId: string | null) =>
-    request<{ kind: string; reply: string; job?: Job; candidates?: Memory[] }>('/api/command', {
-      method: 'POST',
-      body: JSON.stringify({ text, sessionId, projectId }),
-    }),
-
-  jobs: (projectId?: string) =>
-    request<Job[]>(`/api/jobs${projectId ? `?projectId=${projectId}` : ''}`),
+  jobs: (
+    params: {
+      projectId?: string;
+      sessionId?: string;
+      status?: string;
+      stage?: string;
+      search?: string;
+      archived?: string;
+      sort?: string;
+      limit?: string;
+    } = {},
+  ) => request<Job[]>(`/api/jobs?${new URLSearchParams(clean(params))}`),
   job: (id: string) => request<JobDetail>(`/api/jobs/${id}`),
   createJob: (
     projectId: string,
@@ -510,10 +673,20 @@ export const api = {
     }),
   startJob: (id: string) =>
     request<{ started: boolean }>(`/api/jobs/${id}/start`, { method: 'POST' }),
-  cancelJob: (id: string) =>
-    request<{ cancelled: boolean }>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
-  resumeJob: (id: string) =>
-    request<{ resumed: boolean }>(`/api/jobs/${id}/resume`, { method: 'POST' }),
+  cancelJob: (id: string) => request<ToolOutcome>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
+  resumeJob: (id: string) => request<ToolOutcome>(`/api/jobs/${id}/resume`, { method: 'POST' }),
+  archiveJob: (id: string, archived: boolean) =>
+    request<ToolOutcome>(`/api/jobs/${id}/archive`, {
+      method: 'POST',
+      body: JSON.stringify({ archived }),
+    }),
+  retryJob: (id: string, autostart = true) =>
+    request<ToolOutcome>(`/api/jobs/${id}/retry`, {
+      method: 'POST',
+      body: JSON.stringify({ autostart }),
+    }),
+  jobDeletionPlan: (id: string) => request<JobDeletionPlan>(`/api/jobs/${id}/deletion-plan`),
+  deleteJob: (id: string) => request<ToolOutcome>(`/api/jobs/${id}`, { method: 'DELETE' }),
   approveJob: (id: string) =>
     request<CandidateApplication>(`/api/jobs/${id}/approve`, { method: 'POST' }),
   applyJob: (id: string) =>

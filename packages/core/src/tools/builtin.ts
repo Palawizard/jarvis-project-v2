@@ -3,6 +3,9 @@ import { ToolRegistry, type ToolRegistryOptions } from './registry.js';
 import type { MemoryService } from '../memory/service.js';
 import type { ProjectService } from '../projects/service.js';
 import type { JobService } from '../jobs/service.js';
+import type { JobLifecycle } from '../jobs/lifecycle.js';
+import type { JobPipeline } from '../jobs/pipeline.js';
+import type { SessionService } from '../sessions/service.js';
 import type { MemoryKind, MemoryScope } from '../memory/types.js';
 
 const SCOPES = ['user', 'project', 'session', 'procedure'] as const;
@@ -19,23 +22,31 @@ const KINDS = [
   'other',
 ] as const;
 
+export interface BuiltinToolDeps {
+  memory: MemoryService;
+  projects: ProjectService;
+  jobs: JobService;
+  sessions: SessionService;
+  pipeline: JobPipeline;
+  lifecycle: JobLifecycle;
+}
+
 /**
- * The tools the initial vertical slice actually needs.
+ * Every capability Jarvis can exercise, from a button or from a sentence.
  *
- * Everything else in the roadmap (screen, desktop control, gmail, calendar)
- * registers the same way; none of it is stubbed here, because a stub that
- * returns nothing is worse than an honestly absent tool. The only thing a new
- * tool has to get right is its `risk` — the policy in policy.ts does the rest.
+ * There is deliberately no second implementation for natural language: the chat
+ * dispatcher and the HTTP routes call the same tools, so a management operation
+ * gets the same policy evaluation, the same audit row and the same confirmation
+ * requirement whichever way it was asked for. The only thing a new tool has to
+ * get right is its `risk` — policy.ts does the rest.
  */
 export function registerBuiltinTools(
-  deps: {
-    memory: MemoryService;
-    projects: ProjectService;
-    jobs: JobService;
-  },
+  deps: BuiltinToolDeps,
   options: ToolRegistryOptions,
 ): ToolRegistry {
   const registry = new ToolRegistry(options);
+
+  // ------------------------------------------------------------------ memory --
 
   registry.register({
     name: 'memory.search',
@@ -156,20 +167,29 @@ export function registerBuiltinTools(
     },
   });
 
+  // ---------------------------------------------------------------- projects --
+
   registry.register({
     name: 'project.list',
-    revision: '1',
+    revision: '2',
     description: 'List projects Jarvis knows about.',
     risk: 'observe',
-    input: z.object({}),
-    async execute() {
-      return deps.projects.list().map((p) => ({
-        id: p.id,
-        name: p.name,
-        rootPath: p.rootPath,
-        isSelf: p.isSelf,
-        stack: p.stack,
-      }));
+    input: z.object({
+      status: z.enum(['active', 'archived', 'all']).default('active'),
+      search: z.string().max(120).optional(),
+    }),
+    async execute(input) {
+      return deps.projects
+        .list({ status: input.status, ...(input.search ? { search: input.search } : {}) })
+        .map((p) => ({
+          id: p.id,
+          name: p.name,
+          aliases: p.aliases,
+          rootPath: p.rootPath,
+          isSelf: p.isSelf,
+          archived: Boolean(p.archivedAt),
+          stack: p.stack,
+        }));
     },
   });
 
@@ -185,37 +205,406 @@ export function registerBuiltinTools(
   });
 
   registry.register({
-    name: 'job.create',
+    name: 'project.update',
     revision: '1',
-    description: 'Create a development job against a project. Does not start it.',
+    description: 'Change a project’s display name, aliases, dev URL or summary.',
+    risk: 'reversible_modification',
+    input: z
+      .object({
+        id: z.string(),
+        name: z.string().min(1).max(80).optional(),
+        aliases: z.array(z.string().min(1).max(60)).max(20).optional(),
+        devUrl: z.string().max(300).nullish(),
+        summary: z.string().max(2000).nullish(),
+      })
+      .strict(),
+    async execute(input) {
+      const patch: Parameters<ProjectService['update']>[1] = {};
+      if (input.name !== undefined) patch.name = input.name;
+      if (input.aliases !== undefined) patch.aliases = input.aliases;
+      if (input.devUrl !== undefined) patch.devUrl = input.devUrl ?? null;
+      if (input.summary !== undefined) patch.summary = input.summary ?? null;
+      const updated = deps.projects.update(input.id, patch);
+      if (!updated) throw new Error('project not found');
+      return updated;
+    },
+  });
+
+  registry.register({
+    name: 'project.archive',
+    revision: '1',
+    description:
+      'Hide a project from active views and resolution. Jobs, history and memory are kept.',
+    risk: 'reversible_modification',
+    input: z.object({ id: z.string(), archived: z.boolean().default(true) }).strict(),
+    async execute(input) {
+      const updated = deps.projects.setArchived(input.id, input.archived);
+      if (!updated) throw new Error('project not found');
+      return updated;
+    },
+  });
+
+  registry.register({
+    name: 'project.redetect',
+    revision: '1',
+    description: 'Re-run stack and command detection against the current filesystem.',
+    risk: 'safe_action',
+    input: z.object({ id: z.string() }).strict(),
+    async execute(input) {
+      const updated = deps.projects.refreshDetection(input.id);
+      if (!updated) throw new Error('project not found');
+      return updated;
+    },
+  });
+
+  registry.register({
+    name: 'project.unregister',
+    revision: '1',
+    description:
+      'Remove a project registration. The repository on disk is never deleted; when Jobs or ' +
+      'memory reference the project it is archived instead so history stays understandable.',
+    risk: 'destructive',
+    input: z.object({ id: z.string() }).strict(),
+    async execute(input) {
+      return deps.projects.unregister(input.id);
+    },
+  });
+
+  // -------------------------------------------------------------------- jobs --
+
+  registry.register({
+    name: 'job.create',
+    revision: '3',
+    description:
+      'Create a development job against a project, optionally starting it. Runs in an isolated ' +
+      'worktree and is never merged automatically.',
+    // Creating a Job -- and, with `autostart`, handing an agent a shell in a
+    // fresh worktree plus provider quota -- is a real modification of the
+    // user's world. It stays at the level the pre-conversational tool had, so
+    // an agent-originated request becomes a confirmation the human answers
+    // rather than an unattended pipeline start.
     risk: 'reversible_modification',
     input: z.object({
       projectId: z.string(),
       request: z.string().min(3),
       acceptance: z.array(z.string()).default([]),
+      autostart: z.boolean().default(false),
+      originMessageId: z.string().nullish(),
     }),
     async execute(input, ctx) {
-      return deps.jobs.create({
+      const job = deps.jobs.create({
         projectId: input.projectId,
         request: input.request,
         acceptance: input.acceptance,
         sessionId: ctx.sessionId ?? null,
+        originMessageId: input.originMessageId ?? null,
       });
+      // Linking here rather than in the chat turn: creation may land later,
+      // from a human confirming the request, and the conversation still has to
+      // end up pointing at the Job it asked for.
+      if (ctx.sessionId) {
+        const state = deps.sessions.get(ctx.sessionId)?.state;
+        if (state) {
+          deps.sessions.updateState(ctx.sessionId, {
+            goal: job.goal,
+            activeJobIds: [...new Set([...(state.activeJobIds ?? []), job.id])],
+          });
+        }
+        if (input.originMessageId) deps.sessions.linkMessageJob(input.originMessageId, job.id);
+        // What the conversation is about follows the Job that really exists.
+        // Recording it earlier changed the conversation's project even when the
+        // human went on to refuse the Job it was resolved for, and recording it
+        // in the chat dispatcher missed the Job a human confirms later.
+        deps.sessions.setProject(ctx.sessionId, job.projectId);
+      }
+      if (input.autostart) deps.pipeline.start(job.id);
+      return job;
     },
   });
 
   registry.register({
     name: 'job.status',
-    revision: '1',
-    description: 'Current stage, status and agent runs for a job.',
+    revision: '2',
+    description: 'Current stage, status, staleness and agent runs for a job.',
     risk: 'observe',
     input: z.object({ id: z.string() }),
     async execute(input) {
       const job = deps.jobs.get(input.id);
-      if (!job) return null;
-      return { job, runs: deps.jobs.runs(job.id) };
+      if (!job) {
+        const tombstone = deps.jobs.tombstone(input.id);
+        return tombstone ? { job: null, tombstone } : null;
+      }
+      return {
+        job,
+        runs: deps.jobs.runs(job.id),
+        running: deps.pipeline.isRunning(job.id),
+        ...(job.stage === 'paused' ? { staleness: await deps.lifecycle.staleness(job.id) } : {}),
+      };
+    },
+  });
+
+  registry.register({
+    name: 'job.list',
+    revision: '1',
+    description: 'List jobs with the same filters the Jobs page uses.',
+    risk: 'observe',
+    input: z
+      .object({
+        projectId: z.string().optional(),
+        sessionId: z.string().optional(),
+        status: z
+          .enum([
+            'pending',
+            'running',
+            'paused',
+            'awaiting_user',
+            'completed',
+            'failed',
+            'cancelled',
+          ])
+          .optional(),
+        archived: z.enum(['active', 'archived', 'all']).default('active'),
+        search: z.string().max(200).optional(),
+        limit: z.number().int().min(1).max(200).default(20),
+      })
+      .strict(),
+    async execute(input) {
+      return deps.jobs.list(input as Parameters<JobService['list']>[0]);
+    },
+  });
+
+  registry.register({
+    name: 'job.archive',
+    revision: '2',
+    description: 'Move a finished job out of History. Every artifact and audit record is kept.',
+    // Not scratch state: this durably changes what the user sees in their own
+    // sidebar or Job list, so an agent has to land on a confirmation for it.
+    risk: 'reversible_modification',
+    input: z.object({ id: z.string(), archived: z.boolean().default(true) }).strict(),
+    async execute(input) {
+      const job = deps.jobs.setArchived(input.id, input.archived);
+      if (!job) throw new Error('job not found');
+      return job;
+    },
+  });
+
+  registry.register({
+    name: 'job.resume',
+    revision: '1',
+    description: 'Resume a paused job after validating its repository, base and worktree.',
+    risk: 'reversible_modification',
+    input: z.object({ id: z.string() }).strict(),
+    async execute(input) {
+      const job = deps.jobs.get(input.id);
+      if (!job) throw new Error('job not found');
+      if (job.stage !== 'paused') throw new Error(`job is ${job.stage}, not paused`);
+      const staleness = await deps.lifecycle.staleness(input.id);
+      if (staleness.stale) {
+        throw new Error(`${staleness.detail} Restart it as a new Job instead.`);
+      }
+      deps.pipeline.resume(input.id);
+      return { resumed: true };
+    },
+  });
+
+  registry.register({
+    name: 'job.retry',
+    revision: '1',
+    description:
+      'Run a finished job again as a NEW job against the project’s current base, keeping a ' +
+      'provenance link to its predecessor.',
+    risk: 'reversible_modification',
+    input: z.object({ id: z.string(), autostart: z.boolean().default(false) }).strict(),
+    async execute(input, ctx) {
+      const job = deps.jobs.retryAsNew(input.id, {
+        sessionId: ctx.sessionId ?? undefined,
+      });
+      if (input.autostart) deps.pipeline.start(job.id);
+      return job;
+    },
+  });
+
+  registry.register({
+    name: 'job.cancel',
+    revision: '1',
+    description:
+      'Stop a running job. Work already done in its worktree stays, so the effect is partial ' +
+      'by nature.',
+    risk: 'sensitive',
+    input: z.object({ id: z.string() }).strict(),
+    async execute(input) {
+      if (!deps.pipeline.cancel(input.id)) throw new Error('job is not running');
+      return { cancelled: true };
+    },
+  });
+
+  registry.register({
+    name: 'job.delete',
+    revision: '1',
+    description:
+      'Abandon a candidate and erase its disposable state: worktree, branch, screenshots and ' +
+      'pipeline rows. Refused for any job whose candidate was applied or self-upgraded.',
+    risk: 'destructive',
+    input: z.object({ id: z.string(), reason: z.string().max(500).optional() }).strict(),
+    async execute(input) {
+      return deps.lifecycle.delete(input.id, input.reason ?? 'deleted by the user');
+    },
+  });
+
+  // ----------------------------------------------------------- conversations --
+
+  registry.register({
+    name: 'conversation.create',
+    revision: '1',
+    description: 'Start a new conversation with fresh working state.',
+    risk: 'safe_action',
+    input: z.object({ title: z.string().max(120).optional() }).strict(),
+    async execute(input) {
+      return deps.sessions.create(input.title ? { title: input.title } : {});
+    },
+  });
+
+  registry.register({
+    name: 'conversation.rename',
+    revision: '2',
+    description: 'Rename a conversation.',
+    // Not scratch state: this durably changes what the user sees in their own
+    // sidebar or Job list, so an agent has to land on a confirmation for it.
+    risk: 'reversible_modification',
+    input: z.object({ id: z.string(), title: z.string().min(1).max(120) }).strict(),
+    async execute(input) {
+      const updated = deps.sessions.rename(input.id, input.title);
+      if (!updated) throw new Error('conversation not found');
+      return updated;
+    },
+  });
+
+  registry.register({
+    name: 'conversation.pin',
+    revision: '1',
+    description: 'Pin or unpin a conversation in the sidebar.',
+    risk: 'safe_action',
+    input: z.object({ id: z.string(), pinned: z.boolean() }).strict(),
+    async execute(input) {
+      const updated = deps.sessions.setPinned(input.id, input.pinned);
+      if (!updated) throw new Error('conversation not found');
+      return updated;
+    },
+  });
+
+  registry.register({
+    name: 'conversation.archive',
+    revision: '2',
+    description: 'Archive or unarchive a conversation. The transcript is kept.',
+    // Not scratch state: this durably changes what the user sees in their own
+    // sidebar or Job list, so an agent has to land on a confirmation for it.
+    risk: 'reversible_modification',
+    input: z.object({ id: z.string(), archived: z.boolean().default(true) }).strict(),
+    async execute(input) {
+      const updated = deps.sessions.setArchived(input.id, input.archived);
+      if (!updated) throw new Error('conversation not found');
+      return updated;
+    },
+  });
+
+  registry.register({
+    name: 'conversation.set_project',
+    revision: '1',
+    description: 'Set or clear the registered project context for a conversation.',
+    risk: 'safe_action',
+    input: z.object({ id: z.string(), projectId: z.string().nullable() }).strict(),
+    async execute(input) {
+      if (input.projectId && !deps.projects.get(input.projectId))
+        throw new Error('project not found');
+      const updated = deps.sessions.setProject(input.id, input.projectId);
+      if (!updated) throw new Error('conversation not found');
+      return updated;
+    },
+  });
+
+  registry.register({
+    name: 'conversation.delete',
+    revision: '1',
+    description:
+      'Delete a conversation and its transcript. Jobs created from it, project memory and ' +
+      'global user memory are all preserved.',
+    risk: 'destructive',
+    input: z.object({ id: z.string() }).strict(),
+    async execute(input) {
+      const outcome = deps.sessions.delete(input.id);
+      if (!outcome.deleted) throw new Error('conversation not found');
+      return outcome;
+    },
+  });
+
+  // ------------------------------------------------------------------ search --
+
+  registry.register({
+    name: 'search.everything',
+    revision: '1',
+    description:
+      'Local typed search across conversations, projects and jobs. Never makes a model call.',
+    risk: 'observe',
+    input: z
+      .object({
+        query: z.string().min(1).max(200),
+        limit: z.number().int().min(1).max(30).default(8),
+      })
+      .strict(),
+    async execute(input) {
+      return searchEverything(deps, input.query, input.limit);
     },
   });
 
   return registry;
+}
+
+export interface SearchHit {
+  type: 'conversation' | 'project' | 'job';
+  id: string;
+  title: string;
+  subtitle: string;
+}
+
+/**
+ * Global search. Deliberately lexical and local: an ordinary "find my sitepilot
+ * chat" must never cost agent quota or leave the machine.
+ */
+export function searchEverything(
+  deps: Pick<BuiltinToolDeps, 'sessions' | 'projects' | 'jobs'>,
+  query: string,
+  limit = 8,
+): SearchHit[] {
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+  const hits: SearchHit[] = [];
+  for (const conversation of deps.sessions.conversations({
+    status: 'all',
+    search: trimmed,
+    limit,
+  })) {
+    hits.push({
+      type: 'conversation',
+      id: conversation.id,
+      title: conversation.title ?? 'Untitled conversation',
+      subtitle: conversation.preview ?? `${conversation.messageCount} messages`,
+    });
+  }
+  for (const project of deps.projects.list({ status: 'all', search: trimmed }).slice(0, limit)) {
+    hits.push({
+      type: 'project',
+      id: project.id,
+      title: project.name,
+      subtitle: project.archivedAt ? `archived · ${project.rootPath}` : project.rootPath,
+    });
+  }
+  for (const job of deps.jobs.list({ search: trimmed, archived: 'all', limit })) {
+    hits.push({
+      type: 'job',
+      id: job.id,
+      title: job.goal,
+      subtitle: `${job.stage}${job.archivedAt ? ' · archived' : ''}`,
+    });
+  }
+  return hits;
 }

@@ -2,89 +2,441 @@
   "version": 1,
   "scenarios": [
     {
-      "name": "command",
-      "matchers": [{ "prefix": "apps/web/src/views/Command" }],
-      "route": "/",
-      "expectedSelector": "[data-testid='command-view']",
-      "viewports": ["desktop", "mobile"]
+      "name": "chat-workspace",
+      "matchers": [
+        {
+          "prefix": "apps/web/src/views/Chat"
+        }
+      ],
+      "route": "/chat/session_qafixture_chat",
+      "fixture": "chat-workspace",
+      "expectedSelector": "[data-testid='chat-view']",
+      "viewports": ["desktop", "mobile"],
+      "expectedSelectorTimeoutMs": 10000
+    },
+    {
+      "name": "conversation-menu",
+      "matchers": [
+        {
+          "exact": "apps/web/src/App.tsx"
+        }
+      ],
+      "route": "/chat/session_qafixture_chat",
+      "fixture": "chat-workspace",
+      "expectedSelector": "[data-testid='conversation-actions-session_qafixture_chat']",
+      "viewports": ["desktop", "mobile"],
+      "interactions": [
+        {
+          "action": "click",
+          "selector": "[data-testid='conversation-menu-session_qafixture_chat']"
+        }
+      ],
+      "viewportInteractions": {
+        "mobile": [
+          {
+            "action": "click",
+            "selector": "[data-testid='mobile-drawer-open']"
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='conversation-menu-session_qafixture_chat']"
+          }
+        ]
+      },
+      "expectedSelectorTimeoutMs": 10000
+    },
+    {
+      "name": "destructive-dialog",
+      "matchers": [
+        {
+          "exact": "apps/web/src/components.tsx"
+        }
+      ],
+      "route": "/chat/session_qafixture_chat",
+      "fixture": "chat-workspace",
+      "expectedSelector": "[data-testid='confirm-dialog']",
+      "viewports": ["desktop", "mobile"],
+      "interactions": [
+        {
+          "action": "click",
+          "selector": "[data-testid='conversation-menu-session_qafixture_chat']"
+        },
+        {
+          "action": "click",
+          "selector": "[data-testid='conversation-delete-session_qafixture_chat']"
+        }
+      ],
+      "viewportInteractions": {
+        "mobile": [
+          {
+            "action": "click",
+            "selector": "[data-testid='mobile-drawer-open']"
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='conversation-menu-session_qafixture_chat']"
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='conversation-delete-session_qafixture_chat']"
+          }
+        ]
+      },
+      "expectedSelectorTimeoutMs": 10000
+    },
+    {
+      "name": "global-search",
+      "matchers": [
+        {
+          "exact": "apps/web/src/App.tsx"
+        }
+      ],
+      "route": "/chat/session_qafixture_chat",
+      "fixture": "chat-workspace",
+      "expectedSelector": "[data-testid='global-search']",
+      "viewports": ["desktop", "mobile"],
+      "interactions": [
+        {
+          "action": "click",
+          "selector": "[data-testid='global-search-open']"
+        },
+        {
+          "action": "fill",
+          "selector": "[data-testid='global-search-input']",
+          "value": "Jarvis"
+        }
+      ],
+      "viewportInteractions": {
+        "mobile": [
+          {
+            "action": "click",
+            "selector": "[data-testid='mobile-drawer-open']"
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='global-search-open']"
+          },
+          {
+            "action": "fill",
+            "selector": "[data-testid='global-search-input']",
+            "value": "Jarvis"
+          }
+        ]
+      },
+      "expectedSelectorTimeoutMs": 10000
+    },
+    {
+      "name": "mobile-conversation-drawer",
+      "matchers": [
+        {
+          "exact": "apps/web/src/App.tsx"
+        },
+        {
+          "exact": "apps/web/src/styles.css"
+        }
+      ],
+      "route": "/chat/session_qafixture_chat",
+      "fixture": "chat-workspace",
+      "expectedSelector": "[data-testid='drawer-scrim']",
+      "viewports": ["mobile"],
+      "interactions": [
+        {
+          "action": "click",
+          "selector": "[data-testid='mobile-drawer-open']"
+        },
+        {
+          "action": "wait",
+          "selector": "[data-testid='conversation-sidebar']",
+          "timeoutMs": 10000
+        }
+      ],
+      "expectedSelectorTimeoutMs": 10000
     },
     {
       "name": "projects",
-      "matchers": [{ "prefix": "apps/web/src/views/Projects" }],
+      "matchers": [
+        {
+          "prefix": "apps/web/src/views/Projects"
+        }
+      ],
       "route": "/",
       "expectedSelector": "[data-testid='projects-view']",
       "viewports": ["desktop", "mobile"],
       "interactions": [
-        { "action": "click", "selector": "[data-testid='nav-projects']" },
-        { "action": "wait", "selector": "[data-testid='projects-view']" }
-      ]
+        {
+          "action": "click",
+          "selector": "[data-testid='nav-projects']"
+        }
+      ],
+      "viewportInteractions": {
+        "mobile": [
+          {
+            "action": "click",
+            "selector": "[data-testid='mobile-drawer-open']"
+          },
+          {
+            "action": "wait",
+            "selector": "[data-testid='conversation-sidebar']",
+            "timeoutMs": 10000
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='nav-projects']"
+          }
+        ]
+      },
+      "expectedSelectorTimeoutMs": 10000
     },
     {
       "name": "jobs-list",
-      "matchers": [{ "exact": "apps/web/src/views/Jobs.tsx" }],
+      "matchers": [
+        {
+          "exact": "apps/web/src/views/Jobs.tsx"
+        }
+      ],
       "route": "/",
       "expectedSelector": "[data-testid='jobs-view']",
       "viewports": ["desktop", "mobile"],
       "interactions": [
-        { "action": "click", "selector": "[data-testid='nav-jobs']" },
-        { "action": "wait", "selector": "[data-testid='jobs-view']" }
-      ]
+        {
+          "action": "click",
+          "selector": "[data-testid='nav-jobs']"
+        }
+      ],
+      "viewportInteractions": {
+        "mobile": [
+          {
+            "action": "click",
+            "selector": "[data-testid='mobile-drawer-open']"
+          },
+          {
+            "action": "wait",
+            "selector": "[data-testid='conversation-sidebar']",
+            "timeoutMs": 10000
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='nav-jobs']"
+          }
+        ]
+      },
+      "expectedSelectorTimeoutMs": 10000,
+      "fixture": "paused-job"
     },
     {
       "name": "job-detail-paused",
-      "matchers": [{ "prefix": "apps/web/src/views/JobDetail" }],
+      "matchers": [
+        {
+          "prefix": "apps/web/src/views/JobDetail"
+        }
+      ],
       "route": "/",
+      "fixture": "paused-job",
       "expectedSelector": "[data-testid='pause-explanation']",
       "viewports": ["desktop", "mobile"],
-      "fixture": "paused-job",
       "interactions": [
-        { "action": "click", "selector": "[data-testid='nav-jobs']" },
-        { "action": "wait", "selector": "[data-testid='jobs-view']" },
-        { "action": "click", "selector": "[data-testid='job-row-job_qafixture_paused']" },
-        { "action": "wait", "selector": "[data-testid='job-detail-view']" },
-        { "action": "wait", "selector": "[data-testid='resume-job']" },
-        { "action": "wait", "selector": "[data-testid='pause-explanation']" }
-      ]
+        {
+          "action": "click",
+          "selector": "[data-testid='nav-jobs']"
+        },
+        {
+          "action": "wait",
+          "selector": "[data-testid='jobs-view']",
+          "timeoutMs": 10000
+        },
+        {
+          "action": "click",
+          "selector": "[data-testid='job-row-job_qafixture_paused']"
+        },
+        {
+          "action": "wait",
+          "selector": "[data-testid='job-detail-view']",
+          "timeoutMs": 10000
+        },
+        {
+          "action": "wait",
+          "selector": "[data-testid='resume-job']",
+          "timeoutMs": 10000
+        }
+      ],
+      "viewportInteractions": {
+        "mobile": [
+          {
+            "action": "click",
+            "selector": "[data-testid='mobile-drawer-open']"
+          },
+          {
+            "action": "wait",
+            "selector": "[data-testid='conversation-sidebar']",
+            "timeoutMs": 10000
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='nav-jobs']"
+          },
+          {
+            "action": "wait",
+            "selector": "[data-testid='jobs-view']",
+            "timeoutMs": 10000
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='job-row-job_qafixture_paused']"
+          },
+          {
+            "action": "wait",
+            "selector": "[data-testid='job-detail-view']",
+            "timeoutMs": 10000
+          },
+          {
+            "action": "wait",
+            "selector": "[data-testid='resume-job']",
+            "timeoutMs": 10000
+          }
+        ]
+      },
+      "expectedSelectorTimeoutMs": 10000
     },
     {
       "name": "memory",
-      "matchers": [{ "prefix": "apps/web/src/views/Memory" }],
+      "matchers": [
+        {
+          "prefix": "apps/web/src/views/Memory"
+        }
+      ],
       "route": "/",
       "expectedSelector": "[data-testid='memory-view']",
       "viewports": ["desktop", "mobile"],
       "interactions": [
-        { "action": "click", "selector": "[data-testid='nav-memory']" },
-        { "action": "wait", "selector": "[data-testid='memory-view']" }
-      ]
+        {
+          "action": "click",
+          "selector": "[data-testid='nav-memory']"
+        }
+      ],
+      "viewportInteractions": {
+        "mobile": [
+          {
+            "action": "click",
+            "selector": "[data-testid='mobile-drawer-open']"
+          },
+          {
+            "action": "wait",
+            "selector": "[data-testid='conversation-sidebar']",
+            "timeoutMs": 10000
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='nav-memory']"
+          }
+        ]
+      },
+      "expectedSelectorTimeoutMs": 10000
     },
     {
       "name": "tools",
-      "matchers": [{ "prefix": "apps/web/src/views/Tools" }],
+      "matchers": [
+        {
+          "prefix": "apps/web/src/views/Tools"
+        }
+      ],
       "route": "/",
+      "fixture": "chat-workspace",
       "expectedSelector": "[data-testid='tools-view']",
       "viewports": ["desktop", "mobile"],
       "interactions": [
-        { "action": "click", "selector": "[data-testid='nav-tools']" },
-        { "action": "wait", "selector": "[data-testid='tools-view']" }
-      ]
+        {
+          "action": "click",
+          "selector": "[data-testid='nav-tools']"
+        }
+      ],
+      "viewportInteractions": {
+        "mobile": [
+          {
+            "action": "click",
+            "selector": "[data-testid='mobile-drawer-open']"
+          },
+          {
+            "action": "wait",
+            "selector": "[data-testid='conversation-sidebar']",
+            "timeoutMs": 10000
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='nav-tools']"
+          }
+        ]
+      },
+      "expectedSelectorTimeoutMs": 10000
     }
   ],
   "globalSmoke": [
     {
       "matchers": [
-        { "exact": "apps/web/src/App.tsx" },
-        { "exact": "apps/web/src/main.tsx" },
-        { "exact": "apps/web/src/components.tsx" },
-        { "exact": "apps/web/src/styles.css" },
-        { "exact": "apps/web/src/index.css" },
-        { "exact": "apps/web/index.html" },
-        { "exact": "apps/web/src/api.ts" },
-        { "exact": "apps/web/src/hooks.ts" },
-        { "exact": "apps/web/vite.config.ts" },
-        { "exact": "apps/web/package.json" },
-        { "exact": "apps/web/tsconfig.json" }
+        {
+          "exact": "apps/web/src/App.tsx"
+        },
+        {
+          "exact": "apps/web/src/main.tsx"
+        },
+        {
+          "exact": "apps/web/src/styles.css"
+        },
+        {
+          "exact": "apps/web/index.html"
+        },
+        {
+          "exact": "apps/web/src/api.ts"
+        },
+        {
+          "exact": "apps/web/src/hooks.ts"
+        },
+        {
+          "exact": "apps/web/vite.config.ts"
+        },
+        {
+          "exact": "apps/web/package.json"
+        },
+        {
+          "exact": "apps/web/tsconfig.json"
+        },
+        {
+          "exact": "apps/web/src/index.css"
+        }
       ],
-      "scenarios": ["command", "jobs-list", "job-detail-paused", "tools"]
+      "scenarios": [
+        "chat-workspace",
+        "conversation-menu",
+        "destructive-dialog",
+        "global-search",
+        "mobile-conversation-drawer",
+        "projects",
+        "jobs-list",
+        "job-detail-paused",
+        "tools"
+      ]
+    },
+    {
+      "matchers": [
+        {
+          "exact": "apps/web/src/components.tsx"
+        }
+      ],
+      "scenarios": [
+        "chat-workspace",
+        "destructive-dialog",
+        "jobs-list",
+        "job-detail-paused",
+        "projects",
+        "tools"
+      ]
+    },
+    {
+      "matchers": [
+        {
+          "prefix": "apps/web/src/views/Command"
+        }
+      ],
+      "scenarios": ["chat-workspace", "jobs-list"]
     }
   ]
 }

@@ -191,15 +191,37 @@ export class VisualQaEngine {
 
       for (const scenario of scenarios) {
         for (const viewport of scenario.viewports ?? viewports) {
-          const context = await browser.newContext({
-            viewport: VIEWPORTS[viewport],
-            serviceWorkers: 'block',
-          });
-          if (opts.signal?.aborted) {
-            await context.close();
-            break;
+          if (opts.signal?.aborted) break;
+          let shot = await this.captureOnce(browser, opts, scenario, viewport, outDir);
+          // A capture that failed because a request never reached the candidate
+          // is infrastructure, not evidence about the UI. Every context is cold,
+          // so a dev-server candidate re-fetches its whole module graph per
+          // scenario; on a loaded machine that exhausts sockets and the app
+          // simply never boots, which then surfaces as a selector timeout.
+          // Retried exactly once, and only for a resource-level network failure:
+          // a real defect fails the same way both times.
+          if (shot.status !== 'captured' && isResourceExhaustion(shot) && !opts.signal?.aborted) {
+            log.warn('visual QA capture hit a resource-level network failure; retrying once', {
+              scenario: scenario.name,
+              viewport,
+              networkFailures: shot.networkFailures,
+            });
+            // Durable, because the abandoned row is about to be deleted: without
+            // this the evidence trail would claim every capture worked first time.
+            this.bus?.emit({
+              type: 'visual_qa.retried',
+              jobId: opts.jobId ?? null,
+              payload: {
+                scenario: scenario.name,
+                viewport,
+                networkFailures: shot.networkFailures,
+                consoleErrors: shot.consoleErrors,
+              },
+            });
+            this.remove(shot.id);
+            shot = await this.captureOnce(browser, opts, scenario, viewport, outDir);
           }
-          shots.push(await this.captureRoute(context, opts, scenario, viewport, outDir));
+          shots.push(shot);
         }
       }
     } catch (error) {
@@ -253,6 +275,21 @@ export class VisualQaEngine {
       return `project-${stableArtifactId(project.id)}`;
     }
     return `run-${newId('visual')}`;
+  }
+
+  /** One scenario capture in its own fresh, isolated browser context. */
+  private async captureOnce(
+    browser: import('playwright').Browser,
+    opts: Parameters<VisualQaEngine['captureRoute']>[1],
+    scenario: Parameters<VisualQaEngine['captureRoute']>[2],
+    viewport: Parameters<VisualQaEngine['captureRoute']>[3],
+    outDir: string,
+  ): Promise<VisualQaShot> {
+    const context = await browser.newContext({
+      viewport: VIEWPORTS[viewport],
+      serviceWorkers: 'block',
+    });
+    return this.captureRoute(context, opts, scenario, viewport, outDir);
   }
 
   private async captureRoute(
@@ -450,6 +487,17 @@ export class VisualQaEngine {
     });
   }
 
+  /**
+   * Drop a superseded capture row.
+   *
+   * Only ever used for a capture that is about to be retried for a resource-level
+   * network failure: leaving it would mean two rows for one scenario/viewport,
+   * and the coverage check would still see the failed one.
+   */
+  private remove(id: string): void {
+    this.db.prepare('DELETE FROM visual_qa WHERE id = ?').run(id);
+  }
+
   private persist(
     input: Omit<VisualQaShot, 'id' | 'createdAt' | 'reviewVerdict' | 'reviewFindings'> & {
       jobId: string | null;
@@ -545,6 +593,35 @@ function parseReview(raw: string | null): {
   } catch {
     return { verdict: null, findings: [] };
   }
+}
+
+/**
+ * A failure caused by the machine running out of sockets or memory for a
+ * request, rather than by anything the candidate rendered.
+ *
+ * Two properties keep this from ever retrying away a real defect:
+ *
+ * - The tokens are only ones where the request never left this machine. A reset
+ *   connection is deliberately NOT here: the connection was established and then
+ *   torn down, which a candidate that crashes mid-response or resets a stream
+ *   produces itself, and that is evidence about the candidate.
+ * - EVERY recorded entry must match, not merely one. A scenario that failed for
+ *   a genuine UI reason and also happens to record one resource error must not
+ *   be retried on the strength of the incidental entry, because a retry that
+ *   passes would drop detection of an intermittent defect.
+ *
+ * With no entries at all there is nothing to attribute the failure to, so it is
+ * treated as evidence about the candidate and not retried.
+ */
+const RESOURCE_ERRORS =
+  /ERR_NO_BUFFER_SPACE|ERR_INSUFFICIENT_RESOURCES|ERR_NETWORK_CHANGED|ERR_OUT_OF_MEMORY|EMFILE|ENOBUFS|ENFILE/i;
+
+export function isResourceExhaustion(shot: {
+  networkFailures?: string[];
+  consoleErrors?: string[];
+}): boolean {
+  const entries = [...(shot.networkFailures ?? []), ...(shot.consoleErrors ?? [])];
+  return entries.length > 0 && entries.every((entry) => RESOURCE_ERRORS.test(entry));
 }
 
 /**

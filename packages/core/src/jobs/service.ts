@@ -1,5 +1,5 @@
 import type { Db } from '../db/index.js';
-import { parseJson } from '../db/index.js';
+import { likeTerm, parseJson, transaction } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { ProviderId } from '../agents/types.js';
@@ -57,9 +57,25 @@ export interface Job {
   /** The scenario plan Visual QA actually resolved for this candidate diff. */
   visualQaPlan: VisualQaPlan | null;
   episodeId: string | null;
+  /** Archived Jobs keep every artifact and simply leave the default History. */
+  archivedAt: string | null;
+  /** The Job this one was created from by "Run again". */
+  predecessorJobId: string | null;
+  /** The exact conversation message that asked for this Job. */
+  originMessageId: string | null;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
+}
+
+/** What is left behind when a disposable Job is hard-deleted. */
+export interface JobTombstone {
+  id: string;
+  sessionId: string | null;
+  projectId: string | null;
+  goal: string;
+  reason: string;
+  deletedAt: string;
 }
 
 export interface AgentRun {
@@ -117,6 +133,9 @@ function rowToJob(row: Row): Job {
     ),
     visualQaPlan: parseJson(row.visual_qa_plan as string, null as VisualQaPlan | null),
     episodeId: (row.episode_id as string) ?? null,
+    archivedAt: (row.archived_at as string) ?? null,
+    predecessorJobId: (row.predecessor_job_id as string) ?? null,
+    originMessageId: (row.origin_message_id as string) ?? null,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
     finishedAt: (row.finished_at as string) ?? null,
@@ -168,6 +187,8 @@ export class JobService {
     candidateSource?: { baseSha: string; sourceSha: string };
     validationOnly?: boolean;
     visualQa?: { required?: boolean; scenarios: VisualQaScenario[] };
+    predecessorJobId?: string | null;
+    originMessageId?: string | null;
   }): Job {
     if (Boolean(input.candidateSource) !== Boolean(input.validationOnly)) {
       throw new Error('candidateSource and validationOnly must be supplied together');
@@ -210,6 +231,9 @@ export class JobService {
       visualQaConfig: input.visualQa ?? null,
       visualQaPlan: null,
       episodeId: null,
+      archivedAt: null,
+      predecessorJobId: input.predecessorJobId ?? null,
+      originMessageId: input.originMessageId ?? null,
       createdAt: now,
       updatedAt: now,
       finishedAt: null,
@@ -218,8 +242,9 @@ export class JobService {
       .prepare(
         `INSERT INTO jobs (id, session_id, project_id, request, goal, acceptance, stage, status,
           fix_cycles, review_fix_cycles, visual_fix_cycles, candidate_base_sha,
-          candidate_source_sha, validation_only, visual_qa_config, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          candidate_source_sha, validation_only, visual_qa_config, predecessor_job_id,
+          origin_message_id, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         job.id,
@@ -237,6 +262,8 @@ export class JobService {
         job.candidateSourceSha,
         job.validationOnly ? 1 : 0,
         job.visualQaConfig ? JSON.stringify(job.visualQaConfig) : null,
+        job.predecessorJobId,
+        job.originMessageId,
         now,
         now,
       );
@@ -254,21 +281,61 @@ export class JobService {
     return row ? rowToJob(row) : null;
   }
 
-  list(filter: { projectId?: string; status?: JobStatus; limit?: number } = {}): Job[] {
+  list(
+    filter: {
+      projectId?: string;
+      sessionId?: string;
+      status?: JobStatus;
+      stage?: JobStage;
+      /** Default `active`: archived Jobs leave the normal History. */
+      archived?: 'active' | 'archived' | 'all';
+      search?: string;
+      /** ISO timestamps bounding `created_at`. */
+      since?: string;
+      until?: string;
+      sort?: 'updated' | 'created';
+      limit?: number;
+    } = {},
+  ): Job[] {
     const where: string[] = [];
     const params: (string | number)[] = [];
     if (filter.projectId) {
       where.push('project_id = ?');
       params.push(filter.projectId);
     }
+    if (filter.sessionId) {
+      where.push('session_id = ?');
+      params.push(filter.sessionId);
+    }
     if (filter.status) {
       where.push('status = ?');
       params.push(filter.status);
     }
+    if (filter.stage) {
+      where.push('stage = ?');
+      params.push(filter.stage);
+    }
+    const archived = filter.archived ?? 'active';
+    if (archived === 'active') where.push('archived_at IS NULL');
+    if (archived === 'archived') where.push('archived_at IS NOT NULL');
+    if (filter.search?.trim()) {
+      where.push("(lower(goal) LIKE ? ESCAPE '~' OR lower(request) LIKE ? ESCAPE '~' OR id = ?)");
+      const like = likeTerm(filter.search.trim().toLowerCase());
+      params.push(like, like, filter.search.trim());
+    }
+    if (filter.since) {
+      where.push('created_at >= ?');
+      params.push(filter.since);
+    }
+    if (filter.until) {
+      where.push('created_at <= ?');
+      params.push(filter.until);
+    }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const order = filter.sort === 'updated' ? 'updated_at' : 'created_at';
     const rows = this.db
-      .prepare(`SELECT * FROM jobs ${clause} ORDER BY created_at DESC LIMIT ?`)
-      .all(...params, filter.limit ?? 50) as Row[];
+      .prepare(`SELECT * FROM jobs ${clause} ORDER BY ${order} DESC LIMIT ?`)
+      .all(...params, Math.min(Math.max(filter.limit ?? 50, 1), 500)) as Row[];
     return rows.map(rowToJob);
   }
 
@@ -389,6 +456,194 @@ export class JobService {
         id,
       );
     return next;
+  }
+
+  // --------------------------------------------------------------- lifecycle --
+
+  /**
+   * Archive a Job. Every pipeline artifact, verification, review and piece of
+   * application evidence is preserved untouched — the Job just leaves History.
+   */
+  setArchived(id: string, archived: boolean): Job | null {
+    const job = this.get(id);
+    if (!job) return null;
+    if (archived && !isFinished(job)) {
+      throw new Error(`job is ${job.stage}; only a finished job can be archived`);
+    }
+    this.db
+      .prepare('UPDATE jobs SET archived_at = ?, updated_at = ? WHERE id = ?')
+      .run(archived ? nowIso() : null, nowIso(), id);
+    this.bus.emit({
+      type: 'job.archived',
+      jobId: id,
+      sessionId: job.sessionId,
+      payload: { archived },
+    });
+    return this.get(id);
+  }
+
+  /**
+   * Whether this Job may be hard-deleted, and what deleting it would destroy.
+   *
+   * The load-bearing rule: a Job that carries any candidate application or
+   * self-upgrade transaction is immutable evidence -- of a change that really
+   * happened, or of a human having authorised one. Never deletable; Archive is
+   * the answer.
+   */
+  deleteEligibility(id: string): {
+    eligible: boolean;
+    reason: string;
+    removes: string[];
+    preserves: string[];
+  } {
+    const job = this.get(id);
+    if (!job) return { eligible: false, reason: 'job not found', removes: [], preserves: [] };
+
+    const has = (sql: string) => Boolean(this.db.prepare(sql).get(id));
+    // ANY application row, not just the ones that reached a repository. An
+    // `approved` row records that a human authorised this candidate and a
+    // `failed` row records that the attempt happened; `candidate_applications`
+    // cascades from `jobs`, so deleting the Job erased that decision outright.
+    const applied = has('SELECT 1 FROM candidate_applications WHERE job_id = ?');
+    const upgraded = has('SELECT 1 FROM upgrade_transactions WHERE job_id = ?');
+    if (applied || upgraded) {
+      return {
+        eligible: false,
+        reason:
+          'this candidate carries application or self-upgrade evidence, which is immutable. ' +
+          'Archive it instead.',
+        removes: [],
+        preserves: ['application record', 'upgrade transaction', 'verification and review history'],
+      };
+    }
+    if (!isFinished(job)) {
+      return {
+        eligible: false,
+        reason: `job is ${job.stage}; cancel it and let its worktree be released first`,
+        removes: [],
+        preserves: [],
+      };
+    }
+    const removes = [
+      ...(job.worktreePath ? ['disposable candidate worktree'] : []),
+      ...(job.branch ? ['candidate branch'] : []),
+      'screenshots and captured artifacts',
+      'verification, review and agent-run records',
+      'disposable context packs',
+    ];
+    return {
+      eligible: true,
+      reason:
+        job.stage === 'awaiting_user' || job.stage === 'paused'
+          ? 'the candidate was never applied; deleting abandons it'
+          : 'this Job produced no applied change',
+      removes,
+      preserves: ['the repository itself', 'project and user memory', 'the deletion audit record'],
+    };
+  }
+
+  /**
+   * Erase a Job's disposable rows and leave a tombstone.
+   *
+   * Filesystem cleanup (worktree, artifacts) happens in JobLifecycle before this
+   * is called: by the time the rows go, the paths they name are already gone.
+   */
+  hardDelete(id: string, reason = 'deleted by the user'): JobTombstone | null {
+    const job = this.get(id);
+    if (!job) return null;
+    const eligibility = this.deleteEligibility(id);
+    if (!eligibility.eligible) throw new Error(eligibility.reason);
+    const tombstone: JobTombstone = {
+      id: job.id,
+      sessionId: job.sessionId,
+      projectId: job.projectId,
+      goal: job.goal,
+      reason: redactSecrets(reason).slice(0, 500),
+      deletedAt: nowIso(),
+    };
+    transaction(this.db, () => {
+      // The episode is a disposable Job episode: it exists only to summarise
+      // this Job. Durable project knowledge learned during it is a separate row
+      // and is deliberately left alone.
+      if (job.episodeId) {
+        this.db
+          .prepare(`DELETE FROM memories WHERE id = ? AND kind = 'episode' AND subject = ?`)
+          .run(job.episodeId, `job.${job.id}`);
+      }
+      this.db.prepare('DELETE FROM context_packs WHERE job_id = ?').run(id);
+      // agent_runs / verifications / reviews / visual_qa all cascade from jobs.
+      this.db.prepare('DELETE FROM jobs WHERE id = ?').run(id);
+      this.db
+        .prepare(
+          `INSERT OR REPLACE INTO job_tombstones (id, session_id, project_id, goal, reason, deleted_at)
+           VALUES (?,?,?,?,?,?)`,
+        )
+        .run(
+          tombstone.id,
+          tombstone.sessionId,
+          tombstone.projectId,
+          tombstone.goal,
+          tombstone.reason,
+          tombstone.deletedAt,
+        );
+    });
+    // Emitted after the row is gone: the audit trail of a deletion is the event
+    // log and the tombstone, never the Job that no longer exists.
+    this.bus.emit({
+      type: 'job.deleted',
+      sessionId: tombstone.sessionId,
+      payload: { jobId: id, goal: tombstone.goal, reason: tombstone.reason },
+    });
+    return tombstone;
+  }
+
+  tombstone(id: string): JobTombstone | null {
+    const row = this.db.prepare('SELECT * FROM job_tombstones WHERE id = ?').get(id) as
+      Row | undefined;
+    if (!row) return null;
+    return {
+      id: row.id as string,
+      sessionId: (row.session_id as string) ?? null,
+      projectId: (row.project_id as string) ?? null,
+      goal: row.goal as string,
+      reason: (row.reason as string) ?? '',
+      deletedAt: row.deleted_at as string,
+    };
+  }
+
+  tombstonesForSession(sessionId: string): JobTombstone[] {
+    const rows = this.db
+      .prepare('SELECT id FROM job_tombstones WHERE session_id = ?')
+      .all(sessionId) as Array<{ id: string }>;
+    return rows.flatMap((row) => {
+      const tombstone = this.tombstone(row.id);
+      return tombstone ? [tombstone] : [];
+    });
+  }
+
+  /**
+   * Create a fresh Job from a finished one.
+   *
+   * Deliberately a NEW Job against the project's current state: resurrecting a
+   * stale candidate would re-use reviewed evidence that no longer describes the
+   * target. The predecessor link is what keeps the history readable.
+   */
+  retryAsNew(id: string, overrides: { sessionId?: string | null } = {}): Job {
+    const previous = this.get(id);
+    if (!previous) throw new Error(`job not found: ${id}`);
+    if (previous.validationOnly) {
+      throw new Error('validation-only jobs pin an immutable candidate and cannot be re-run');
+    }
+    return this.create({
+      projectId: previous.projectId,
+      sessionId: overrides.sessionId ?? previous.sessionId,
+      request: previous.request,
+      goal: previous.goal,
+      acceptance: previous.acceptance,
+      ...(previous.visualQaConfig ? { visualQa: previous.visualQaConfig } : {}),
+      predecessorJobId: previous.id,
+      originMessageId: previous.originMessageId,
+    });
   }
 
   // -------------------------------------------------------------- agent runs --
@@ -515,6 +770,11 @@ export class JobService {
     }
     return { jobs: stale.length, runs };
   }
+}
+
+/** A Job nothing is going to move on its own. */
+function isFinished(job: Job): boolean {
+  return ['completed', 'failed', 'cancelled', 'paused', 'awaiting_user'].includes(job.stage);
 }
 
 /** Trim a natural-language request into a one-line goal. Purely mechanical. */

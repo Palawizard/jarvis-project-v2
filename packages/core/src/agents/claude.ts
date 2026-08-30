@@ -54,6 +54,7 @@ export class ClaudeProvider implements AgentProvider {
       streaming: true,
       resumable: true,
       structuredOutput: true,
+      toolFreeChat: true,
       models: ['opus', 'sonnet', 'haiku'],
     };
 
@@ -247,7 +248,10 @@ export function buildClaudeArgs(
   model: string,
   configuredPermissionMode: JarvisConfig['agents']['claudePermissionMode'],
 ): string[] {
-  const readOnly = options.role === 'reviewer' || options.role === 'visual_reviewer';
+  // The conversational agent has no business editing source: it answers, and it
+  // may only *request* structured Jarvis actions that trusted code then decides.
+  const readOnly =
+    options.role === 'reviewer' || options.role === 'visual_reviewer' || options.role === 'chat';
   const args = [
     '-p',
     '--output-format',
@@ -263,6 +267,9 @@ export function buildClaudeArgs(
   if (options.safeMode) args.push('--safe-mode');
   if (options.ephemeral) args.push('--no-session-persistence');
   if (options.role === 'visual_reviewer') args.push('--tools', 'Read');
+  // General conversation runs with no tools at all. It is not in a worktree and
+  // has nothing legitimate to read from the filesystem.
+  if (options.role === 'chat') args.push('--tools', '');
   for (const dir of new Set(
     options.imagePaths?.map((file) => path.dirname(path.resolve(options.cwd, file))) ?? [],
   )) {

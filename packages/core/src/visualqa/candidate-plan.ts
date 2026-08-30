@@ -276,7 +276,7 @@ export function validateCatalog(raw: Buffer | string): CandidateCatalog {
 
   // Bounded counts alone still allow hours of blocking waits, and every step
   // costs its engine default when the catalog simply omits a timeout.
-  const worstCaseMs = scenarios.reduce((total, entry) => total + scenarioWorstCaseMs(entry), 0);
+  const worstCaseMs = catalogWorstCaseMs({ version: 1, scenarios, globalSmoke: [] });
   if (worstCaseMs > BOUNDS.declaredMs) reject('exceeds the catalog waiting-time budget');
 
   const smokeRaw = body.globalSmoke ?? [];
@@ -300,6 +300,16 @@ export function validateCatalog(raw: Buffer | string): CandidateCatalog {
     return { matchers, scenarios: [...new Set(value.scenarios as string[])] };
   });
   return { version: 1, scenarios, globalSmoke };
+}
+
+/** The whole-catalog declared wait budget, exposed so a catalog can assert its
+ * own headroom: the check runs before selection, so a catalog that reaches the
+ * ceiling pauses every self UI job rather than failing one. */
+export const CATALOG_BUDGET_MS: number = BOUNDS.declaredMs;
+
+/** Total declared waiting a whole catalog could hold the browser for. */
+export function catalogWorstCaseMs(catalog: CandidateCatalog): number {
+  return catalog.scenarios.reduce((total, entry) => total + scenarioWorstCaseMs(entry), 0);
 }
 
 /** Mirrors the waits VisualQaEngine actually performs, defaults included. */

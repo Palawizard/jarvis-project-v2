@@ -31,30 +31,104 @@ export type AgentFailureKind =
   | 'protocol'
   | 'agent_failure';
 
+/** Failure kinds that describe provider/infrastructure state, never the source. */
+export const INFRASTRUCTURE_FAILURE_KINDS: readonly AgentFailureKind[] = [
+  'quota',
+  'cooldown',
+  'unavailable',
+  'timeout',
+  'session_invalid',
+  'protocol',
+];
+
+/**
+ * Provider usage-limit vocabulary, as Claude Code and Codex actually phrase it.
+ * Kept explicit rather than folded into a generic "error" bucket, because a
+ * quota pause must never look like a product defect and must never reach a fixer.
+ */
+const QUOTA_PATTERNS = [
+  /rate[ -]?limit/i,
+  /too many requests/i,
+  /\bquota\b/i,
+  /usage limit (?:reached|exceeded)/i,
+  /(?:monthly|weekly|daily|session|spend|hourly) limit/i,
+  /limit (?:will )?reset(?:s)? (?:at|in|on)/i,
+  /out of (?:credits|usage)/i,
+  /upgrade to increase your usage limit/i,
+  /you(?:'ve| have) (?:hit|reached) your/i,
+];
+
+/**
+ * A persisted provider session that can no longer be resumed. Distinguished
+ * from a generic failure so recovery can retire the session id and try ONCE in
+ * a fresh context instead of replaying the same broken thread forever.
+ */
+const SESSION_INVALID_PATTERNS = [
+  /(?:session|conversation|thread|resume)[^.\n]{0,40}(?:not found|invalid|expired|no longer|(?:can ?not|could not|can't|couldn't) be resumed|does not exist)/i,
+  /(?:no|unknown) (?:such )?(?:session|conversation|thread)\b/i,
+  /--resume[^.\n]{0,40}(?:failed|invalid|unknown)/i,
+];
+
 export function classifyAgentFailure(
   result: Pick<AgentRunResult, 'status' | 'error'>,
 ): AgentFailureKind {
   if (result.status === 'cancelled') return 'cancelled';
   if (result.status === 'timeout') return 'timeout';
   const error = result.error ?? '';
-  if (/rate[ -]?limit|usage limit|spend limit|session limit|too many requests|quota/i.test(error))
-    return 'quota';
+  if (QUOTA_PATTERNS.some((pattern) => pattern.test(error))) return 'quota';
   if (/cooldown/i.test(error)) return 'cooldown';
   // Auth outages are provider health, not a stale thread id: "your session has
   // expired" would otherwise read as session_invalid and skip the cooldown.
   if (/not logged in|log ?in again/i.test(error)) return 'unavailable';
-  if (
-    /(?:session|conversation|thread|resume)[^.\n]{0,40}(?:not found|invalid|expired|no longer|(?:can ?not|could not|can't|couldn't) be resumed|does not exist)/i.test(
-      error,
-    ) ||
-    /(?:no|unknown) (?:such )?(?:session|conversation|thread)\b/i.test(error)
-  )
-    return 'session_invalid';
+  if (SESSION_INVALID_PATTERNS.some((pattern) => pattern.test(error))) return 'session_invalid';
   if (/not found|could not start|could not be executed|not logged in|unavailable/i.test(error))
     return 'unavailable';
   if (/malformed JSONL|without a terminal structured event|protocol/i.test(error))
     return 'protocol';
   return 'agent_failure';
+}
+
+/**
+ * The reset moment a provider mentioned, when it names one unambiguously.
+ * Best-effort and honest: an unparsable phrase yields null rather than a guess.
+ */
+export function parseQuotaReset(error: string | undefined): string | null {
+  if (!error) return null;
+  const iso =
+    /reset(?:s|ting)?\s+(?:at|on)\s+(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?)/i.exec(
+      error,
+    );
+  if (iso?.[1]) {
+    const parsed = Date.parse(iso[1].replace(' ', 'T'));
+    if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+  }
+  const clock =
+    /reset(?:s|ting)?\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?(?:\s*\([^)]{1,20}\))?)/i.exec(error);
+  return clock?.[1] ? clock[1].trim() : null;
+}
+
+/** One line a human can act on, for the pause reason and the UI. */
+export function describeAgentFailure(kind: AgentFailureKind, error: string | undefined): string {
+  switch (kind) {
+    case 'quota': {
+      const reset = parseQuotaReset(error);
+      return `Provider usage limit reached${reset ? `; resets at ${reset}` : ''}. This is provider state, not a problem with the code.`;
+    }
+    case 'cooldown':
+      return 'Provider is in a temporary cooldown. This is provider state, not a problem with the code.';
+    case 'session_invalid':
+      return 'The saved provider session could not be resumed.';
+    case 'unavailable':
+      return 'No provider CLI is available or logged in.';
+    case 'timeout':
+      return 'The provider run exceeded its time budget.';
+    case 'protocol':
+      return 'The provider produced an unusable structured response.';
+    case 'cancelled':
+      return 'The run was cancelled.';
+    default:
+      return 'The agent reported an error during execution.';
+  }
 }
 
 interface RegistryDeps {
@@ -126,7 +200,9 @@ export class AgentRegistry {
     } = {},
   ): Promise<RoutingResult> {
     const caps = await this.capabilities();
-    const usable = caps.filter((capability) => capability.available);
+    const usable = caps.filter(
+      (capability) => capability.available && (role !== 'chat' || capability.toolFreeChat === true),
+    );
     const profile = resolveModelProfile(opts.taskProfile);
     const order: ProviderId[] = [];
     if ((role === 'reviewer' || role === 'visual_reviewer') && opts.avoid) {
@@ -145,7 +221,16 @@ export class AgentRegistry {
     const capability = selectedId ? usable.find((cap) => cap.id === selectedId) : undefined;
     const reason = selectedId
       ? routingReason(selectedId, role, opts, caps, profile)
-      : caps.map((cap) => `${cap.id}: ${cap.reason ?? 'unavailable'}`).join('; ');
+      : caps
+          .map(
+            (cap) =>
+              `${cap.id}: ${
+                role === 'chat' && cap.available && cap.toolFreeChat !== true
+                  ? 'cannot run tool-free chat'
+                  : (cap.reason ?? 'unavailable')
+              }`,
+          )
+          .join('; ');
     const decision: RoutingDecision = {
       id: newId('route'),
       jobId: opts.jobId ?? null,
@@ -169,7 +254,11 @@ export class AgentRegistry {
     return { provider: this.get(selectedId), capabilities: capability, decision };
   }
 
-  recordResult(provider: ProviderId, result: Pick<AgentRunResult, 'status' | 'error'>): void {
+  recordResult(
+    provider: ProviderId,
+    result: Pick<AgentRunResult, 'status' | 'error'>,
+    opts: { resumed?: boolean } = {},
+  ): void {
     const at = this.now();
     if (result.status === 'completed') {
       this.health.set(provider, { lastSuccessAt: at.toISOString() });
@@ -180,7 +269,14 @@ export class AgentRegistry {
       lastFailureAt: at.toISOString(),
     };
     const kind = classifyAgentFailure(result);
-    if (['quota', 'unavailable', 'timeout', 'protocol'].includes(kind)) {
+    // A broken persisted session says nothing about the provider's health, so it
+    // must not put an otherwise usable provider into cooldown. A protocol failure
+    // while resuming is the same story: the observed Codex case answered a fresh
+    // invocation perfectly and only failed on the resumed thread. Cooling the
+    // provider down there would make the one legitimate recovery unroutable, so
+    // the fresh-context attempt decides whether the provider is really unhealthy.
+    const sessionScoped = kind === 'session_invalid' || (kind === 'protocol' && opts.resumed);
+    if (!sessionScoped && ['quota', 'unavailable', 'timeout', 'protocol'].includes(kind)) {
       next.cooldownUntil = new Date(at.getTime() + this.config.agents.cooldownMs).toISOString();
       this.deps.bus?.emit({
         type: kind === 'quota' ? 'agent.rate_limited' : 'agent.provider_unhealthy',

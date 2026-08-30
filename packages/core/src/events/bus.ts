@@ -12,6 +12,9 @@ export type JarvisEventType =
   | 'job.completed'
   | 'job.failed'
   | 'job.cancelled'
+  | 'job.archived'
+  | 'job.deleted'
+  | 'job.linked'
   | 'candidate.approved'
   | 'candidate.apply.started'
   | 'candidate.apply.completed'
@@ -44,6 +47,9 @@ export type JarvisEventType =
   | 'visual_qa.plan.resolved'
   | 'visual_qa.started'
   | 'visual_qa.captured'
+  // The machine could not make a request; the capture was retaken. Persisted so a
+  // run that needed two attempts is distinguishable from one that did not.
+  | 'visual_qa.retried'
   | 'visual_qa.completed'
   | 'visual_review.started'
   | 'visual_review.completed'
@@ -65,6 +71,16 @@ export type JarvisEventType =
   | 'memory.retrieved'
   | 'memory.deleted'
   | 'session.updated'
+  | 'conversation.created'
+  | 'conversation.updated'
+  | 'conversation.archived'
+  | 'conversation.deleted'
+  | 'message.created'
+  // Deltas carry only a status and a character count. Streaming the tokens
+  // themselves into an append-only log would grow the database without bound.
+  | 'message.delta'
+  | 'message.completed'
+  | 'message.failed'
   | 'system.recovery';
 
 export interface JarvisEvent {
@@ -94,6 +110,16 @@ export class EventBus {
   emit(event: JarvisEvent): JarvisEvent {
     const createdAt = event.createdAt ?? nowIso();
     const payload = JSON.stringify(event.payload ?? {});
+    // A delta is live UI fan-out, not history: the message row already holds the
+    // content a restart needs to recover. Persisting one row per token chunk
+    // grew the audit log by hundreds of rows for a single answer, which is
+    // exactly what the type comment above says must not happen.
+    if (event.type === 'message.delta') {
+      const live = { ...event, createdAt };
+      this.emitter.emit('event', live);
+      this.emitter.emit(event.type, live);
+      return live;
+    }
     const info = this.db
       .prepare(
         `INSERT INTO events (type, job_id, session_id, run_id, payload, created_at)

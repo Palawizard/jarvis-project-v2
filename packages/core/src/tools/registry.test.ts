@@ -142,6 +142,26 @@ describe('tool execution and gating', () => {
     expect(outcome.error).toMatch(/ceiling/);
   });
 
+  it('does not escalate a denial caused by a caller ceiling', async () => {
+    const reg = registry();
+    const { tool, calls } = counter('safe.forbidden', 'safe_action');
+    reg.register(tool);
+    const denied = await reg.execute(
+      'safe.forbidden',
+      { text: 'blocked' },
+      { actor: 'agent', maxRisk: 'observe' },
+    );
+    if (denied.status !== 'denied') throw new Error('expected denial');
+
+    const escalation = await reg.escalateAgentRequest(denied.execution.id, { text: 'blocked' });
+
+    expect(escalation.status).toBe('denied');
+    expect(escalation.execution.id).toBe(denied.execution.id);
+    expect(escalation.execution.reasonCode).toBe('caller_ceiling');
+    expect(reg.executions({ toolName: 'safe.forbidden' })).toHaveLength(1);
+    expect(calls).toEqual([]);
+  });
+
   it('validates input against the schema before executing', async () => {
     const reg = registry();
     const { tool, calls } = counter('demo.validate');
@@ -683,6 +703,44 @@ describe('standing permissions', () => {
     // ...and the next one asks again, because nothing was remembered.
     const second = await reg.execute('agent.once', { text: 'b' }, { actor: 'agent' });
     expect(second.status).toBe('pending_approval');
+  });
+
+  it('keeps agent origin and grant suppression when a failed escalation is retried', async () => {
+    const reg = registry();
+    reg.register({
+      name: 'agent.sensitive.retry',
+      revision: '1',
+      description: 'fails after approval',
+      risk: 'sensitive',
+      input: z.object({ text: z.string() }),
+      execute: async () => {
+        throw new Error('deterministic failure');
+      },
+    });
+    const denied = await reg.execute(
+      'agent.sensitive.retry',
+      { text: 'same request' },
+      { actor: 'agent' },
+    );
+    if (denied.status !== 'denied') throw new Error('expected an agent denial');
+    const pending = await reg.escalateAgentRequest(denied.execution.id, {
+      text: 'same request',
+    });
+    if (pending.status !== 'pending_approval') throw new Error('expected human confirmation');
+    const failed = await reg.approve(pending.execution.id);
+    expect(failed.status).toBe('failed');
+
+    const grant = reg.grant({ toolName: 'agent.sensitive.retry', actor: 'user' });
+    const retried = await reg.retry(failed.execution.id);
+
+    expect(retried.status).toBe('pending_approval');
+    expect(retried.execution).toMatchObject({
+      actor: 'user',
+      originatingActor: 'agent',
+      parentExecutionId: failed.execution.id,
+      grantId: null,
+    });
+    expect(reg.getGrant(grant.id)?.revokedAt).toBeNull();
   });
 
   it('ignores a grant row that was written for a non-user actor', async () => {

@@ -10,6 +10,8 @@ import { GitWorkspace } from '../git/workspace.js';
 import type { Job } from '../jobs/service.js';
 import type { Project } from '../projects/service.js';
 import {
+  CATALOG_BUDGET_MS,
+  catalogWorstCaseMs,
   resolveVisualPlanForCandidate,
   validateCatalog,
   VISUAL_QA_CATALOG_PATH,
@@ -79,7 +81,7 @@ function project(overrides: Partial<Project> = {}): Project {
     devUrl: null,
     summary: null,
     isSelf: true,
-    config: { visualQa: { required: true, scenarios: [selfSurfaceScenario('command')] } },
+    config: { visualQa: { required: true, scenarios: [selfSurfaceScenario('jobs-list')] } },
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
     ...overrides,
@@ -156,6 +158,21 @@ describe('the committed catalog', () => {
     const root = repoRoot();
     const raw = fs.readFileSync(path.join(root, ...VISUAL_QA_CATALOG_PATH.split('/')), 'utf8');
     validateCatalog(raw);
+
+    // The parent and the candidate must agree on the surface vocabulary:
+    // selfSurfaceScenario throws for a name only one of them knows, and the
+    // deleted Command view must never resolve a legacy command scenario.
+    for (const entry of validateCatalog(raw).scenarios) {
+      expect(entry.name).not.toBe('command');
+      expect(() => selfSurfaceScenario(entry.name)).not.toThrow();
+    }
+
+    // The wait budget is whole-catalog and is checked before selection, so a
+    // catalog that creeps up to it pauses EVERY self UI job as planning
+    // infrastructure rather than failing one. Assert the headroom here, where
+    // it is cheap to see, instead of discovering it on a real candidate.
+    const worstCaseMs = catalogWorstCaseMs(validateCatalog(raw));
+    expect(worstCaseMs).toBeLessThan(CATALOG_BUDGET_MS * 0.85);
 
     const webFiles = execFileSync('git', ['ls-files', 'apps/web'], { cwd: root, encoding: 'utf8' })
       .trim()

@@ -6,7 +6,12 @@ import path from 'node:path';
 import { loadConfig } from '../config.js';
 import { openDb } from '../db/index.js';
 import { randomBytes } from 'node:crypto';
-import { candidateControlHeader, validateVisualEvidence, VisualQaEngine } from './engine.js';
+import {
+  candidateControlHeader,
+  isResourceExhaustion,
+  validateVisualEvidence,
+  VisualQaEngine,
+} from './engine.js';
 
 const servers: http.Server[] = [];
 const roots: string[] = [];
@@ -24,6 +29,58 @@ afterEach(
       });
     }),
 );
+
+describe('retrying only a resource-level capture failure', () => {
+  it('recognises a request the machine could not make', () => {
+    // The failure this exists for: a cold context re-fetches the whole dev
+    // module graph per scenario, the machine runs out of sockets, and the app
+    // never boots -- which then surfaces as a selector timeout.
+    expect(
+      isResourceExhaustion({
+        networkFailures: ['GET http://127.0.0.1:52325/src/App.tsx — net::ERR_NO_BUFFER_SPACE'],
+      }),
+    ).toBe(true);
+    expect(
+      isResourceExhaustion({
+        consoleErrors: ['Failed to load resource: net::ERR_NO_BUFFER_SPACE'],
+      }),
+    ).toBe(true);
+  });
+
+  it('needs every recorded entry to be resource-level, not just one', () => {
+    // A scenario that failed for a genuine UI reason and merely happens to also
+    // record a resource error must not be retried on the strength of the
+    // incidental entry: a retry that passes would drop detection of an
+    // intermittent defect from every run to every other run.
+    expect(
+      isResourceExhaustion({
+        networkFailures: ['GET /src/App.tsx — net::ERR_NO_BUFFER_SPACE'],
+        consoleErrors: ['TypeError: cannot read properties of undefined'],
+      }),
+    ).toBe(false);
+  });
+
+  it('treats a reset connection as evidence about the candidate', () => {
+    // The connection was established and then torn down, which a candidate that
+    // crashes mid-response or resets a stream produces itself.
+    expect(
+      isResourceExhaustion({ networkFailures: ['GET /api/events — net::ERR_CONNECTION_RESET'] }),
+    ).toBe(false);
+  });
+
+  it('never retries away evidence about the candidate', () => {
+    // A 404, a 500, a script error or a plain timeout are all things the
+    // candidate did. Retrying any of them would hide a real defect.
+    expect(isResourceExhaustion({ networkFailures: ['GET /src/App.tsx — 404 Not Found'] })).toBe(
+      false,
+    );
+    expect(isResourceExhaustion({ networkFailures: ['GET /api/jobs — 500'] })).toBe(false);
+    expect(
+      isResourceExhaustion({ consoleErrors: ['TypeError: cannot read properties of undefined'] }),
+    ).toBe(false);
+    expect(isResourceExhaustion({})).toBe(false);
+  });
+});
 
 describe('deterministic visual interactions', () => {
   it('captures desktop/mobile after goto, fill, click, wait and screenshot steps', async () => {
@@ -99,7 +156,7 @@ describe('deterministic visual interactions', () => {
     } finally {
       db.close();
     }
-  });
+  }, 60_000);
 
   it('runs the declared per-viewport interactions instead of the shared ones', async () => {
     // Mobile hides the sidebar behind a real drawer, exactly as a candidate UI
@@ -454,7 +511,12 @@ function findPngs(root: string): string[] {
 
 describe('candidate-runtime authenticated visual QA', () => {
   const CANDIDATE_SCENARIOS = () => [
-    { name: 'command', route: '/', viewports: ['desktop' as const, 'mobile' as const] },
+    {
+      name: 'chat-workspace',
+      route: '/',
+      expectedSelector: "[data-testid='chat-view']",
+      viewports: ['desktop' as const, 'mobile' as const],
+    },
     {
       name: 'tools',
       route: '/',
@@ -462,6 +524,14 @@ describe('candidate-runtime authenticated visual QA', () => {
         { action: 'click' as const, selector: "[data-testid='nav-tools']" },
         { action: 'wait' as const, selector: "[data-testid='tools-view']" },
       ],
+      viewportInteractions: {
+        mobile: [
+          { action: 'click' as const, selector: "[data-testid='mobile-drawer-open']" },
+          { action: 'click' as const, selector: "[data-testid='nav-tools']" },
+          { action: 'wait' as const, selector: "[data-testid='tools-view']" },
+        ],
+      },
+      expectedSelector: "[data-testid='tools-view']",
       viewports: ['desktop' as const, 'mobile' as const],
     },
   ];
@@ -493,8 +563,14 @@ describe('candidate-runtime authenticated visual QA', () => {
           const root = document.getElementById('root');
           const status = await fetch('/api/auth/status');
           if (status.status !== 200) { root.innerHTML = '<h1>Human control locked</h1>'; return; }
-          root.innerHTML = "<div data-testid='command-view'><h1>Command</h1>" +
+          root.innerHTML = "<div data-testid='chat-view'><h1>Chat</h1>" +
+            "<button data-testid='mobile-drawer-open'>Menu</button>" +
             "<button data-testid='nav-tools'>Tools</button></div>";
+          const nav = document.querySelector("[data-testid='nav-tools']");
+          if (innerWidth < 600) nav.disabled = true;
+          document.querySelector("[data-testid='mobile-drawer-open']").addEventListener('click', () => {
+            nav.disabled = false;
+          });
           document.querySelector("[data-testid='nav-tools']").addEventListener('click', () => {
             root.innerHTML = "<div data-testid='tools-view'><h1>Tools</h1></div>";
           });
@@ -564,14 +640,14 @@ describe('candidate-runtime authenticated visual QA', () => {
       expect(shots.filter((shot) => shot.status === 'captured')).toHaveLength(4);
       expect(shots.filter((shot) => shot.status === 'failed')).toHaveLength(0);
       expect(shots.map((shot) => `${shot.scenarioName}/${shot.viewport}`)).toEqual([
-        'command/desktop',
-        'command/mobile',
+        'chat-workspace/desktop',
+        'chat-workspace/mobile',
         'tools/desktop',
         'tools/mobile',
       ]);
       expect(shots.every((shot) => validateVisualEvidence(shot.screenshotPath))).toBe(true);
       // No 401 and no console errors: the pairing screen was never rendered, so
-      // the screenshots can only show the authenticated Command/Tools UI.
+      // the screenshots can only show the authenticated Chat/Tools UI.
       expect(shots.flatMap((shot) => shot.networkFailures)).toEqual([]);
       expect(shots.flatMap((shot) => shot.consoleErrors)).toEqual([]);
       expect(app.locked()).toBe(0);

@@ -19,6 +19,7 @@
 - Explicit ordered verification steps; Jarvis's full gate includes integration and Playwright E2E while live subscription tests remain opt-in.
 - One-use terminal pairing, origin-scoped browser control capability, authenticated private API/fetch-stream events, and adversarial loopback-client denial.
 - Schema-v5 grant-definition binding, exact recovery/repair evidence checkpoints, strict review protocols, and exact-origin Visual QA navigation/artifact confinement.
+- Schema-v7 conversations: persistent multi-conversation chat, a chat agent path with no source-editing authority, strict structured action routing, deterministic project resolution with explicit ambiguity, conversation-linked Job provenance and tombstones, project/Job archive-versus-delete lifecycles with immutable-evidence protection, one shared destructive confirmation, global search, and classified provider-failure recovery with bounded fresh-context session recovery and stale-Job detection.
 
 ## Partial
 

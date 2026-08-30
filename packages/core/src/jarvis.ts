@@ -8,10 +8,12 @@ import { ensureDirs, getConfig, loadConfig, setConfig, type JarvisConfig } from 
 import { EventBus } from './events/bus.js';
 import { MemoryService } from './memory/service.js';
 import { ContextPackBuilder } from './context/pack.js';
-import { ProjectService, type ProjectConfig } from './projects/service.js';
+import { ProjectService, normaliseProjectName, type ProjectConfig } from './projects/service.js';
 import { SessionService } from './sessions/service.js';
 import { JobService } from './jobs/service.js';
 import { JobPipeline } from './jobs/pipeline.js';
+import { JobLifecycle } from './jobs/lifecycle.js';
+import { ChatService } from './chat/service.js';
 import { AgentRegistry } from './agents/registry.js';
 import { VerificationEngine } from './verification/engine.js';
 import { ReviewEngine } from './review/engine.js';
@@ -47,6 +49,8 @@ export class Jarvis {
   readonly visualQa: VisualQaEngine;
   readonly visualReviewer: VisualReviewer;
   readonly pipeline: JobPipeline;
+  readonly lifecycle: JobLifecycle;
+  readonly chat: ChatService;
   readonly applications: CandidateApplicationService;
   readonly upgrades: UpgradeManager;
   readonly tools: ToolRegistry;
@@ -93,16 +97,6 @@ export class Jarvis {
       this.applications,
       config,
     );
-    this.tools = registerBuiltinTools(
-      { memory: this.memory, projects: this.projects, jobs: this.jobs },
-      {
-        db: this.db,
-        bus: this.bus,
-        defaultTimeoutMs: config.tools.defaultTimeoutMs,
-        approvalTtlMs: config.tools.approvalTtlMs,
-        maxRecordChars: config.tools.maxRecordChars,
-      },
-    );
     this.pipeline = new JobPipeline({
       db: this.db,
       bus: this.bus,
@@ -118,6 +112,42 @@ export class Jarvis {
       visualQa: this.visualQa,
       visualReviewer: this.visualReviewer,
     });
+    this.lifecycle = new JobLifecycle({
+      jobs: this.jobs,
+      projects: this.projects,
+      pipeline: this.pipeline,
+      config,
+    });
+    // One catalog for both the buttons and the sentences: a management action
+    // gets the same policy decision whichever way it was asked for.
+    this.tools = registerBuiltinTools(
+      {
+        memory: this.memory,
+        projects: this.projects,
+        jobs: this.jobs,
+        sessions: this.sessions,
+        pipeline: this.pipeline,
+        lifecycle: this.lifecycle,
+      },
+      {
+        db: this.db,
+        bus: this.bus,
+        defaultTimeoutMs: config.tools.defaultTimeoutMs,
+        approvalTtlMs: config.tools.approvalTtlMs,
+        maxRecordChars: config.tools.maxRecordChars,
+      },
+    );
+    this.chat = new ChatService({
+      config,
+      bus: this.bus,
+      agents: this.agents,
+      context: this.context,
+      memory: this.memory,
+      projects: this.projects,
+      jobs: this.jobs,
+      sessions: this.sessions,
+      tools: this.tools,
+    });
   }
 
   static open(overrides: Partial<JarvisConfig> = {}): Jarvis {
@@ -129,18 +159,19 @@ export class Jarvis {
    * Order matters: recover crashed jobs before anything reads job state.
    */
   async boot(): Promise<{
-    recovered: { jobs: number; runs: number };
+    recovered: { jobs: number; runs: number; messages: number };
     tools: { interrupted: number; expired: number };
     expired: number;
     selfProject: string | null;
     fixtures: string[];
   }> {
-    const recovered = this.jobs.recoverInterrupted();
+    const interruptedResponses = this.sessions.recoverInterruptedMessages();
+    const recovered = { ...this.jobs.recoverInterrupted(), messages: interruptedResponses };
     const interruptedApplications = this.applications.recoverInterrupted();
     // A tool that died mid-action may have had an effect on the outside world,
     // so it is surfaced as interrupted and never replayed automatically.
     const tools = this.tools.recoverInterrupted();
-    if (recovered.jobs || recovered.runs) {
+    if (recovered.jobs || recovered.runs || recovered.messages) {
       log.warn('recovered interrupted work from a previous run', recovered);
     }
     if (interruptedApplications) {
@@ -186,7 +217,7 @@ export class Jarvis {
       // (see visualqa/candidate-plan.ts), which never falls back to these
       // defaults: the running parent's scenarios describe the running parent's
       // UI. They remain only for the legacy pre-plan approval path.
-      visualQa: { required: true, scenarios: [selfSurfaceScenario('command')] },
+      visualQa: { required: true, scenarios: [selfSurfaceScenario('chat-workspace')] },
       verification: {
         steps: [
           { name: 'format', command: 'pnpm format:check' },
@@ -199,14 +230,30 @@ export class Jarvis {
         ],
       },
     };
+    // "Fix the Jobs page in Jarvis" resolves without a chooser through the
+    // project name and the self-reference test in ProjectService, NOT through
+    // aliases. These two were seeded here as aliases, and an alias matches
+    // anywhere in a sentence at a tier above conversation affinity -- so
+    // "Jarvis fix the login bug" resolved this repository and silently
+    // retargeted a conversation that was about something else. Seeded values
+    // are stripped from an existing row too, so a deployed database heals on
+    // the next boot; any alias the user added themselves is kept.
+    const seededAddress = new Set(['jarvis', 'yourself']);
+    const aliases = (existing?.aliases ?? []).filter(
+      (alias) => !seededAddress.has(normaliseProjectName(alias)),
+    );
     if (existing) {
-      this.projects.update(existing.id, { config: { ...existing.config, ...config } });
+      this.projects.update(existing.id, {
+        aliases,
+        config: { ...existing.config, ...config },
+      });
       return this.projects.refreshDetection(existing.id) ?? existing;
     }
     return this.projects.register({
       name: 'jarvis',
       rootPath: repoRoot,
       isSelf: true,
+      aliases,
       devUrl: 'http://localhost:5199',
       summary:
         'Jarvis itself: a local-first, memory-first AI assistant. TypeScript pnpm monorepo — ' +

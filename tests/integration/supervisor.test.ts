@@ -84,6 +84,9 @@ http.createServer((req,res)=>{ if(req.url!=='/health'){res.statusCode=404; retur
   return { root, repo, stateDir, previousSha, candidateSha };
 }
 
+// Must comfortably exceed the supervisor's own budget: an unhealthy candidate
+// spends `healthTimeoutMs` failing, then rolls back, restarts and healthchecks
+// again. Bounded so a genuine hang still fails, just not on a loaded machine.
 async function waitFor<T>(
   read: () => Promise<T | null> | T | null,
   timeoutMs = SUPERVISOR_TIMEOUT_MS,
@@ -196,8 +199,12 @@ async function runActivation(
       // survive every supervised start, including the post-activation restart.
       runtimeEnv: { JARVIS_IMPLEMENTER_PROVIDER: 'claude', JARVIS_CODEX_BIN: DISABLED_CODEX },
       pollMs: 30,
-      healthTimeoutMs: 1_200,
-      commandTimeoutMs: 5_000,
+      // Generous on purpose. These tests assert that a healthy candidate
+      // activates and an unhealthy one rolls back — not how many milliseconds a
+      // fake server needs to bind a port. A tight budget here makes the
+      // supervisor give up on a loaded machine and fail for the wrong reason.
+      healthTimeoutMs: 10_000,
+      commandTimeoutMs: 30_000,
       once: true,
     }),
   );

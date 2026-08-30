@@ -41,10 +41,12 @@ describe('explicit memory command API', () => {
         },
         body: JSON.stringify({ text: 'forget deployment setting', sessionId: session.id }),
       });
-      const body = (await response.json()) as { resolution: string; candidates: unknown[] };
+      const body = (await response.json()) as { kind: string; memoryCandidates?: unknown[] };
       expect(response.status).toBe(200);
-      expect(body.resolution).toBe('ambiguous');
-      expect(body.candidates).toHaveLength(2);
+      // Explicit memory stays deterministic and local: no chat model call, and
+      // an ambiguous "forget" resolves to exact candidates instead of guessing.
+      expect(body.kind).toBe('memory');
+      expect(body.memoryCandidates).toHaveLength(2);
       expect(jarvis.memory.list({ scope: 'user' }).items).toHaveLength(2);
     } finally {
       jarvis.close();

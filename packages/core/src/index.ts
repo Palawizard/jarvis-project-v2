@@ -34,28 +34,47 @@ export {
 export {
   ProjectService,
   detectStack,
+  normaliseProjectName,
+  projectNameKeys,
   type Project,
   type ProjectCommands,
   type ProjectStack,
   type ProjectConfig,
+  type ProjectResolution,
   type CandidateRuntimeConfig,
   type VisualInteraction,
 } from './projects/service.js';
 export {
   SessionService,
+  ConversationService,
+  deriveConversationTitle,
   type Session,
+  type Conversation,
+  type ConversationSummary,
   type SessionState,
   type Message,
+  type MessageStatus,
 } from './sessions/service.js';
+export { ChatService, type ChatTurn, type ChatTurnKind } from './chat/service.js';
+export {
+  ChatActionSchema,
+  extractChatAction,
+  ACTION_TOOLS,
+  CHAT_ACTION_INSTRUCTIONS,
+  type ChatAction,
+  type ChatActionName,
+} from './chat/actions.js';
 
 export {
   JobService,
   normaliseGoal,
   type Job,
+  type JobTombstone,
   type AgentRun,
   type RepairKind,
   type RepairCheckpoint,
 } from './jobs/service.js';
+export { JobLifecycle, type StaleJobReport, type JobDeletionPlan } from './jobs/lifecycle.js';
 export {
   canTransition,
   assertTransition,
@@ -67,7 +86,13 @@ export {
   type JobStage,
   type JobStatus,
 } from './jobs/machine.js';
-export { JobPipeline, candidateRejectionReason, renderProjectSnapshot } from './jobs/pipeline.js';
+export {
+  JobPipeline,
+  candidateRejectionReason,
+  renderProjectSnapshot,
+  agentStagePauseReason,
+  type AgentStageOutcome,
+} from './jobs/pipeline.js';
 export {
   CandidateApplicationService,
   CandidateApplicationError,
@@ -76,7 +101,14 @@ export {
 } from './application/service.js';
 export { UpgradeManager, type UpgradeTransaction, type UpgradeStatus } from './upgrade/manager.js';
 
-export { AgentRegistry } from './agents/registry.js';
+export {
+  AgentRegistry,
+  classifyAgentFailure,
+  describeAgentFailure,
+  parseQuotaReset,
+  INFRASTRUCTURE_FAILURE_KINDS,
+  type AgentFailureKind,
+} from './agents/registry.js';
 export { ClaudeProvider } from './agents/claude.js';
 export { CodexProvider } from './agents/codex.js';
 export { extractMemoryProposals, MEMORY_PROPOSAL_INSTRUCTIONS } from './agents/proposals.js';
@@ -170,7 +202,7 @@ export {
   type ToolActor,
   type PolicyDecision,
 } from './tools/policy.js';
-export { registerBuiltinTools } from './tools/builtin.js';
+export { registerBuiltinTools, searchEverything, type SearchHit } from './tools/builtin.js';
 export {
   agentIsolationPreflight,
   type AgentIsolationBackend,

@@ -11,7 +11,7 @@ import { CANDIDATE_FIXTURE_ENV } from './fixtures.js';
 
 export class CandidateRuntimeUnsupportedError extends Error {}
 
-/** Grace for a launcher that exits right after its server started listening. */
+/** Bounded grace against immediate launcher death; not proof of permanent liveness. */
 const READY_SETTLE_MS = 500;
 
 function exitedError(
@@ -190,10 +190,7 @@ export async function startCandidateRuntime(opts: {
     // then tears the whole job down — so both probes can pass against a process
     // that is already on its way out. Settle for that exit before handing the
     // runtime out, instead of giving Visual QA a corpse to photograph.
-    const settled = await Promise.race([
-      terminated,
-      new Promise<null>((resolve) => setTimeout(resolve, READY_SETTLE_MS, null)),
-    ]);
+    const settled = await settleRuntime(terminated, opts.signal);
     if (settled) throw exitedError(settled, logs);
     if (opts.signal?.aborted) throw new Error('candidate runtime start cancelled');
     return {
@@ -206,9 +203,43 @@ export async function startCandidateRuntime(opts: {
       stop,
     };
   } catch (error) {
-    await stop();
+    try {
+      await stop();
+    } catch (cleanupError) {
+      // Keep the startup/exit diagnostic primary. Cleanup is secondary evidence,
+      // not a replacement for the failure that made cleanup necessary.
+      throw new AggregateError(
+        [error, cleanupError],
+        error instanceof Error ? error.message : String(error),
+        { cause: error },
+      );
+    }
     throw error;
   }
+}
+
+function settleRuntime(
+  terminated: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
+  signal?: AbortSignal,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null } | null> {
+  return new Promise((resolve, reject) => {
+    const aborted = () => {
+      clearTimeout(timer);
+      reject(new Error('candidate runtime start cancelled'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', aborted);
+      resolve(null);
+    }, READY_SETTLE_MS);
+    timer.unref();
+    if (signal?.aborted) return aborted();
+    signal?.addEventListener('abort', aborted, { once: true });
+    void terminated.then((exit) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', aborted);
+      resolve(exit);
+    });
+  });
 }
 
 async function assertExpectedCommit(cwd: string, expectedCommit: string): Promise<void> {

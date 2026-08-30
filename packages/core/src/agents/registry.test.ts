@@ -14,6 +14,7 @@ class FakeProvider implements AgentProvider {
   constructor(
     readonly id: ProviderId,
     private readonly available = true,
+    private readonly toolFreeChat = true,
   ) {}
 
   async capabilities(): Promise<ProviderCapabilities> {
@@ -25,6 +26,7 @@ class FakeProvider implements AgentProvider {
       resumable: true,
       models: this.id === 'claude' ? ['opus', 'sonnet', 'haiku'] : [],
       structuredOutput: true,
+      toolFreeChat: this.toolFreeChat,
       ...(!this.available ? { reason: 'offline' } : {}),
     };
   }
@@ -73,6 +75,18 @@ describe('AgentRegistry v2', () => {
     ]).route('implementer', { prefer: 'codex' });
     expect(result.provider?.id).toBe('claude');
     expect(result.decision.reason).toContain('unavailable');
+  });
+
+  it('routes chat only to a provider that can run without tools', async () => {
+    const result = await registry([
+      new FakeProvider('codex', true, false),
+      new FakeProvider('claude'),
+    ]).route('chat', { prefer: 'codex' });
+    expect(result.provider?.id).toBe('claude');
+
+    const unavailable = await registry([new FakeProvider('codex', true, false)]).route('chat');
+    expect(unavailable.provider).toBeNull();
+    expect(unavailable.reason).toContain('cannot run tool-free chat');
   });
 
   it('uses cross-provider review and same-provider fallback', async () => {

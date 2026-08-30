@@ -250,6 +250,7 @@ describe('pnpm dev supervisor bootstrap', () => {
       JARVIS_REVIEWER_PROVIDER: 'claude',
       JARVIS_CODEX_BIN: 'C:\\__jarvis_codex_disabled__\\codex.exe',
       JARVIS_CLAUDE_MODEL: 'sonnet',
+      JARVIS_LOG_LEVEL: 'debug',
       JARVIS_PROVIDER_COOLDOWN_MS: '1000',
       JARVIS_WEB_PORT: '',
     });
@@ -259,12 +260,49 @@ describe('pnpm dev supervisor bootstrap', () => {
       JARVIS_REVIEWER_PROVIDER: 'claude',
       JARVIS_CODEX_BIN: 'C:\\__jarvis_codex_disabled__\\codex.exe',
       JARVIS_CLAUDE_MODEL: 'sonnet',
+      JARVIS_LOG_LEVEL: 'debug',
       JARVIS_PROVIDER_COOLDOWN_MS: '1000',
     });
     for (const name of RUNTIME_ENV_ALLOWLIST) {
       expect(name).not.toMatch(SECRET_ENV_NAME);
       expect(name).not.toMatch(/^JARVIS_(?:SUPERVISED|UPGRADE_|CANDIDATE_|RUNTIME_NONCE)/);
     }
+  });
+
+  // The regression mechanism for the allowlist itself: every non-secret
+  // JARVIS_* setting the runtime actually reads must be forwarded explicitly.
+  // Scanning the real sources is what stops a newly supported variable from
+  // being silently dropped by the supervised launcher, the way JARVIS_LOG_LEVEL
+  // was. It deliberately does NOT relax the allowlist into a `JARVIS_*` prefix
+  // match — every name is still listed one by one in scripts/dev.mjs.
+  it('explicitly allowlists every supported non-secret config environment variable', () => {
+    // Names that configure the runtime, wherever it reads them from.
+    const sources = [
+      'packages/core/src/config.ts',
+      'packages/core/src/logger.ts',
+      'packages/core/src/agents/claude.ts',
+      'packages/core/src/agents/codex.ts',
+    ];
+    const supported = new Set(
+      sources
+        // Any JARVIS_* token in these files is an environment variable name,
+        // however the read happens to be written or line-wrapped.
+        .flatMap((file) => [...fs.readFileSync(file, 'utf8').matchAll(/JARVIS_[A-Z0-9_]+/g)])
+        .map((match) => match[0])
+        // Secrets and supervisor/candidate-internal handshake values are never
+        // forwarded, so they are not part of the supported surface.
+        .filter(
+          (name) =>
+            !SECRET_ENV_NAME.test(name) &&
+            !/^JARVIS_(?:SUPERVISED|UPGRADE_|CANDIDATE_|RUNTIME_NONCE)/.test(name),
+        ),
+    );
+    expect(supported.size).toBeGreaterThan(20);
+    const missing = [...supported].filter((name) => !RUNTIME_ENV_ALLOWLIST.includes(name));
+    expect(missing).toEqual([]);
+    // And nothing is forwarded that no part of the runtime actually reads.
+    const unused = RUNTIME_ENV_ALLOWLIST.filter((name) => !supported.has(name));
+    expect(unused).toEqual([]);
   });
 });
 
@@ -365,6 +403,24 @@ describe('pnpm dev supervised runtime', () => {
 
     killTree(readSession(session).webPid);
     expect(await instance.exit()).not.toBe(0);
+    await expectPortsFree(ports);
+  });
+
+  // The Windows console delivers Ctrl+C to every process in the group, so a
+  // child can exit *before* the launcher runs its own SIGINT handler. That
+  // ordering must still be a clean shutdown: latching the child's exit code
+  // would make an ordinary Ctrl+C report failure.
+  it('reports a clean shutdown when a child exits just before the stop request', async () => {
+    const ports = [await freePort(), await freePort()];
+    const instance = launch({}, [], ports);
+    const { session } = await ready(instance);
+
+    // Kill a child and ask to stop within the same instant, which is exactly
+    // what a console control event looks like from the launcher's side.
+    killTree(readSession(session).webPid);
+    instance.child.stdin?.end();
+
+    expect(await instance.exit()).toBe(0);
     await expectPortsFree(ports);
   });
 

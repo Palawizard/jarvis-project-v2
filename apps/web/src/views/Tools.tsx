@@ -144,7 +144,11 @@ export function ToolsView({
               <div className="mem-head">
                 <Badge tone={RISK_TONE[execution.risk]}>{execution.risk.replace(/_/g, ' ')}</Badge>
                 <code className="mono">{execution.toolName}</code>
-                <Badge>{execution.actor}</Badge>
+                <Badge>
+                  {execution.originatingActor === execution.actor
+                    ? execution.actor
+                    : `${execution.originatingActor} → ${execution.actor} confirmation`}
+                </Badge>
                 <span style={{ flex: 1 }} />
                 <button
                   className="btn sm"
@@ -159,26 +163,28 @@ export function ToolsView({
                 >
                   Allow once
                 </button>
-                {execution.actor === 'user' && execution.risk !== 'destructive' && (
-                  <button
-                    className="btn sm"
-                    disabled={busy === execution.id}
-                    title={
-                      execution.projectId
-                        ? 'Always allow this tool for this project'
-                        : 'Always allow this tool everywhere'
-                    }
-                    onClick={() =>
-                      void act(
-                        execution.id,
-                        () => api.approveTool(execution.id, true, execution.projectId),
-                        `Ran ${execution.toolName} and remembered the permission.`,
-                      )
-                    }
-                  >
-                    Always allow
-                  </button>
-                )}
+                {execution.actor === 'user' &&
+                  execution.originatingActor === 'user' &&
+                  execution.risk !== 'destructive' && (
+                    <button
+                      className="btn sm"
+                      disabled={busy === execution.id}
+                      title={
+                        execution.projectId
+                          ? 'Always allow this tool for this project'
+                          : 'Always allow this tool everywhere'
+                      }
+                      onClick={() =>
+                        void act(
+                          execution.id,
+                          () => api.approveTool(execution.id, true, execution.projectId),
+                          `Ran ${execution.toolName} and remembered the permission.`,
+                        )
+                      }
+                    >
+                      Always allow
+                    </button>
+                  )}
                 <button
                   className="btn sm danger"
                   disabled={busy === execution.id}
@@ -218,7 +224,7 @@ export function ToolsView({
           <Empty>No standing permissions. Every confirmation is asked each time.</Empty>
         ) : (
           <div className="table-scroll">
-            <table>
+            <table className="mobile-cards">
               <thead>
                 <tr>
                   <th>Tool</th>
@@ -231,15 +237,17 @@ export function ToolsView({
               <tbody>
                 {(grants.data ?? []).map((grant) => (
                   <tr key={grant.id}>
-                    <td>
+                    <td data-label="Tool">
                       <code className="mono">{grant.toolName}</code>
                     </td>
-                    <td>{grant.actor}</td>
-                    <td className="tiny dim">{projectLabel(projects, grant.projectId)}</td>
-                    <td className="tiny dim">
+                    <td data-label="For">{grant.actor}</td>
+                    <td data-label="Scope" className="tiny dim">
+                      {projectLabel(projects, grant.projectId)}
+                    </td>
+                    <td data-label="Expires" className="tiny dim">
                       {grant.expiresAt ? new Date(grant.expiresAt).toLocaleString() : 'never'}
                     </td>
-                    <td>
+                    <td data-label="Actions">
                       <button
                         className="btn sm danger"
                         disabled={busy === grant.id}
@@ -267,7 +275,7 @@ export function ToolsView({
           <Empty>No tool has been run yet.</Empty>
         ) : (
           <div className="table-scroll">
-            <table>
+            <table className="mobile-cards">
               <thead>
                 <tr>
                   <th>Tool</th>
@@ -282,22 +290,28 @@ export function ToolsView({
               <tbody>
                 {executions.map((execution) => (
                   <tr key={execution.id}>
-                    <td>
+                    <td data-label="Tool">
                       <code className="mono">{execution.toolName}</code>
                     </td>
-                    <td className="tiny dim">{execution.risk.replace(/_/g, ' ')}</td>
-                    <td className="tiny dim">{execution.actor}</td>
-                    <td>
+                    <td data-label="Risk" className="tiny dim">
+                      {execution.risk.replace(/_/g, ' ')}
+                    </td>
+                    <td data-label="Asked by" className="tiny dim">
+                      {execution.actor}
+                    </td>
+                    <td data-label="Outcome">
                       <Badge tone={STATUS_TONE[execution.status]}>
                         {execution.status.replace(/_/g, ' ')}
                       </Badge>
                     </td>
-                    <td className="tiny dim">{execution.error ?? execution.reason}</td>
-                    <td className="tiny dim nowrap">
+                    <td data-label="Detail" className="tiny dim">
+                      {execution.error ?? execution.reason}
+                    </td>
+                    <td data-label="When" className="tiny dim nowrap">
                       {new Date(execution.requestedAt).toLocaleString()}
                       {execution.durationMs !== null && ` · ${execution.durationMs}ms`}
                     </td>
-                    <td>
+                    <td data-label="Actions">
                       {(execution.status === 'interrupted' ||
                         execution.status === 'timed_out' ||
                         execution.status === 'expired' ||

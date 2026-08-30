@@ -45,6 +45,8 @@ export interface ProviderCapabilities {
   resumable: boolean;
   models: string[];
   structuredOutput: boolean;
+  /** Provider can answer normal chat with no filesystem or execution tools. */
+  toolFreeChat?: boolean;
   cooldownUntil?: string;
   lastFailureAt?: string;
   lastSuccessAt?: string;

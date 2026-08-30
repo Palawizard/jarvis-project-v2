@@ -1,16 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
+  type ConversationSummary,
   type Health,
-  type Job,
   type JarvisEvent,
+  type Job,
   type Project,
-  type Session,
+  type SearchHit,
   type ToolExecution,
 } from './api.ts';
+import { Badge, ConfirmDialog, useModalDialog } from './components.tsx';
 import { useAsync, useEventStream, useTheme } from './hooks.ts';
-import { Badge, StageBadge } from './components.tsx';
-import { CommandView } from './views/Command.tsx';
+import { ChatView, approvePending } from './views/Chat.tsx';
 import { ProjectsView } from './views/Projects.tsx';
 import { JobsView } from './views/Jobs.tsx';
 import { JobDetailView } from './views/JobDetail.tsx';
@@ -18,12 +19,33 @@ import { MemoryView } from './views/Memory.tsx';
 import { ToolsView } from './views/Tools.tsx';
 
 export type Route =
-  | { name: 'command' }
+  | { name: 'home' }
+  | { name: 'chat'; id: string }
   | { name: 'projects'; id?: string }
   | { name: 'jobs' }
   | { name: 'job'; id: string }
   | { name: 'memory' }
   | { name: 'tools' };
+
+function routeFromPath(pathname = location.pathname): Route {
+  const parts = pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  if (parts[0] === 'chat' && parts[1]) return { name: 'chat', id: parts[1] };
+  if (parts[0] === 'projects') return { name: 'projects', ...(parts[1] ? { id: parts[1] } : {}) };
+  if (parts[0] === 'jobs' && parts[1]) return { name: 'job', id: parts[1] };
+  if (parts[0] === 'jobs') return { name: 'jobs' };
+  if (parts[0] === 'memory') return { name: 'memory' };
+  if (parts[0] === 'tools') return { name: 'tools' };
+  return { name: 'home' };
+}
+
+function pathFor(route: Route): string {
+  if (route.name === 'chat') return `/chat/${encodeURIComponent(route.id)}`;
+  if (route.name === 'projects')
+    return `/projects${route.id ? `/${encodeURIComponent(route.id)}` : ''}`;
+  if (route.name === 'job') return `/jobs/${encodeURIComponent(route.id)}`;
+  if (route.name === 'home') return '/';
+  return `/${route.name}`;
+}
 
 export function App() {
   const [auth, setAuth] = useState<'checking' | 'locked' | 'authenticated'>('checking');
@@ -37,10 +59,8 @@ export function App() {
     window.addEventListener('jarvis-auth-failed', check);
     return () => window.removeEventListener('jarvis-auth-failed', check);
   }, []);
-
-  if (auth !== 'authenticated') {
+  if (auth !== 'authenticated')
     return <PairingView checking={auth === 'checking'} onPaired={() => setAuth('authenticated')} />;
-  }
   return <AuthenticatedApp />;
 }
 
@@ -99,223 +119,362 @@ function PairingView({ checking, onPaired }: { checking: boolean; onPaired: () =
 }
 
 function AuthenticatedApp() {
-  const [route, setRoute] = useState<Route>({ name: 'command' });
+  const [route, setRoute] = useState<Route>(() => routeFromPath());
   const [theme, toggleTheme] = useTheme();
   const [lastEvent, setLastEvent] = useState<JarvisEvent | null>(null);
+  const [drawer, setDrawer] = useState(false);
+  const [archivedChats, setArchivedChats] = useState(false);
+  const [chatSearch, setChatSearch] = useState('');
+  const [rename, setRename] = useState<ConversationSummary | null>(null);
+  const [deleteChat, setDeleteChat] = useState<ConversationSummary | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const bootstrapFailed = useRef(false);
+  const [palette, setPalette] = useState(false);
+  const [globalQuery, setGlobalQuery] = useState('');
 
   const health = useAsync<Health>(() => api.health(), []);
-  const projects = useAsync<Project[]>(() => api.projects(), []);
-  const sessionData = useAsync<{ session: Session; rendered: string; messages: never[] }>(
-    () => api.session() as never,
-    [],
+  const projects = useAsync<Project[]>(() => api.projects({ status: 'all' }), []);
+  const jobs = useAsync<Job[]>(() => api.jobs({ archived: 'active', limit: '200' }), []);
+  const conversations = useAsync<ConversationSummary[]>(
+    () =>
+      api.conversations({
+        status: archivedChats ? 'archived' : 'active',
+        search: chatSearch || undefined,
+      }),
+    [archivedChats, chatSearch],
   );
-  const jobs = useAsync<Job[]>(() => api.jobs(), []);
   const toolRequests = useAsync<{ pending: ToolExecution[] }>(() => api.toolExecutions(), []);
-
-  // A single stream feeds every view; each view re-reads what it needs.
+  const search = useAsync<SearchHit[]>(
+    () => (globalQuery.trim() ? api.search(globalQuery) : Promise.resolve([])),
+    [globalQuery],
+  );
   const { connected } = useEventStream(
-    useCallback((event: JarvisEvent) => {
-      setLastEvent(event);
-    }, []),
+    useCallback((event: JarvisEvent) => setLastEvent(event), []),
   );
 
-  // Refresh the job list only on job-level events, not on every agent token.
+  // Latest route, readable from async callbacks that must not act on a stale one.
+  const routeRef = useRef(route);
+  routeRef.current = route;
+
+  const navigate = useCallback((next: Route, replace = false) => {
+    const path = pathFor(next);
+    history[replace ? 'replaceState' : 'pushState']({}, '', path);
+    setRoute(next);
+    setDrawer(false);
+  }, []);
+
   useEffect(() => {
-    if (lastEvent && (lastEvent.type.startsWith('job.') || lastEvent.type === 'system.recovery')) {
-      jobs.reload();
-    }
-    // A permission request the user never sees is a permission request that
-    // silently blocks work, so the badge tracks the stream everywhere.
+    const pop = () => setRoute(routeFromPath());
+    window.addEventListener('popstate', pop);
+    return () => window.removeEventListener('popstate', pop);
+  }, []);
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setPalette(true);
+      }
+    };
+    window.addEventListener('keydown', shortcut);
+    return () => window.removeEventListener('keydown', shortcut);
+  }, []);
+  useEffect(() => {
+    if (lastEvent?.type.startsWith('job.') || lastEvent?.type === 'system.recovery') jobs.reload();
+    // Not `message.delta`: the sidebar shows titles and activity, neither of
+    // which changes while tokens arrive, and reloading the whole conversation
+    // list per token chunk was the most expensive thing streaming did.
+    if (
+      lastEvent?.type.startsWith('conversation.') ||
+      lastEvent?.type === 'message.created' ||
+      lastEvent?.type === 'message.completed' ||
+      lastEvent?.type === 'message.failed' ||
+      lastEvent?.type === 'job.linked'
+    )
+      conversations.reload();
     if (lastEvent?.type.startsWith('tool.')) toolRequests.reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent]);
+  useEffect(() => {
+    if (busy || route.name !== 'home' || conversations.loading || conversations.error) return;
+    if (bootstrapFailed.current) return;
+    const first = conversations.data?.[0];
+    if (first) navigate({ name: 'chat', id: first.id }, true);
+    else {
+      setBusy(true);
+      void api
+        .createConversation()
+        .then((conversation) => {
+          conversations.reload();
+          // The user may have opened or started a conversation while this
+          // request was in flight. Navigating unconditionally would yank them
+          // out of it — and out of anything already typed there.
+          if (routeRef.current.name === 'home') {
+            navigate({ name: 'chat', id: conversation.id }, true);
+          }
+        })
+        .catch((reason: unknown) => {
+          // Latch: `busy` is a dependency of this effect, so retrying on failure
+          // re-fires it immediately and POSTs again as fast as the network
+          // allows, once per round trip, forever.
+          bootstrapFailed.current = true;
+          reportFailure(reason);
+        })
+        .finally(() => setBusy(false));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, route.name, conversations.loading, conversations.error, conversations.data, navigate]);
 
   const activeJobs = useMemo(
-    () => (jobs.data ?? []).filter((j) => j.status === 'running' || j.status === 'pending'),
+    () => (jobs.data ?? []).filter((job) => ['running', 'pending'].includes(job.status)),
     [jobs.data],
   );
-  const awaiting = useMemo(
-    () => (jobs.data ?? []).filter((j) => j.status === 'awaiting_user'),
+  const attention = useMemo(
+    () =>
+      (jobs.data ?? []).filter((job) => ['awaiting_user', 'paused', 'failed'].includes(job.status)),
     [jobs.data],
   );
-  const pendingTools = toolRequests.data?.pending ?? [];
-  const apiErrors = [
+  const errors = [
     health.error,
     projects.error,
-    sessionData.error,
     jobs.error,
+    conversations.error,
     toolRequests.error,
-  ].filter((error): error is string => !!error);
+    actionError,
+  ].filter((value): value is string => Boolean(value));
+  // Pin, archive and rename now answer 409 when the mutation did not really
+  // happen. Dropping that on the floor showed the user nothing at all, which is
+  // the same silent-success problem the route was fixed for.
+  const reportFailure = (reason: unknown) =>
+    setActionError(reason instanceof Error ? reason.message : String(reason));
 
-  const session = sessionData.data?.session ?? null;
-  const [projectId, setProjectId] = useState<string | null>(null);
-  useEffect(() => {
-    if (session?.projectId) setProjectId(session.projectId);
-  }, [session?.projectId]);
-
-  const selectProject = useCallback(
-    async (id: string | null) => {
-      setProjectId(id);
-      if (session) await api.setSessionProject(session.id, id).catch(() => undefined);
-    },
-    [session],
-  );
-
-  const title =
-    route.name === 'command'
-      ? 'Command'
-      : route.name === 'projects'
-        ? 'Projects'
-        : route.name === 'jobs'
-          ? 'Jobs'
-          : route.name === 'job'
-            ? 'Job'
-            : route.name === 'tools'
-              ? 'Tools and permissions'
-              : 'Memory';
+  const newChat = async () => {
+    setBusy(true);
+    try {
+      const conversation = await api.createConversation();
+      conversations.reload();
+      navigate({ name: 'chat', id: conversation.id });
+    } catch (reason) {
+      reportFailure(reason);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const removeConversation = async () => {
+    if (!deleteChat) return;
+    setActionError(null);
+    setBusy(true);
+    try {
+      await approvePending(await api.deleteConversation(deleteChat.id));
+      const deletedId = deleteChat.id;
+      setDeleteChat(null);
+      conversations.reload();
+      if (route.name === 'chat' && route.id === deletedId) navigate({ name: 'home' }, true);
+    } catch (reason) {
+      reportFailure(reason);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
-    <div className="app">
-      <nav className="sidebar">
-        <div className="brand">
-          <span className="brand-dot" />
-          Jarvis
-        </div>
-        <NavItem
-          active={route.name === 'command'}
-          onClick={() => setRoute({ name: 'command' })}
-          label="Command"
-          testId="nav-command"
-        />
-        <NavItem
-          active={route.name === 'projects'}
-          onClick={() => setRoute({ name: 'projects' })}
-          label="Projects"
-          count={projects.data?.length}
-          testId="nav-projects"
-        />
-        <NavItem
-          active={route.name === 'jobs' || route.name === 'job'}
-          onClick={() => setRoute({ name: 'jobs' })}
-          label="Jobs"
-          count={activeJobs.length || undefined}
-          testId="nav-jobs"
-        />
-        <NavItem
-          active={route.name === 'memory'}
-          onClick={() => setRoute({ name: 'memory' })}
-          label="Memory"
-          count={health.data?.memory.active}
-          testId="nav-memory"
-        />
-        <NavItem
-          active={route.name === 'tools'}
-          onClick={() => setRoute({ name: 'tools' })}
-          label="Tools"
-          count={pendingTools.length || undefined}
-          testId="nav-tools"
-        />
-
-        <div className="sidebar-foot">
-          <div>
-            <span>stream</span>
-            <span className={connected ? '' : 'faint'}>{connected ? 'live' : 'offline'}</span>
+    <div className={`app chat-app ${drawer ? 'drawer-open' : ''}`}>
+      <button
+        className="drawer-scrim"
+        data-testid="drawer-scrim"
+        aria-label="Close conversations"
+        onClick={() => setDrawer(false)}
+      />
+      <aside
+        className="conversation-sidebar"
+        aria-label="Conversations"
+        data-testid="conversation-sidebar"
+      >
+        <div className="sidebar-brand">
+          <div className="brand">
+            <span className="brand-dot" /> Jarvis
           </div>
-          {health.data?.providers.map((p) => (
-            <div key={p.id} title={p.reason ?? p.authMethod ?? ''}>
-              <span>{p.id}</span>
-              <span
-                style={{
-                  color: p.cooldownUntil ? 'var(--warn)' : p.available ? 'var(--ok)' : 'var(--err)',
-                }}
+          <button
+            className="btn sm"
+            aria-label="Close conversation drawer"
+            onClick={() => setDrawer(false)}
+          >
+            ×
+          </button>
+        </div>
+        <button className="btn primary new-chat" disabled={busy} onClick={() => void newChat()}>
+          ＋ New chat
+        </button>
+        <button
+          className="search-trigger"
+          data-testid="global-search-open"
+          onClick={() => setPalette(true)}
+        >
+          ⌕ Search <kbd>Ctrl K</kbd>
+        </button>
+        <input
+          type="search"
+          aria-label="Search conversations"
+          placeholder="Filter conversations"
+          value={chatSearch}
+          onChange={(event) => setChatSearch(event.target.value)}
+        />
+        <div className="conversation-list">
+          {(conversations.data ?? []).map((conversation) => (
+            <div
+              className={`conversation-row ${route.name === 'chat' && route.id === conversation.id ? 'active' : ''}`}
+              key={conversation.id}
+              data-testid={`conversation-row-${conversation.id}`}
+            >
+              <button
+                className="conversation-open"
+                onClick={() => navigate({ name: 'chat', id: conversation.id })}
               >
-                {p.cooldownUntil ? 'cooldown' : p.available ? 'available' : 'unavailable'}
-              </span>
+                <span className="conversation-title">
+                  {conversation.pinned ? '◆ ' : ''}
+                  {conversation.title ?? 'New conversation'}
+                </span>
+                <span className="conversation-preview">
+                  {conversation.preview ?? 'No messages yet'}
+                </span>
+              </button>
+              <details className="item-menu">
+                <summary
+                  data-testid={`conversation-menu-${conversation.id}`}
+                  aria-label={`Actions for ${conversation.title ?? 'conversation'}`}
+                >
+                  •••
+                </summary>
+                <div role="menu" data-testid={`conversation-actions-${conversation.id}`}>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setActionError(null);
+                      setRename(conversation);
+                    }}
+                  >
+                    Rename
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() =>
+                      void api
+                        .updateConversation(conversation.id, { pinned: !conversation.pinned })
+                        .then(conversations.reload, reportFailure)
+                    }
+                  >
+                    {conversation.pinned ? 'Unpin' : 'Pin'}
+                  </button>
+                  <button
+                    role="menuitem"
+                    onClick={() =>
+                      void api
+                        .updateConversation(conversation.id, { archived: !archivedChats })
+                        .then(() => {
+                          conversations.reload();
+                          if (route.name === 'chat' && route.id === conversation.id)
+                            navigate({ name: 'home' });
+                        }, reportFailure)
+                    }
+                  >
+                    {archivedChats ? 'Unarchive' : 'Archive'}
+                  </button>
+                  <button
+                    role="menuitem"
+                    data-testid={`conversation-delete-${conversation.id}`}
+                    className="danger-text"
+                    onClick={() => {
+                      setActionError(null);
+                      setDeleteChat(conversation);
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </details>
             </div>
           ))}
-          <div title={health.data?.memory.embeddings.error ?? health.data?.memory.embeddings.model}>
-            <span>semantic</span>
-            <span
-              style={{
-                color: !health.data?.memory.embeddings.enabled
-                  ? 'var(--text-faint)'
-                  : health.data?.memory.embeddings.disabledForProcess
-                    ? 'var(--err)'
-                    : health.data?.memory.embeddings.ready
-                      ? 'var(--ok)'
-                      : 'var(--warn)',
-              }}
-            >
-              {!health.data?.memory.embeddings.enabled
-                ? 'off'
-                : health.data?.memory.embeddings.disabledForProcess
-                  ? 'failed'
-                  : health.data?.memory.embeddings.ready
-                    ? 'ready'
-                    : 'lazy'}
-            </span>
-          </div>
+          {!conversations.loading && (conversations.data?.length ?? 0) === 0 && (
+            <div className="empty tiny">No {archivedChats ? 'archived ' : ''}conversations.</div>
+          )}
         </div>
-      </nav>
+        <button className="archive-toggle" onClick={() => setArchivedChats((value) => !value)}>
+          {archivedChats ? '← Recent conversations' : 'Archived conversations'}
+        </button>
+        <nav className="app-nav" aria-label="Workspace">
+          <Nav
+            active={route.name === 'projects'}
+            label="Projects"
+            onClick={() => navigate({ name: 'projects' })}
+            count={projects.data?.filter((project) => !project.archivedAt).length}
+          />
+          <Nav
+            active={route.name === 'jobs' || route.name === 'job'}
+            label="Jobs"
+            onClick={() => navigate({ name: 'jobs' })}
+            count={activeJobs.length || undefined}
+          />
+          <Nav
+            active={route.name === 'memory'}
+            label="Memory"
+            onClick={() => navigate({ name: 'memory' })}
+            count={health.data?.memory.active}
+          />
+          <Nav
+            active={route.name === 'tools'}
+            label="Tools"
+            onClick={() => navigate({ name: 'tools' })}
+            count={toolRequests.data?.pending.length || undefined}
+          />
+        </nav>
+        <div className="sidebar-status">
+          <span className={connected ? 'ok-text' : 'faint'}>
+            {connected ? '● live' : '○ offline'}
+          </span>
+          {attention.length > 0 && (
+            <button onClick={() => navigate({ name: 'jobs' })}>
+              {attention.length} need attention
+            </button>
+          )}
+        </div>
+      </aside>
 
       <main className="main">
-        <header className="topbar">
-          <h1>{title}</h1>
-          {awaiting.length > 0 && (
-            <button className="btn sm" onClick={() => setRoute({ name: 'jobs' })}>
-              <Badge tone="warn">{awaiting.length} awaiting you</Badge>
-            </button>
-          )}
-          {pendingTools.length > 0 && (
-            <button className="btn sm" onClick={() => setRoute({ name: 'tools' })}>
-              <Badge tone="warn">
-                {pendingTools.length} permission{' '}
-                {pendingTools.length === 1 ? 'request' : 'requests'}
-              </Badge>
-            </button>
-          )}
-          <span className="spacer" />
-          <select
-            className="topbar-project"
-            value={projectId ?? ''}
-            onChange={(e) => void selectProject(e.target.value || null)}
-            aria-label="Active project"
+        <div className="mobile-bar">
+          <button
+            className="btn sm"
+            data-testid="mobile-drawer-open"
+            aria-label="Open conversations"
+            onClick={() => setDrawer(true)}
           >
-            <option value="">No project selected</option>
-            {(projects.data ?? []).map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-                {p.isSelf ? ' (self)' : ''}
-              </option>
-            ))}
-          </select>
-          <button className="btn sm theme-toggle" onClick={toggleTheme} aria-label="Toggle theme">
-            {theme === 'dark' ? '☾' : '☀'}
+            ☰
           </button>
-        </header>
-
-        {apiErrors.length > 0 && (
+          <span>Jarvis</span>
+          <button className="btn sm" onClick={() => setPalette(true)}>
+            ⌕
+          </button>
+        </div>
+        {errors.length > 0 && (
           <div className="api-error" role="alert">
-            Jarvis API error: {[...new Set(apiErrors)].join(' · ')}
+            Jarvis API error: {[...new Set(errors)].join(' · ')}
           </div>
         )}
-
-        {route.name === 'command' && (
-          <CommandView
-            session={session}
+        {route.name === 'chat' && (
+          <ChatView
+            conversationId={route.id}
             projects={projects.data ?? []}
-            projectId={projectId}
-            onSelectProject={selectProject}
-            onOpenJob={(id) => setRoute({ name: 'job', id })}
+            conversations={conversations.data ?? []}
             lastEvent={lastEvent}
+            onMissing={() => navigate({ name: 'home' }, true)}
+            onOpenJob={(id) => navigate({ name: 'job', id })}
           />
         )}
         {route.name === 'projects' && (
           <ProjectsView
             projects={projects.data ?? []}
             selectedId={route.id}
-            onSelect={(id) => setRoute({ name: 'projects', ...(id ? { id } : {}) })}
-            onOpenJob={(id) => setRoute({ name: 'job', id })}
+            onSelect={(id) => navigate({ name: 'projects', ...(id ? { id } : {}) })}
+            onOpenJob={(id) => navigate({ name: 'job', id })}
             onChanged={projects.reload}
           />
         )}
@@ -323,7 +482,10 @@ function AuthenticatedApp() {
           <JobsView
             jobs={jobs.data ?? []}
             projects={projects.data ?? []}
-            onOpen={(id) => setRoute({ name: 'job', id })}
+            onOpen={(id) => navigate({ name: 'job', id })}
+            onChanged={jobs.reload}
+            onOpenConversation={(id) => navigate({ name: 'chat', id })}
+            onOpenProject={(id) => navigate({ name: 'projects', id })}
           />
         )}
         {route.name === 'job' && (
@@ -331,39 +493,244 @@ function AuthenticatedApp() {
             jobId={route.id}
             lastEvent={lastEvent}
             artifactsDir={health.data?.artifactsDir ?? ''}
-            onBack={() => setRoute({ name: 'jobs' })}
+            onBack={() => navigate({ name: 'jobs' })}
+            onOpenJob={(id) => navigate({ name: 'job', id })}
           />
         )}
         {route.name === 'memory' && (
           <MemoryView projects={projects.data ?? []} lastEvent={lastEvent} />
         )}
         {route.name === 'tools' && (
-          <ToolsView projects={projects.data ?? []} projectId={projectId} lastEvent={lastEvent} />
+          <ToolsView projects={projects.data ?? []} projectId={null} lastEvent={lastEvent} />
         )}
+        {route.name === 'home' && <div className="empty">Opening Jarvis…</div>}
+        <button className="theme-float btn sm" onClick={toggleTheme} aria-label="Toggle theme">
+          {theme === 'dark' ? '☾' : '☀'}
+        </button>
       </main>
+
+      <GlobalSearch
+        open={palette}
+        query={globalQuery}
+        hits={search.data ?? []}
+        loading={search.loading}
+        onQuery={setGlobalQuery}
+        onClose={() => {
+          setPalette(false);
+          setGlobalQuery('');
+        }}
+        onOpen={(hit) => {
+          setPalette(false);
+          setGlobalQuery('');
+          navigate(
+            hit.type === 'conversation'
+              ? { name: 'chat', id: hit.id }
+              : hit.type === 'project'
+                ? { name: 'projects', id: hit.id }
+                : { name: 'job', id: hit.id },
+          );
+        }}
+      />
+      {rename && (
+        <RenameDialog
+          conversation={rename}
+          busy={busy}
+          error={actionError}
+          onCancel={() => setRename(null)}
+          onSave={(title) => {
+            setBusy(true);
+            void api
+              .updateConversation(rename.id, { title })
+              .then(() => {
+                setRename(null);
+                conversations.reload();
+              }, reportFailure)
+              .finally(() => setBusy(false));
+          }}
+        />
+      )}
+      {deleteChat && (
+        <ConfirmDialog
+          open
+          title={`Delete “${deleteChat?.title ?? 'conversation'}”?`}
+          description="The conversation and its working state will be permanently removed."
+          removes={[
+            'its transcript',
+            'conversation-only working state',
+            'conversation-specific metadata',
+          ]}
+          preserves={[
+            'Jobs created from it',
+            'global and project memories',
+            'application and self-upgrade evidence',
+          ]}
+          confirmLabel="Delete conversation"
+          busy={busy}
+          error={actionError}
+          onCancel={() => setDeleteChat(null)}
+          onConfirm={() => void removeConversation()}
+        />
+      )}
     </div>
   );
 }
 
-function NavItem({
+function Nav({
   active,
-  onClick,
   label,
   count,
-  testId,
+  onClick,
 }: {
   active: boolean;
-  onClick: () => void;
   label: string;
   count?: number;
-  testId?: string;
+  onClick: () => void;
 }) {
   return (
-    <button className={`nav-item ${active ? 'active' : ''}`} onClick={onClick} data-testid={testId}>
+    <button
+      data-testid={`nav-${label.toLowerCase()}`}
+      className={`nav-item ${active ? 'active' : ''}`}
+      onClick={onClick}
+    >
       <span>{label}</span>
       {count !== undefined && count > 0 && <span className="nav-count">{count}</span>}
     </button>
   );
 }
 
-export { StageBadge };
+function RenameDialog({
+  conversation,
+  busy,
+  error,
+  onCancel,
+  onSave,
+}: {
+  conversation: ConversationSummary;
+  busy: boolean;
+  /** Inside the dialog: showModal() makes the shell's banner unreachable. */
+  error?: string | null;
+  onCancel: () => void;
+  onSave: (title: string) => void;
+}) {
+  const [title, setTitle] = useState(conversation.title ?? '');
+  const ref = useModalDialog(true);
+  return (
+    <dialog
+      ref={ref}
+      className="confirm-dialog"
+      data-testid="rename-dialog"
+      aria-labelledby="rename-title"
+      onCancel={onCancel}
+    >
+      <h2 id="rename-title">Rename conversation</h2>
+      <input
+        autoFocus
+        aria-label="Conversation title"
+        value={title}
+        maxLength={120}
+        onChange={(event) => setTitle(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' && title.trim()) onSave(title.trim());
+        }}
+      />
+      {error && (
+        <div className="api-error" role="alert">
+          {error}
+        </div>
+      )}
+      <div className="row dialog-actions">
+        <button className="btn" onClick={onCancel}>
+          Cancel
+        </button>
+        <button
+          className="btn primary"
+          disabled={busy || !title.trim()}
+          onClick={() => onSave(title.trim())}
+        >
+          Save
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
+function GlobalSearch({
+  open,
+  query,
+  hits,
+  loading,
+  onQuery,
+  onClose,
+  onOpen,
+}: {
+  open: boolean;
+  query: string;
+  hits: SearchHit[];
+  loading: boolean;
+  onQuery: (value: string) => void;
+  onClose: () => void;
+  onOpen: (hit: SearchHit) => void;
+}) {
+  // Driven by the real `open` prop: this component stays mounted, so the effect
+  // has to re-run when it flips. showModal() gives the backdrop and focus trap.
+  const ref = useModalDialog(open);
+  if (!open) return null;
+  return (
+    <dialog
+      ref={ref}
+      className="palette"
+      data-testid="global-search"
+      aria-label="Global search"
+      onCancel={onClose}
+      onKeyDown={(event) => {
+        // Not redundant with onCancel: focus starts in the search input, and a
+        // search input consumes Escape to clear itself, so the dialog never
+        // sees a cancel while the palette is being typed into.
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          onClose();
+        }
+      }}
+    >
+      <input
+        autoFocus
+        type="search"
+        data-testid="global-search-input"
+        placeholder="Search chats, projects, and Jobs…"
+        aria-label="Global search query"
+        value={query}
+        onChange={(event) => onQuery(event.target.value)}
+      />
+      <div className="palette-results">
+        {loading ? (
+          <div className="empty">Searching…</div>
+        ) : (
+          hits.map((hit) => (
+            <button
+              key={`${hit.type}:${hit.id}`}
+              data-testid={`search-hit-${hit.type}-${hit.id}`}
+              onClick={() => onOpen(hit)}
+            >
+              <Badge tone={hit.type === 'conversation' ? 'accent' : undefined}>
+                {hit.type === 'conversation' ? 'Chat' : hit.type === 'job' ? 'Job' : 'Project'}
+              </Badge>
+              <span>
+                <strong>{hit.title}</strong>
+                <small>{hit.subtitle}</small>
+              </span>
+            </button>
+          ))
+        )}
+        {query && !loading && hits.length === 0 && <div className="empty">No matches.</div>}
+      </div>
+      <div className="palette-foot">
+        <span>Navigation only — search never runs actions.</span>
+        <button className="btn sm" onClick={onClose}>
+          Esc
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
+export { StageBadge } from './components.tsx';

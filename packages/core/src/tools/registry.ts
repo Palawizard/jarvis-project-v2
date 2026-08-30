@@ -13,6 +13,7 @@ import {
   previewDecision,
   riskExceeds,
   type PolicyDecision,
+  type PolicyReasonCode,
   type RiskLevel,
   type ToolActor,
 } from './policy.js';
@@ -58,6 +59,8 @@ export interface ToolContext {
  */
 export interface ToolCallContext {
   actor: ToolActor;
+  /** Original requester. Agent-originated user confirmations keep this as `agent`. */
+  originatedBy?: ToolActor | undefined;
   sessionId?: string | null;
   projectId?: string | null;
   jobId?: string | null;
@@ -78,6 +81,15 @@ export type ToolExecutionStatus =
   | 'interrupted'
   | 'timed_out';
 
+type ExecutionReasonCode =
+  | PolicyReasonCode
+  | 'legacy'
+  | 'invalid_input'
+  | 'unserialisable_input'
+  | 'noncanonical_input'
+  | 'secret_in_input'
+  | 'input_too_large';
+
 /**
  * Outcomes after which Jarvis cannot say whether the tool's external effect
  * happened: the process died mid-call, or the call outlived its timeout and may
@@ -92,7 +104,9 @@ export interface ToolExecution {
   risk: RiskLevel;
   definitionRevision: string | null;
   actor: ToolActor;
+  originatingActor: ToolActor;
   decision: PolicyDecision;
+  reasonCode: ExecutionReasonCode;
   status: ToolExecutionStatus;
   reason: string;
   sessionId: string | null;
@@ -258,7 +272,9 @@ export class ToolRegistry {
 
     // Decide before touching the input: a caller that may not run this tool
     // gets no validation feedback and reaches no tool code at all.
-    const grant = this.#matchingGrant(tool, ctx);
+    // A trusted user-confirmation wrapper cannot turn an agent request into a
+    // direct human request. Agent provenance centrally disables standing grants.
+    const grant = ctx.originatedBy === 'agent' ? null : this.#matchingGrant(tool, ctx);
     const outcome = decide({
       risk: tool.risk,
       actor: ctx.actor,
@@ -267,6 +283,7 @@ export class ToolRegistry {
     });
     if (!grant && outcome.decision === 'allow' && this.#hasDriftedGrant(tool, ctx)) {
       outcome.decision = 'confirm';
+      outcome.code = 'grant_definition_drift';
       outcome.reason = 'tool definition changed since the standing permission';
     }
 
@@ -278,6 +295,7 @@ export class ToolRegistry {
         ctx,
         decision: 'deny',
         status: 'denied',
+        reasonCode: outcome.code,
         reason: outcome.reason,
         inputJson: this.#record(rawInput ?? null),
         inputValidated: false,
@@ -297,6 +315,7 @@ export class ToolRegistry {
         ctx,
         decision: outcome.decision,
         status: 'failed',
+        reasonCode: 'invalid_input',
         reason: 'invalid_input',
         inputJson: this.#record(rawInput ?? null),
         inputValidated: false,
@@ -308,12 +327,16 @@ export class ToolRegistry {
     }
 
     /** Refuse without keeping the arguments, and still leave an audit row. */
-    const refuse = (reason: string, message: string): ToolExecutionOutcome => {
+    const refuse = (
+      reason: Exclude<ExecutionReasonCode, PolicyReasonCode | 'legacy' | 'invalid_input'>,
+      message: string,
+    ): ToolExecutionOutcome => {
       const execution = this.#insert({
         tool,
         ctx,
         decision: 'deny',
         status: 'denied',
+        reasonCode: reason,
         reason,
         inputJson: null,
         inputValidated: false,
@@ -360,6 +383,7 @@ export class ToolRegistry {
       ctx,
       decision: outcome.decision,
       status: outcome.decision === 'allow' ? 'running' : 'pending_approval',
+      reasonCode: outcome.code,
       reason: outcome.reason,
       inputJson: serialized,
       inputValidated: true,
@@ -374,6 +398,69 @@ export class ToolRegistry {
 
     this.#emit('tool.execution.started', execution);
     return this.#run(tool, execution, canonicalInput);
+  }
+
+  /**
+   * Convert only an agent risk-ceiling denial into a linked, one-shot human
+   * confirmation. The original canonical payload must match, and grants stay
+   * disabled because the new execution retains `originatedBy: 'agent'`.
+   */
+  async escalateAgentRequest(
+    executionId: string,
+    rawInput: unknown,
+  ): Promise<ToolExecutionOutcome> {
+    const previous = this.getExecution(executionId);
+    if (!previous) throw new ToolPermissionError('tool execution not found', 'execution_not_found');
+    const refused = (): ToolExecutionOutcome => ({
+      status: 'denied',
+      execution: previous,
+      error: previous.error ?? previous.reason,
+    });
+    if (
+      previous.status !== 'denied' ||
+      previous.actor !== 'agent' ||
+      previous.originatingActor !== 'agent' ||
+      previous.reasonCode !== 'actor_risk_ceiling'
+    ) {
+      return refused();
+    }
+
+    const tool = this.#tools.get(previous.toolName);
+    if (
+      !tool ||
+      tool.risk !== previous.risk ||
+      definitionRevision(tool) !== previous.definitionRevision ||
+      decide({ risk: tool.risk, actor: 'user', hasGrant: false }).decision !== 'confirm'
+    ) {
+      return refused();
+    }
+
+    const parsed = (tool.input as z.ZodType).safeParse(rawInput);
+    if (!parsed.success) return refused();
+    const serialized = safeJson(parsed.data);
+    if (serialized === null || serialized.length > this.#maxRecordChars) return refused();
+    const canonicalInput = JSON.parse(serialized) as unknown;
+    if (
+      !isDeepStrictEqual(parsed.data, canonicalInput) ||
+      !scanForSecrets(serialized).clean ||
+      !isDeepStrictEqual(previous.input, canonicalInput)
+    ) {
+      return refused();
+    }
+
+    const outcome = await this.execute(previous.toolName, canonicalInput, {
+      actor: 'user',
+      originatedBy: 'agent',
+      sessionId: previous.sessionId,
+      projectId: previous.projectId,
+      jobId: previous.jobId,
+      agentRunId: previous.agentRunId,
+      parentExecutionId: previous.id,
+    });
+    if (outcome.status === 'pending_approval' || outcome.status === 'denied') return outcome;
+    throw new Error(
+      `agent-originated escalation invariant violated: ${previous.toolName} became ${outcome.status}`,
+    );
   }
 
   /**
@@ -432,9 +519,12 @@ export class ToolRegistry {
     // after the claim would strand the execution in `running` forever. Both
     // rules are re-stated here rather than left to grant(), so that approving
     // the single invocation stays possible even when remembering it does not.
-    if (options.remember && !isGrantableActor(pending.actor)) {
+    if (
+      options.remember &&
+      (!isGrantableActor(pending.actor) || pending.originatingActor !== pending.actor)
+    ) {
       throw new ToolPermissionError(
-        `standing permissions are only for the user's own actions, not for ${pending.actor}; ` +
+        "standing permissions are only for the user's own actions; agent-originated confirmations are one-shot; " +
           'approve this one invocation without remembering it',
         'grant_actor_not_permitted',
       );
@@ -545,6 +635,7 @@ export class ToolRegistry {
     // wrong level.
     return this.execute(previous.toolName, previous.input ?? {}, {
       actor: previous.actor,
+      originatedBy: previous.originatingActor,
       sessionId: previous.sessionId,
       projectId: previous.projectId,
       jobId: previous.jobId,
@@ -926,6 +1017,7 @@ export class ToolRegistry {
     ctx: ToolCallContext;
     decision: PolicyDecision;
     status: ToolExecutionStatus;
+    reasonCode: ExecutionReasonCode;
     reason: string;
     /** Already serialised by the caller, which decides faithful vs audit-only. */
     inputJson: string | null;
@@ -940,10 +1032,11 @@ export class ToolRegistry {
     this.#db
       .prepare(
         `INSERT INTO tool_executions
-           (id, tool_name, risk, definition_revision, actor, decision, status, reason, session_id,
+           (id, tool_name, risk, definition_revision, actor, originating_actor, decision, status,
+            reason_code, reason, session_id,
             project_id, job_id, agent_run_id, parent_execution_id, input, input_hash,
             input_validated, error, grant_id, requested_at, started_at, finished_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -951,8 +1044,10 @@ export class ToolRegistry {
         args.tool.risk,
         definitionRevision(args.tool),
         args.ctx.actor,
+        args.ctx.originatedBy ?? args.ctx.actor,
         args.decision,
         args.status,
+        args.reasonCode,
         args.reason,
         args.ctx.sessionId ?? null,
         args.ctx.projectId ?? null,
@@ -1039,6 +1134,8 @@ export class ToolRegistry {
         tool: execution.toolName,
         risk: execution.risk,
         actor: execution.actor,
+        originatingActor: execution.originatingActor,
+        parentExecutionId: execution.parentExecutionId,
         status: execution.status,
         reason: execution.reason,
         ...(execution.error ? { error: execution.error } : {}),
@@ -1099,7 +1196,9 @@ function rowToExecution(row: Row): ToolExecution {
     risk: row.risk as RiskLevel,
     definitionRevision: (row.definition_revision as string) ?? null,
     actor: row.actor as ToolActor,
+    originatingActor: ((row.originating_actor as ToolActor) ?? row.actor) as ToolActor,
     decision: row.decision as PolicyDecision,
+    reasonCode: ((row.reason_code as string) ?? 'legacy') as ToolExecution['reasonCode'],
     status: row.status as ToolExecutionStatus,
     reason: (row.reason as string) ?? '',
     sessionId: (row.session_id as string) ?? null,

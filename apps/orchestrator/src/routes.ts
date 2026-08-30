@@ -3,23 +3,35 @@ import path from 'node:path';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import {
-  detectExplicitCommand,
-  classifyExplicitMemory,
   candidateRejectionReason,
   GitWorkspace,
   repoStatus,
   normaliseGoal,
   renderProjectSnapshot,
+  searchEverything,
   PIPELINE_STAGES,
   RISK_LEVELS,
   type Jarvis,
+  type JobStage,
+  type JobStatus,
   type MemoryKind,
   type MemoryScope,
   type RiskLevel,
   type ToolExecutionStatus,
+  type ToolExecutionOutcome,
   type VisualInteraction,
   agentIsolationPreflight,
 } from '@jarvis/core';
+
+const JOB_STATUSES = new Set<string>([
+  'pending',
+  'running',
+  'paused',
+  'awaiting_user',
+  'completed',
+  'failed',
+  'cancelled',
+]);
 
 const MEMORY_SCOPES = new Set<MemoryScope>(['user', 'project', 'session', 'agent', 'procedure']);
 const MEMORY_KINDS = new Set<MemoryKind>([
@@ -45,6 +57,20 @@ export function createRoutes(jarvis: Jarvis): Hono {
   const git = new GitWorkspace(jarvis.config.worktreesDir);
 
   const fail = (message: string, status = 400) => Response.json({ error: message }, { status });
+  /**
+   * Answer with an outcome that really succeeded, or say plainly that it did not.
+   *
+   * For a tool the caller can run directly -- no confirmation in its path -- a
+   * non-succeeded outcome means the mutation did not happen, and answering 200
+   * with it made the browser report success for a write that never landed.
+   * Routes whose tool legitimately returns `pending_approval` (the destructive
+   * ones) must NOT use this: there, 200 plus the pending outcome is the contract.
+   */
+  const settled = (outcome: ToolExecutionOutcome) => {
+    if (outcome.status === 'succeeded') return Response.json(outcome);
+    const detail = 'error' in outcome && outcome.error ? `: ${outcome.error}` : '';
+    return fail(`${outcome.execution.toolName} did not run (${outcome.status}${detail})`, 409);
+  };
   const allowedOrigin = (origin: string | undefined) =>
     Boolean(origin && jarvis.config.controlOrigins.includes(origin));
 
@@ -169,7 +195,17 @@ export function createRoutes(jarvis: Jarvis): Hono {
   );
 
   // ---------------------------------------------------------------- projects --
-  app.get('/api/projects', (c) => c.json(jarvis.projects.list()));
+  app.get('/api/projects', (c) => {
+    const status = c.req.query('status');
+    const search = c.req.query('search');
+    if (status && !['active', 'archived', 'all'].includes(status)) return fail('invalid status');
+    return c.json(
+      jarvis.projects.list({
+        status: (status as 'active' | 'archived' | 'all') ?? 'all',
+        ...(search ? { search } : {}),
+      }),
+    );
+  });
 
   app.post('/api/projects', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as {
@@ -201,17 +237,67 @@ export function createRoutes(jarvis: Jarvis): Hono {
     });
   });
 
+  /**
+   * Editable project metadata. Everything goes through the tool boundary so the
+   * button and the sentence "rename project X to Y" share one implementation
+   * and one audit trail.
+   */
   app.patch('/api/projects/:id', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as Record<string, never>;
-    const updated = jarvis.projects.update(c.req.param('id'), body);
-    if (!updated) return fail('project not found', 404);
-    return c.json(updated);
+    const id = c.req.param('id');
+    if (!jarvis.projects.get(id)) return fail('project not found', 404);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      name?: unknown;
+      aliases?: unknown;
+      devUrl?: unknown;
+      summary?: unknown;
+    };
+    const input: Record<string, unknown> = { id };
+    if (body.name !== undefined) input.name = body.name;
+    if (body.aliases !== undefined) input.aliases = body.aliases;
+    if (body.devUrl !== undefined) input.devUrl = body.devUrl;
+    if (body.summary !== undefined) input.summary = body.summary;
+    if (Object.keys(input).length === 1) return fail('nothing to update');
+    return settled(
+      await jarvis.tools.execute('project.update', input, { actor: 'user', projectId: id }),
+    );
   });
 
-  app.post('/api/projects/:id/refresh', (c) => {
-    const updated = jarvis.projects.refreshDetection(c.req.param('id'));
-    if (!updated) return fail('project not found', 404);
-    return c.json(updated);
+  app.post('/api/projects/:id/archive', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.projects.get(id)) return fail('project not found', 404);
+    const body = (await c.req.json().catch(() => ({}))) as { archived?: unknown };
+    return settled(
+      await jarvis.tools.execute(
+        'project.archive',
+        { id, archived: body.archived ?? true },
+        { actor: 'user', projectId: id },
+      ),
+    );
+  });
+
+  /** What unregistering would do, so the confirmation dialog can say it exactly. */
+  app.get('/api/projects/:id/unregister-preflight', (c) => {
+    if (!jarvis.projects.get(c.req.param('id'))) return fail('project not found', 404);
+    return c.json(jarvis.projects.unregisterPreflight(c.req.param('id')));
+  });
+
+  /**
+   * Unregister. Destructive by policy, so this returns a pending approval that
+   * the human answers through /api/tool-executions/:id/approve — the browser
+   * modal is the explanation, never the authority.
+   */
+  app.delete('/api/projects/:id', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.projects.get(id)) return fail('project not found', 404);
+    return c.json(await jarvis.tools.execute('project.unregister', { id }, { actor: 'user' }));
+  });
+
+  app.post('/api/projects/:id/refresh', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.projects.get(id)) return fail('project not found', 404);
+    return settled(
+      await jarvis.tools.execute('project.redetect', { id }, { actor: 'user', projectId: id }),
+    );
   });
 
   /** Delete an entire project's Jarvis memory. Deliberately explicit and separate. */
@@ -227,7 +313,201 @@ export function createRoutes(jarvis: Jarvis): Hono {
     );
   });
 
-  // ---------------------------------------------------------------- sessions --
+  // ----------------------------------------------------------- conversations --
+  const conversationDetail = (id: string) => {
+    const conversation = jarvis.sessions.get(id);
+    if (!conversation) return null;
+    const messages = jarvis.sessions.messages(id, 400);
+    const executionIds = new Set(
+      messages
+        .map((message) => message.metadata.executionId)
+        .filter((executionId): executionId is string => typeof executionId === 'string'),
+    );
+    return {
+      conversation,
+      rendered: jarvis.sessions.renderState(conversation.state),
+      messages,
+      toolExecutions: [...executionIds]
+        .map((executionId) => jarvis.tools.getExecution(executionId))
+        .filter((execution) => execution?.sessionId === id),
+      // Job cards render live from these; a deleted Job renders its tombstone.
+      jobs: jarvis.jobs.list({ sessionId: id, archived: 'all', limit: 50 }),
+      tombstones: jarvis.jobs.tombstonesForSession(id),
+      responding: jarvis.chat.isResponding(id),
+    };
+  };
+
+  app.get('/api/conversations', (c) => {
+    const status = c.req.query('status') ?? 'active';
+    if (!['active', 'archived', 'all'].includes(status)) return fail('invalid status');
+    const search = c.req.query('search');
+    return c.json(
+      jarvis.sessions.conversations({
+        status: status as 'active' | 'archived' | 'all',
+        ...(search ? { search } : {}),
+        limit: Math.min(200, Number.parseInt(c.req.query('limit') ?? '80', 10) || 80),
+      }),
+    );
+  });
+
+  app.post('/api/conversations', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { title?: unknown };
+    if (body.title !== undefined && typeof body.title !== 'string') {
+      return fail('title must be a string');
+    }
+    const outcome = await jarvis.tools.execute(
+      'conversation.create',
+      body.title ? { title: body.title } : {},
+      { actor: 'user' },
+    );
+    if (outcome.status !== 'succeeded') return fail('could not create a conversation', 409);
+    return c.json(outcome.result, 201);
+  });
+
+  app.get('/api/conversations/:id', (c) => {
+    const detail = conversationDetail(c.req.param('id'));
+    if (!detail) return fail('conversation not found', 404);
+    return c.json(detail);
+  });
+
+  app.patch('/api/conversations/:id', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.sessions.get(id)) return fail('conversation not found', 404);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      title?: unknown;
+      pinned?: unknown;
+      archived?: unknown;
+      projectId?: unknown;
+    };
+    const fields = Object.keys(body);
+    if (
+      fields.length !== 1 ||
+      !['title', 'pinned', 'archived', 'projectId'].includes(fields[0] as string)
+    ) {
+      return fail('exactly one supported conversation field is required');
+    }
+    // Every mutation goes through the permission boundary, so every mutation has
+    // an outcome. Reporting success for a rename that is awaiting approval,
+    // denied, failed or of unknown effect would leave the UI showing state the
+    // database does not have.
+    const mutate = async (tool: string, input: Record<string, unknown>, what: string) => {
+      const outcome = await jarvis.tools.execute(tool, input, { actor: 'user', sessionId: id });
+      if (outcome.status === 'succeeded') return null;
+      const detail = 'error' in outcome ? `: ${outcome.error}` : '';
+      // 409 for every non-succeeded outcome, exactly as the projectId branch
+      // below already does: the endpoint promises the conversation now holds
+      // this state, and a pending or denied mutation means it does not.
+      return fail(`could not ${what} (${outcome.status}${detail})`, 409);
+    };
+    // A single field of the wrong type, or a blank title, matched no branch
+    // below and still answered 200 -- a success for a mutation that never
+    // happened, which is the same lie the outcome checks exist to prevent.
+    let dispatched = false;
+    if (typeof body.title === 'string' && body.title.trim()) {
+      dispatched = true;
+      const rejected = await mutate(
+        'conversation.rename',
+        { id, title: body.title.trim() },
+        'rename the conversation',
+      );
+      if (rejected) return rejected;
+    }
+    if (typeof body.pinned === 'boolean') {
+      dispatched = true;
+      const rejected = await mutate(
+        'conversation.pin',
+        { id, pinned: body.pinned },
+        'pin the conversation',
+      );
+      if (rejected) return rejected;
+    }
+    if (typeof body.archived === 'boolean') {
+      dispatched = true;
+      const rejected = await mutate(
+        'conversation.archive',
+        { id, archived: body.archived },
+        'archive the conversation',
+      );
+      if (rejected) return rejected;
+    }
+    if (body.projectId !== undefined) {
+      dispatched = true;
+      if (body.projectId !== null && typeof body.projectId !== 'string') {
+        return fail('projectId must be a string or null');
+      }
+      if (body.projectId && !jarvis.projects.get(body.projectId)) {
+        return fail('project not found', 404);
+      }
+      const projectId = (body.projectId as string | null) ?? null;
+      const outcome = await jarvis.tools.execute(
+        'conversation.set_project',
+        { id, projectId },
+        { actor: 'user', sessionId: id, projectId },
+      );
+      if (outcome.status !== 'succeeded') return fail('could not update project context', 409);
+    }
+    if (!dispatched) return fail('the supported conversation field had an unusable value');
+    return c.json(jarvis.sessions.get(id));
+  });
+
+  /** Destructive: returns a pending approval the human must answer explicitly. */
+  app.delete('/api/conversations/:id', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.sessions.get(id)) return fail('conversation not found', 404);
+    return c.json(
+      await jarvis.tools.execute('conversation.delete', { id }, { actor: 'user', sessionId: id }),
+    );
+  });
+
+  app.post('/api/conversations/:id/messages', async (c) => {
+    const id = c.req.param('id');
+    const body = (await c.req.json().catch(() => ({}))) as { text?: unknown };
+    if (typeof body.text !== 'string' || !body.text.trim()) return fail('text is required');
+    try {
+      return c.json(await jarvis.chat.send({ conversationId: id, text: body.text }));
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
+    }
+  });
+
+  app.post('/api/conversations/:id/stop', (c) =>
+    c.json({ stopped: jarvis.chat.stop(c.req.param('id')) }),
+  );
+
+  app.post('/api/conversations/:id/retry', async (c) => {
+    try {
+      return c.json(await jarvis.chat.retry(c.req.param('id')));
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
+    }
+  });
+
+  app.post('/api/conversations/:id/edit-last', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { text?: unknown };
+    if (typeof body.text !== 'string' || !body.text.trim()) return fail('text is required');
+    try {
+      return c.json(await jarvis.chat.editLastUserMessage(c.req.param('id'), body.text));
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
+    }
+  });
+
+  // ------------------------------------------------------------------ search --
+  app.get('/api/search', (c) => {
+    const query = c.req.query('q') ?? '';
+    if (!query.trim()) return c.json([]);
+    return c.json(
+      searchEverything(
+        { sessions: jarvis.sessions, projects: jarvis.projects, jobs: jarvis.jobs },
+        query,
+        Math.min(20, Number.parseInt(c.req.query('limit') ?? '6', 10) || 6),
+      ),
+    );
+  });
+
+  // -------------------------------------------- sessions (compatibility shim) --
+  // The old single "current session" surface. Kept so an existing client keeps
+  // working; the new UI addresses conversations by id and never relies on it.
   app.get('/api/session', (c) => {
     const session = jarvis.sessions.current();
     return c.json({
@@ -243,143 +523,90 @@ export function createRoutes(jarvis: Jarvis): Hono {
   });
 
   app.patch('/api/sessions/:id', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { projectId?: string | null };
+    const body = (await c.req.json().catch(() => ({}))) as { projectId?: unknown };
     if (body.projectId !== undefined) {
-      const updated = jarvis.sessions.setProject(c.req.param('id'), body.projectId);
-      if (!updated) return fail('session not found', 404);
-      return c.json(updated);
+      if (body.projectId !== null && typeof body.projectId !== 'string') {
+        return fail('projectId must be a string or null');
+      }
+      if (body.projectId && !jarvis.projects.get(body.projectId))
+        return fail('project not found', 404);
+      const id = c.req.param('id');
+      const outcome = await jarvis.tools.execute(
+        'conversation.set_project',
+        { id, projectId: body.projectId },
+        { actor: 'user', sessionId: id, projectId: body.projectId },
+      );
+      if (outcome.status !== 'succeeded') return fail('session not found', 404);
+      return c.json(outcome.result);
     }
     return fail('nothing to update');
   });
 
   // ----------------------------------------------------------------- command --
   /**
-   * The Home/Command surface.
+   * Compatibility shim for the pre-conversation Command surface.
    *
-   * Stage A of the memory pipeline runs here: explicit remember/forget/update is
-   * detected deterministically and handled without any model call. Only an actual
-   * coding request spends agent quota.
+   * Everything it used to decide now lives in ChatService: explicit memory
+   * commands stay deterministic and local, and a non-memory message is an
+   * ordinary conversation rather than an automatic development job.
    */
   app.post('/api/command', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as {
       text?: string;
       sessionId?: string;
-      projectId?: string | null;
-      autostart?: boolean;
+      projectId?: unknown;
     };
     const text = body.text?.trim();
     if (!text) return fail('text is required');
-
-    const session = body.sessionId
+    const conversation = body.sessionId
       ? jarvis.sessions.get(body.sessionId)
       : jarvis.sessions.current();
-    if (!session) return fail('session not found', 404);
-    jarvis.sessions.addMessage(session.id, 'user', text);
-
-    const explicit = detectExplicitCommand(text);
-    if (explicit) {
-      const projectId = body.projectId ?? session.projectId;
-      if (explicit.action === 'remember') {
-        const scope: MemoryScope = projectId ? 'project' : 'user';
-        const outcome = await jarvis.memory.remember({
-          scope,
-          scopeId: projectId ?? null,
-          kind: classifyExplicitMemory(explicit.payload, scope),
-          content: explicit.payload,
-          sourceType: 'user_explicit',
-          sourceRef: { sessionId: session.id },
-          explicit: true,
-        });
-        const reply =
-          outcome.status === 'stored'
-            ? `Remembered${outcome.supersededId ? ' (and superseded the previous value)' : ''}.`
-            : outcome.status === 'duplicate'
-              ? 'I already knew that — kept the existing memory.'
-              : `Not stored: ${outcome.reason}${outcome.detail ? ` (${outcome.detail})` : ''}`;
-        jarvis.sessions.addMessage(session.id, 'assistant', reply);
-        return c.json({ kind: 'memory', action: 'remember', outcome, reply });
+    if (!conversation) return fail('conversation not found', 404);
+    if (body.projectId !== undefined) {
+      if (body.projectId !== null && typeof body.projectId !== 'string') {
+        return fail('projectId must be a string or null');
       }
-
-      if (explicit.action === 'forget') {
-        const resolution = await jarvis.memory.resolveForget(explicit.payload, [
-          { scope: 'user', scopeId: null },
-          ...(projectId ? [{ scope: 'project' as MemoryScope, scopeId: projectId }] : []),
-        ]);
-        if (resolution.status === 'not_found') {
-          const reply = `I could not find a memory matching "${explicit.payload}".`;
-          jarvis.sessions.addMessage(session.id, 'assistant', reply);
-          return c.json({ kind: 'memory', action: 'forget', reply, candidates: [] });
-        }
-        if (resolution.status === 'ambiguous') {
-          const reply = 'Several memories could match. Choose the exact one to forget.';
-          jarvis.sessions.addMessage(session.id, 'assistant', reply);
-          return c.json({
-            kind: 'memory',
-            action: 'forget',
-            reply,
-            resolution: 'ambiguous',
-            candidates: resolution.candidates,
-          });
-        }
-        jarvis.memory.forget(resolution.memory.id);
-        const reply = `Forgot: "${resolution.memory.content}"`;
-        jarvis.sessions.addMessage(session.id, 'assistant', reply);
-        return c.json({
-          kind: 'memory',
-          action: 'forget',
-          reply,
-          forgotten: resolution.memory,
-          candidates: [],
-        });
-      }
-
-      // update/correction
-      const matches = await jarvis.memory.retrieve({
-        query: explicit.payload,
-        scopes: [
-          { scope: 'user', scopeId: null },
-          ...(projectId ? [{ scope: 'project' as MemoryScope, scopeId: projectId }] : []),
-        ],
-        limit: 3,
-      });
-      const target = matches[0];
-      const outcome = target
-        ? await jarvis.memory.correct(target.memory.id, explicit.payload, { sessionId: session.id })
-        : await jarvis.memory.remember({
-            scope: projectId ? 'project' : 'user',
-            scopeId: projectId ?? null,
-            kind: 'correction',
-            content: explicit.payload,
-            sourceType: 'user_explicit',
-            sourceRef: { sessionId: session.id },
-            explicit: true,
-          });
-      const reply = target
-        ? 'Updated — the previous version is kept as superseded.'
-        : 'Noted as a new memory.';
-      jarvis.sessions.addMessage(session.id, 'assistant', reply);
-      return c.json({ kind: 'memory', action: 'update', outcome, reply });
+      if (body.projectId && !jarvis.projects.get(body.projectId))
+        return fail('project not found', 404);
+      const outcome = await jarvis.tools.execute(
+        'conversation.set_project',
+        { id: conversation.id, projectId: body.projectId },
+        { actor: 'user', sessionId: conversation.id, projectId: body.projectId },
+      );
+      if (outcome.status !== 'succeeded') return fail('could not update project context', 409);
     }
-
-    // Not a memory command: treat it as a development request.
-    const projectId = body.projectId ?? session.projectId;
-    if (!projectId) {
-      const reply = 'Select a project first — I need a target repository for a development job.';
-      jarvis.sessions.addMessage(session.id, 'assistant', reply);
-      return c.json({ kind: 'need_project', reply });
+    try {
+      const turn = await jarvis.chat.send({ conversationId: conversation.id, text });
+      return c.json({ ...turn, kind: turn.kind, job: turn.job ?? undefined });
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 409);
     }
-    const job = jarvis.jobs.create({ projectId, sessionId: session.id, request: text });
-    jarvis.sessions.updateState(session.id, { goal: job.goal, activeJobIds: [job.id] });
-    if (body.autostart !== false) jarvis.pipeline.start(job.id);
-    const reply = `Started job "${job.goal}".`;
-    jarvis.sessions.addMessage(session.id, 'assistant', reply);
-    return c.json({ kind: 'job', job, reply });
   });
 
   // -------------------------------------------------------------------- jobs --
   app.get('/api/jobs', (c) => {
-    const projectId = c.req.query('projectId');
-    return c.json(jarvis.jobs.list({ ...(projectId ? { projectId } : {}), limit: 50 }));
+    const q = c.req.query();
+    if (q.archived && !['active', 'archived', 'all'].includes(q.archived)) {
+      return fail('invalid archived filter');
+    }
+    if (q.status && !JOB_STATUSES.has(q.status)) return fail('invalid status');
+    if (q.stage && !PIPELINE_STAGES.includes(q.stage as (typeof PIPELINE_STAGES)[number])) {
+      return fail('invalid stage');
+    }
+    return c.json(
+      jarvis.jobs.list({
+        ...(q.projectId ? { projectId: q.projectId } : {}),
+        ...(q.sessionId ? { sessionId: q.sessionId } : {}),
+        ...(q.status ? { status: q.status as JobStatus } : {}),
+        ...(q.stage ? { stage: q.stage as JobStage } : {}),
+        ...(q.search ? { search: q.search } : {}),
+        ...(q.since ? { since: q.since } : {}),
+        ...(q.until ? { until: q.until } : {}),
+        ...(q.sort === 'updated' ? { sort: 'updated' as const } : {}),
+        archived: (q.archived as 'active' | 'archived' | 'all') ?? 'active',
+        limit: Math.min(200, Number.parseInt(q.limit ?? '100', 10) || 100),
+      }),
+    );
   });
 
   app.post('/api/jobs', async (c) => {
@@ -388,6 +615,7 @@ export function createRoutes(jarvis: Jarvis): Hono {
       request?: string;
       acceptance?: string[];
       sessionId?: string;
+      originMessageId?: string;
       autostart?: boolean;
       validationOnly?: boolean;
       candidateSource?: { baseSha?: string; sourceSha?: string };
@@ -398,6 +626,9 @@ export function createRoutes(jarvis: Jarvis): Hono {
           route?: string;
           viewports?: Array<'desktop' | 'mobile'>;
           interactions?: Array<Record<string, unknown>>;
+          viewportInteractions?: Partial<
+            Record<'desktop' | 'mobile', Array<Record<string, unknown>>>
+          >;
         }>;
       };
     };
@@ -440,12 +671,30 @@ export function createRoutes(jarvis: Jarvis): Hono {
               if ((scenario.interactions?.length ?? 0) > 50) {
                 throw new Error(`visual QA scenario ${scenario.name} exceeds 50 interactions`);
               }
+              for (const [viewport, steps] of Object.entries(scenario.viewportInteractions ?? {})) {
+                if (!['desktop', 'mobile'].includes(viewport) || !Array.isArray(steps)) {
+                  throw new Error(`visual QA scenario ${scenario.name} has an invalid viewport`);
+                }
+                if ((steps?.length ?? 0) > 50) {
+                  throw new Error(`visual QA scenario ${scenario.name} exceeds 50 interactions`);
+                }
+              }
               return {
                 name: scenario.name.trim(),
                 route: scenario.route,
                 ...(scenario.viewports ? { viewports: scenario.viewports } : {}),
                 ...(scenario.interactions
                   ? { interactions: scenario.interactions.map(parseVisualInteraction) }
+                  : {}),
+                ...(scenario.viewportInteractions
+                  ? {
+                      viewportInteractions: Object.fromEntries(
+                        Object.entries(scenario.viewportInteractions).map(([viewport, steps]) => [
+                          viewport,
+                          steps?.map(parseVisualInteraction),
+                        ]),
+                      ),
+                    }
                   : {}),
               };
             }),
@@ -459,6 +708,7 @@ export function createRoutes(jarvis: Jarvis): Hono {
       request: body.request,
       acceptance: body.acceptance ?? [],
       sessionId: body.sessionId ?? null,
+      ...(body.originMessageId ? { originMessageId: body.originMessageId } : {}),
       ...(candidateSource ? { candidateSource } : {}),
       validationOnly: body.validationOnly ?? false,
       ...(visualQa ? { visualQa } : {}),
@@ -508,6 +758,10 @@ export function createRoutes(jarvis: Jarvis): Hono {
       episode: job.episodeId ? jarvis.memory.get(job.episodeId) : null,
       contextPacks: packIds.map((id) => jarvis.context.getPack(id)).filter(Boolean),
       project: jarvis.projects.get(job.projectId),
+      // Resuming a candidate whose target has moved on is the failure mode this
+      // surfaces before the button is ever pressed.
+      staleness: job.stage === 'paused' ? await jarvis.lifecycle.staleness(job.id) : null,
+      deletionPlan: jarvis.lifecycle.deletionPlan(job.id),
     });
   });
 
@@ -519,17 +773,64 @@ export function createRoutes(jarvis: Jarvis): Hono {
     return c.json({ started: true });
   });
 
-  app.post('/api/jobs/:id/cancel', (c) => {
-    const cancelled = jarvis.pipeline.cancel(c.req.param('id'));
-    return c.json({ cancelled });
+  /** Cancelling is `sensitive`: its effect is partial by nature, so it confirms. */
+  app.post('/api/jobs/:id/cancel', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.jobs.get(id)) return fail('job not found', 404);
+    return c.json(await jarvis.tools.execute('job.cancel', { id }, { actor: 'user', jobId: id }));
   });
 
-  app.post('/api/jobs/:id/resume', (c) => {
-    const job = jarvis.jobs.get(c.req.param('id'));
+  app.post('/api/jobs/:id/resume', async (c) => {
+    const id = c.req.param('id');
+    const job = jarvis.jobs.get(id);
     if (!job) return fail('job not found', 404);
     if (job.stage !== 'paused') return fail(`job is ${job.stage}, not paused`, 409);
-    jarvis.pipeline.resume(job.id);
-    return c.json({ resumed: true });
+    const outcome = await jarvis.tools.execute('job.resume', { id }, { actor: 'user', jobId: id });
+    return settled(outcome);
+  });
+
+  /** Why a paused Job may or may not be resumable right now. Read-only. */
+  app.get('/api/jobs/:id/staleness', async (c) => {
+    if (!jarvis.jobs.get(c.req.param('id'))) return fail('job not found', 404);
+    return c.json(await jarvis.lifecycle.staleness(c.req.param('id')));
+  });
+
+  app.post('/api/jobs/:id/archive', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.jobs.get(id)) return fail('job not found', 404);
+    const body = (await c.req.json().catch(() => ({}))) as { archived?: unknown };
+    const outcome = await jarvis.tools.execute(
+      'job.archive',
+      { id, archived: body.archived ?? true },
+      { actor: 'user', jobId: id },
+    );
+    return settled(outcome);
+  });
+
+  /** Run again: always a NEW Job on the current base, never a resurrected candidate. */
+  app.post('/api/jobs/:id/retry', async (c) => {
+    const id = c.req.param('id');
+    const job = jarvis.jobs.get(id);
+    if (!job) return fail('job not found', 404);
+    const body = (await c.req.json().catch(() => ({}))) as { autostart?: unknown };
+    const outcome = await jarvis.tools.execute(
+      'job.retry',
+      { id, autostart: body.autostart !== false },
+      { actor: 'user', jobId: id, sessionId: job.sessionId },
+    );
+    return settled(outcome);
+  });
+
+  /** What deleting this Job would remove and preserve. Powers the confirmation. */
+  app.get('/api/jobs/:id/deletion-plan', (c) => {
+    if (!jarvis.jobs.get(c.req.param('id'))) return fail('job not found', 404);
+    return c.json(jarvis.lifecycle.deletionPlan(c.req.param('id')));
+  });
+
+  app.delete('/api/jobs/:id', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.jobs.get(id)) return fail('job not found', 404);
+    return c.json(await jarvis.tools.execute('job.delete', { id }, { actor: 'user', jobId: id }));
   });
 
   const approveCandidate = async (jobId: string) => {

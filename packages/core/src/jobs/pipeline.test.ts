@@ -1439,8 +1439,16 @@ describe('provider-scoped session recovery', () => {
     memoryProposals: [],
   });
 
-  async function runStage(h: Harness, provider: ProviderId, resumeSessionId: string) {
+  async function runStage(
+    h: Harness,
+    provider: ProviderId,
+    resumeSessionId: string,
+    owner?: ProviderId,
+  ) {
     const created = h.jobs.create({ projectId: h.project.id, request: 'resume provider session' });
+    // A persisted resume id always has a recorded owner; the pair is what the
+    // stage reads.
+    h.jobs.patch(created.id, { lastProvider: owner ?? provider, resumeSessionId });
     const pipeline = h.pipeline as unknown as {
       runAgentStage(opts: {
         jobId: string;
@@ -1515,6 +1523,22 @@ describe('provider-scoped session recovery', () => {
     expect(fallbackCalls).toBe(1);
     expect(fallbackResumeId).toBeUndefined();
     expect(preferredCalls).toBe(2);
+  });
+
+  it('never resumes a session recorded against a different provider', async () => {
+    // The Job carries a Claude thread, but this stage prefers Codex. Handing it
+    // over would put a Claude id behind `codex resume` -- the exact shape that
+    // produced "Codex exited without a terminal structured event" against a
+    // worktree where direct Codex execution worked.
+    const codex = new FakeProvider('codex', (options) =>
+      options.resumeSessionId ? failure('wrong provider session') : success('fresh codex'),
+    );
+    const h = await harness({ review, providers: [codex] });
+    const { result } = await runStage(h, 'codex', 'claude-session', 'claude');
+
+    expect(result.status).toBe('completed');
+    expect(codex.calls.map((call) => call.resumeSessionId)).toEqual([undefined]);
+    h.db.close();
   });
 
   it('never sends a session id to a provider chosen on the first attempt', async () => {

@@ -1,7 +1,17 @@
 import { useEffect, useState } from 'react';
-import { api, artifactUrl, type ContextPack, type JarvisEvent } from '../api.ts';
+import { api, artifactUrl, type ContextPack, type JarvisEvent, type Job } from '../api.ts';
 import { useAsync } from '../hooks.ts';
-import { Badge, Card, Diff, Empty, MemoryCard, Pipeline, StageBadge } from '../components.tsx';
+import {
+  Badge,
+  Card,
+  ConfirmDialog,
+  Diff,
+  Empty,
+  MemoryCard,
+  Pipeline,
+  StageBadge,
+} from '../components.tsx';
+import { approvePending } from './Chat.tsx';
 
 /**
  * Full job result view.
@@ -15,15 +25,21 @@ export function JobDetailView({
   lastEvent,
   artifactsDir,
   onBack,
+  onOpenJob,
 }: {
   jobId: string;
   lastEvent: JarvisEvent | null;
   artifactsDir: string;
   onBack: () => void;
+  onOpenJob: (id: string) => void;
 }) {
   const detail = useAsync(() => api.job(jobId), [jobId]);
   const [pack, setPack] = useState<ContextPack | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const setActionErrorFrom = (reason: unknown) =>
+    setActionError(reason instanceof Error ? reason.message : String(reason));
+  const [destructive, setDestructive] = useState<'cancel' | 'delete' | null>(null);
+  const [busy, setBusy] = useState(false);
 
   // Live refresh, but only for events belonging to this job.
   useEffect(() => {
@@ -59,6 +75,8 @@ export function JobDetailView({
     application,
     routingDecisions,
     upgrade,
+    staleness,
+    deletionPlan,
   } = detail.data;
   const review = reviews[reviews.length - 1];
   const implementationRun = runs.findLast(
@@ -79,7 +97,10 @@ export function JobDetailView({
         {running && (
           <button
             className="btn sm danger"
-            onClick={() => void api.cancelJob(job.id).then(detail.reload)}
+            onClick={() => {
+              setActionError(null);
+              setDestructive('cancel');
+            }}
           >
             Cancel
           </button>
@@ -87,7 +108,7 @@ export function JobDetailView({
         {job.stage === 'queued' && (
           <button
             className="btn sm primary"
-            onClick={() => void api.startJob(job.id).then(detail.reload)}
+            onClick={() => void api.startJob(job.id).then(detail.reload, setActionErrorFrom)}
           >
             Start
           </button>
@@ -101,6 +122,47 @@ export function JobDetailView({
           >
             Paused: {firstLine(job.pauseReason ?? job.error) ?? 'reason not recorded'}
           </span>
+        )}
+        {['failed', 'completed', 'cancelled', 'paused', 'awaiting_user'].includes(job.stage) && (
+          <button
+            className="btn sm"
+            onClick={() =>
+              // Say why when it refuses: "Restart as new Job" on a
+              // validation-only Job is refused, and used to do nothing at all.
+              void api.retryJob(job.id).then((outcome) => {
+                if (outcome.status !== 'succeeded') {
+                  const detailText =
+                    'error' in outcome && outcome.error ? `: ${outcome.error}` : '';
+                  setActionError(`could not restart this Job (${outcome.status}${detailText})`);
+                  return;
+                }
+                onOpenJob((outcome.result as Job).id);
+              }, setActionErrorFrom)
+            }
+          >
+            Restart as new Job
+          </button>
+        )}
+        {['failed', 'completed', 'cancelled', 'paused', 'awaiting_user'].includes(job.stage) && (
+          <button
+            className="btn sm"
+            onClick={() =>
+              void api.archiveJob(job.id, !job.archivedAt).then(detail.reload, setActionErrorFrom)
+            }
+          >
+            {job.archivedAt ? 'Unarchive' : 'Archive'}
+          </button>
+        )}
+        {deletionPlan.eligible && (
+          <button
+            className="btn sm danger"
+            onClick={() => {
+              setActionError(null);
+              setDestructive('delete');
+            }}
+          >
+            Delete
+          </button>
         )}
         {job.stage === 'paused' && (
           <button
@@ -214,6 +276,12 @@ export function JobDetailView({
       {job.stage === 'paused' && (
         <div className="alert error" role="status" data-testid="pause-explanation">
           Paused at {job.resumeStage ?? 'unknown stage'}: {job.pauseReason ?? job.error}
+        </div>
+      )}
+      {staleness?.stale && (
+        <div className="alert error" role="status" data-testid="stale-job">
+          <strong>This paused Job is stale.</strong> {staleness.detail} Resume is blocked; restart
+          as a new Job against the current target, inspect this candidate, or archive it.
         </div>
       )}
       <div className="small dim" style={{ marginBottom: 10 }}>
@@ -528,7 +596,10 @@ export function JobDetailView({
                           <button
                             className="btn sm"
                             onClick={() =>
-                              r.contextPackId && void api.contextPack(r.contextPackId).then(setPack)
+                              r.contextPackId &&
+                              void api
+                                .contextPack(r.contextPackId)
+                                .then(setPack, setActionErrorFrom)
                             }
                           >
                             Context
@@ -621,7 +692,7 @@ export function JobDetailView({
                   </span>
                   <button
                     className="btn sm"
-                    onClick={() => void api.contextPack(p.id).then(setPack)}
+                    onClick={() => void api.contextPack(p.id).then(setPack, setActionErrorFrom)}
                   >
                     Inspect
                   </button>
@@ -751,6 +822,44 @@ export function JobDetailView({
           </Card>
         </div>
       </div>
+      {destructive !== null && (
+        <ConfirmDialog
+          open
+          title={destructive === 'cancel' ? `Cancel “${job.goal}”?` : `Delete “${job.goal}”?`}
+          description={
+            destructive === 'cancel'
+              ? 'The active process will stop; partial work stays contained.'
+              : deletionPlan.reason
+          }
+          removes={destructive === 'cancel' ? ['the active agent process'] : deletionPlan.removes}
+          preserves={
+            destructive === 'cancel'
+              ? ['the Job, worktree, edits, and audit history']
+              : deletionPlan.preserves
+          }
+          confirmLabel={destructive === 'cancel' ? 'Cancel Job' : 'Delete Job'}
+          busy={busy}
+          error={actionError}
+          onCancel={() => setDestructive(null)}
+          onConfirm={() => {
+            setBusy(true);
+            const action =
+              destructive === 'cancel'
+                ? api.cancelJob(job.id).then((outcome) => approvePending(outcome))
+                : api.deleteJob(job.id).then((outcome) => approvePending(outcome));
+            void action
+              .then(() => {
+                setDestructive(null);
+                if (destructive === 'delete') onBack();
+                else detail.reload();
+              })
+              .catch((error: unknown) =>
+                setActionError(error instanceof Error ? error.message : String(error)),
+              )
+              .finally(() => setBusy(false));
+          }}
+        />
+      )}
     </div>
   );
 }

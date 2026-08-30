@@ -10,6 +10,8 @@ import type { MemoryService } from '../memory/service.js';
 import type { ContextPackBuilder } from '../context/pack.js';
 import {
   classifyAgentFailure,
+  describeAgentFailure,
+  INFRASTRUCTURE_FAILURE_KINDS,
   type AgentFailureKind,
   type AgentRegistry,
 } from '../agents/registry.js';
@@ -24,7 +26,7 @@ import {
 } from '../visualqa/candidate-plan.js';
 import { VisualReviewer } from '../visualqa/reviewer.js';
 import { startCandidateRuntime } from '../runtime/candidate.js';
-import { GitWorkspace } from '../git/workspace.js';
+import { GitWorkspace, repoStatus } from '../git/workspace.js';
 import { MEMORY_PROPOSAL_INSTRUCTIONS } from '../agents/proposals.js';
 import {
   proposalToInput,
@@ -38,17 +40,6 @@ import type { AgentRole } from '../agents/types.js';
 import type { VisualReview } from '../visualqa/reviewer.js';
 
 const log = createLogger('pipeline');
-
-interface AgentStageOutcome {
-  status: string;
-  result: string;
-  error?: string | undefined;
-  failureKind?: AgentFailureKind | undefined;
-  sessionId?: string | undefined;
-  provider?: ProviderId;
-  proposals: ReturnType<typeof proposalToInput>[];
-  runId: string;
-}
 
 export interface PipelineDeps {
   db: Db;
@@ -64,6 +55,40 @@ export interface PipelineDeps {
   review: ReviewEngine;
   visualQa?: VisualQaEngine;
   visualReviewer?: VisualReviewer;
+}
+
+/** One agent stage's outcome, including *why* it failed if it did. */
+export interface AgentStageOutcome {
+  status: string;
+  result: string;
+  error?: string | undefined;
+  /** Absent on success. Infrastructure kinds must never invoke a source fixer. */
+  failureKind?: AgentFailureKind | undefined;
+  sessionId?: string | undefined;
+  provider?: ProviderId;
+  proposals: ReturnType<typeof proposalToInput>[];
+  runId: string;
+}
+
+/**
+ * Pause text for a failed agent stage.
+ *
+ * An infrastructure failure says so in its first line, because "agent reported
+ * an error" on a quota pause is what makes a provider outage look like broken
+ * code — and what would tempt anyone reading it to send a fixer at the source.
+ */
+export function agentStagePauseReason(outcome: AgentStageOutcome, fallback: string): string {
+  const kind = outcome.failureKind;
+  if (!kind) return outcome.error ?? fallback;
+  const headline = describeAgentFailure(kind, outcome.error);
+  const infrastructure = INFRASTRUCTURE_FAILURE_KINDS.includes(kind);
+  return [
+    headline,
+    infrastructure ? 'No source fix was attempted: nothing about the candidate caused this.' : '',
+    outcome.error ?? '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 /**
@@ -242,7 +267,7 @@ export class JobPipeline {
           this.pause(
             jobId,
             'fixing',
-            `${fixed.error ?? 'verification fixer provider attempts exhausted'}\n\n${report.failureSummary}`,
+            `${agentStagePauseReason(fixed, 'verification fixer provider attempts exhausted')}\n\n${report.failureSummary}`,
           );
           return;
         }
@@ -369,7 +394,7 @@ export class JobPipeline {
           this.pause(
             jobId,
             'fixing',
-            `${fixed.error ?? 'code-review fixer provider attempts exhausted'}\n\n${renderCodeBlockers(blockers)}`,
+            `${agentStagePauseReason(fixed, 'code-review fixer provider attempts exhausted')}\n\n${renderCodeBlockers(blockers)}`,
           );
           return;
         }
@@ -562,7 +587,7 @@ export class JobPipeline {
             this.pause(
               jobId,
               'fixing',
-              `${fixed.error ?? 'visual fixer provider attempts exhausted'}\n\n${renderVisualBlockers(blockingReview)}`,
+              `${agentStagePauseReason(fixed, 'visual fixer provider attempts exhausted')}\n\n${renderVisualBlockers(blockingReview)}`,
             );
             return;
           }
@@ -704,6 +729,23 @@ export class JobPipeline {
         });
         return;
       }
+      // The target may have moved on since this candidate was checkpointed —
+      // exactly what happens after Jarvis self-updates. Old reviewed work must
+      // not be resumed against a repository it has never seen.
+      const target = await repoStatus(project.rootPath);
+      if (target.head && target.head !== job.baseRef) {
+        const detail =
+          `Resume refused: this Job was based on ${job.baseRef.slice(0, 8)}, ` +
+          `but the target is now ${target.head.slice(0, 8)}. ` +
+          'Restart it as a new Job against the current base, or archive it.';
+        jobs.patch(jobId, { pauseReason: detail, error: detail });
+        bus.emit({
+          type: 'system.recovery',
+          jobId,
+          payload: { reason: 'stale_base', jobBase: job.baseRef, targetHead: target.head },
+        });
+        return;
+      }
       await this.git.validateRecoveryWorkspace({
         repoRoot: project.rootPath,
         worktreePath: job.worktreePath,
@@ -818,7 +860,11 @@ export class JobPipeline {
           return;
         }
         if (resumed.status !== 'completed') {
-          this.pause(jobId, resumeStage, resumed.error ?? 'resumed agent stage exhausted');
+          this.pause(
+            jobId,
+            resumeStage,
+            agentStagePauseReason(resumed, 'resumed agent stage exhausted'),
+          );
           return;
         }
         await this.git.commitPending(job.worktreePath, `jarvis: resume ${resumeStage}`);
@@ -933,11 +979,7 @@ export class JobPipeline {
       return;
     }
     if (implResult.status !== 'completed') {
-      this.pause(
-        jobId,
-        'implementing',
-        `Implementer unavailable: ${implResult.error ?? 'unknown'}`,
-      );
+      this.pause(jobId, 'implementing', agentStagePauseReason(implResult, 'Implementer failed'));
       return;
     }
     await this.git.commitPending(worktree.path, `jarvis: ${job.goal}`);
@@ -966,7 +1008,13 @@ export class JobPipeline {
     headRef: string;
     cycle: number;
   }): Promise<VisualQaOutcome> {
-    let outcome: VisualQaOutcome;
+    // Fail closed: if neither the try nor the catch ever assigns (a throw from
+    // the catch itself), the finally block and the caller still see a bounded
+    // infrastructure outcome rather than an unassigned read.
+    let outcome: VisualQaOutcome = {
+      kind: 'infrastructure',
+      error: 'visual QA did not complete',
+    };
     let server: Awaited<ReturnType<typeof startCandidateRuntime>> | undefined;
     try {
       server = await startCandidateRuntime({
@@ -1045,10 +1093,11 @@ export class JobPipeline {
       try {
         await server?.stop();
       } catch (error) {
-        outcome = {
-          kind: 'infrastructure',
-          error: `candidate runtime cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-        };
+        const cleanup = `candidate runtime cleanup also failed: ${error instanceof Error ? error.message : String(error)}`;
+        outcome =
+          outcome && 'error' in outcome
+            ? { ...outcome, error: `${outcome.error}\n\n${cleanup}` }
+            : { kind: 'infrastructure', error: cleanup };
       }
     }
     return outcome;
@@ -1068,7 +1117,17 @@ export class JobPipeline {
     let preferred = opts.preferredProvider;
     // A provider session has authority only as the pair (provider, id). A legacy
     // id without an owner is retired by omission rather than guessed.
-    let resumeSessionId = preferred ? opts.resumeSessionId : undefined;
+    //
+    // `lastProvider` is written in the same patch as `resumeSessionId`, so it is
+    // the recorded owner of that id. Requiring it to match here makes the
+    // one-provider-per-session invariant structural rather than a convention
+    // every call site has to remember: a Claude thread can never reach the Codex
+    // CLI, whichever caller assembled the pair.
+    const sessionOwner = this.deps.jobs.get(opts.jobId)?.lastProvider ?? null;
+    let resumeSessionId =
+      preferred && opts.resumeSessionId && sessionOwner === preferred
+        ? opts.resumeSessionId
+        : undefined;
     let last: AgentStageOutcome | undefined;
     const maxAttempts = this.config.pipeline.agentStageRetries;
     for (let attempt = 0; attempt <= maxAttempts; attempt++) {
@@ -1081,10 +1140,13 @@ export class JobPipeline {
         },
       });
       if (!routed.provider) {
+        // Every provider is unusable. That is infrastructure state, and saying
+        // so verbatim is what stops it from being read as a code problem.
         last = {
           status: 'failed',
           result: '',
           error: `No healthy provider: ${routed.reason}`,
+          failureKind: 'unavailable',
           proposals: [],
           runId: '',
         };
@@ -1104,6 +1166,8 @@ export class JobPipeline {
           attempt < maxAttempts &&
           (result.failureKind === 'session_invalid' || result.failureKind === 'protocol')
         ) {
+          // Retire the broken external session so nothing replays it: not this
+          // loop, and not a later Resume reading it back off the Job row.
           this.deps.jobs.patch(opts.jobId, { resumeSessionId: null });
           this.deps.bus.emit({
             type: 'agent.stage.retry',
@@ -1117,6 +1181,7 @@ export class JobPipeline {
               error: result.error,
             },
           });
+          // Same provider, same worktree, same prompt - a fresh agent context.
           const fresh = await this.runAgent({
             ...opts,
             provider,
@@ -1139,6 +1204,7 @@ export class JobPipeline {
           stage: opts.role,
           attempt: attempt + 1,
           provider: last.provider,
+          failureKind: last.failureKind,
           error: last.error,
         },
       });
@@ -1248,7 +1314,9 @@ export class JobPipeline {
       };
     }
 
-    agents.recordResult?.(opts.provider, result);
+    agents.recordResult?.(opts.provider, result, { resumed: Boolean(opts.resumeSessionId) });
+    // Classified on the raw error, which is the only place the provider's own
+    // wording survives. Everything that leaves this boundary is redacted.
     const failureKind = result.status === 'completed' ? undefined : classifyAgentFailure(result);
 
     // Provider text crosses into prompts, recovery state, events and durable
@@ -1266,7 +1334,12 @@ export class JobPipeline {
     });
     jobs.patch(opts.jobId, {
       lastProvider: opts.provider,
-      resumeSessionId: result.sessionId ?? opts.resumeSessionId ?? null,
+      // A session that just proved unresumable is not a checkpoint. Dropping it
+      // here is what stops a later Resume from replaying the same dead thread.
+      resumeSessionId:
+        failureKind === 'session_invalid'
+          ? null
+          : (result.sessionId ?? opts.resumeSessionId ?? null),
     });
     bus.emit({
       type: result.status === 'completed' ? 'agent.completed' : 'agent.failed',

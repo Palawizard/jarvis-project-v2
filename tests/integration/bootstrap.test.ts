@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   ContextPackBuilder,
   EventBus,
+  Jarvis,
   JobPipeline,
   JobService,
   MemoryService,
@@ -22,6 +23,7 @@ import {
   type Db,
   type ProviderCapabilities,
   type ProviderId,
+  selfSurfaceScenario,
 } from '../../packages/core/src/index.js';
 
 const homes: string[] = [];
@@ -246,5 +248,39 @@ describe('bootstrap vertical slice without cloud quota', () => {
     expect(persisted.get(episodeId)?.content).toBe(episode?.content);
     reopened.close();
     activeDb = null;
+  });
+});
+
+describe('self project registration', () => {
+  it('registers Jarvis as its own project with a resolvable visual QA default', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-self-'));
+    homes.push(home);
+    const base = loadConfig({ home });
+    const jarvis = new Jarvis({ ...base, memory: { ...base.memory, embeddingsEnabled: false } });
+    try {
+      const result = await jarvis.boot();
+      // registerSelf failures are deliberately swallowed so a non-repo install
+      // still boots. That makes a broken self config silent, which is exactly
+      // how a stale surface name once left /health reporting commit "unknown".
+      expect(result.selfProject).not.toBeNull();
+      const self = jarvis.projects.getSelf();
+      expect(self?.isSelf).toBe(true);
+      // 'jarvis'/'yourself' are deliberately NOT aliases: an alias matches
+      // anywhere in a sentence and above conversation affinity, so seeding the
+      // words used to address Jarvis made "Jarvis fix the login bug" retarget
+      // the conversation at Jarvis's own repository. It resolves by name and by
+      // explicit reference instead.
+      expect(self?.aliases).not.toContain('jarvis');
+      expect(self?.aliases).not.toContain('yourself');
+      const named = jarvis.projects.resolve('fix the Jobs page in Jarvis');
+      expect(named.status).toBe('resolved');
+      if (named.status === 'resolved') expect(named.project.id).toBe(self?.id);
+      // Every scenario the self project defaults to must exist in the catalog.
+      for (const scenario of self?.config.visualQa?.scenarios ?? []) {
+        expect(() => selfSurfaceScenario(scenario.name)).not.toThrow();
+      }
+    } finally {
+      jarvis.close();
+    }
   });
 });

@@ -199,7 +199,9 @@ describe('plan drives which findings may block', () => {
       { visualQaConfig: null } as never,
       {
         isSelf: true,
-        config: { visualQa: { required: true, scenarios: [selfSurfaceScenario('command')] } },
+        config: {
+          visualQa: { required: true, scenarios: [selfSurfaceScenario('chat-workspace')] },
+        },
         stack: {},
       } as never,
       ['apps/web/src/views/JobDetail.tsx'],

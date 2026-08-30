@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { openDb, type Db } from '../db/index.js';
 import { loadConfig } from '../config.js';
 import { nowIso } from '../ids.js';
-import { FIXTURE_PAUSED_JOB_ID } from '../visualqa/surfaces.js';
+import { FIXTURE_CHAT_ID, FIXTURE_PAUSED_JOB_ID } from '../visualqa/surfaces.js';
 import {
   CANDIDATE_FIXTURE_ENV,
   requestedCandidateFixtures,
@@ -104,5 +104,99 @@ describe('candidate visual QA fixtures', () => {
     const database = db();
     expect(seedCandidateFixtures(database, { projectId: null, env: candidateEnv })).toEqual([]);
     expect(pausedJob(database)).toBeUndefined();
+  });
+});
+
+describe('chat workspace fixture', () => {
+  const chatEnv = {
+    JARVIS_CANDIDATE_RUNTIME: '1',
+    [CANDIDATE_FIXTURE_ENV]: 'chat-workspace',
+  } as NodeJS.ProcessEnv;
+
+  function seeded() {
+    const database = db();
+    expect(seedCandidateFixtures(database, { projectId: 'prj_self', env: chatEnv })).toEqual([
+      'chat-workspace',
+    ]);
+    return database;
+  }
+
+  it('seeds several conversations, one selected and one with a long title', () => {
+    const database = seeded();
+    const conversations = database
+      .prepare('SELECT id, title, pinned FROM sessions ORDER BY pinned DESC')
+      .all() as Array<{ id: string; title: string; pinned: number }>;
+    expect(conversations.length).toBeGreaterThanOrEqual(2);
+    const active = conversations.find((row) => row.id === FIXTURE_CHAT_ID);
+    expect(active?.pinned).toBe(1);
+    // Long titles are a real layout hazard, so the catalog always shows one.
+    expect(conversations.some((row) => row.title.length > 60)).toBe(true);
+  });
+
+  it('seeds a Markdown assistant turn covering the renderer surface', () => {
+    const content = (
+      seeded()
+        .prepare("SELECT content FROM messages WHERE session_id=? AND role='assistant'")
+        .get(FIXTURE_CHAT_ID) as { content: string }
+    ).content;
+    for (const markdown of ['##', '- ', '**', '>', '```', '|']) {
+      expect(content).toContain(markdown);
+    }
+    expect(content).toContain('> Jobs are linked background work.\n### Audit linkage');
+  });
+
+  it('seeds both a running and an awaiting_user Job card for the conversation', () => {
+    const jobs = seeded()
+      .prepare('SELECT id, stage, status, pause_reason FROM jobs WHERE session_id=?')
+      .all(FIXTURE_CHAT_ID) as Array<{
+      stage: string;
+      status: string;
+      pause_reason: string | null;
+    }>;
+    expect(jobs.map((job) => job.stage).sort()).toEqual(['awaiting_user', 'implementing']);
+    expect(jobs.find((job) => job.stage === 'awaiting_user')?.pause_reason).toBeTruthy();
+  });
+
+  it('seeds an agent-originated pending confirmation with no grantable provenance', () => {
+    const execution = seeded()
+      .prepare(
+        `SELECT actor, originating_actor, status, parent_execution_id
+           FROM tool_executions WHERE id='tex_qafixture_agent_confirmation'`,
+      )
+      .get();
+    expect(execution).toEqual({
+      actor: 'user',
+      originating_actor: 'agent',
+      status: 'pending_approval',
+      parent_execution_id: 'tex_qafixture_agent_denial',
+    });
+  });
+
+  it('uses only synthetic values, and never touches the real runtime', () => {
+    const database = seeded();
+    const rows = JSON.stringify([
+      database.prepare('SELECT * FROM sessions').all(),
+      database.prepare('SELECT * FROM jobs').all(),
+      database.prepare('SELECT * FROM messages').all(),
+    ]);
+    expect(rows).toContain('qafixture');
+    // No real credential, home path or user content can reach a candidate.
+    expect(rows).not.toMatch(/[A-Za-z]:\\\\Users\\\\/);
+    expect(rows).not.toMatch(/sk-[a-z]+-/i);
+
+    const real = db();
+    expect(
+      seedCandidateFixtures(real, {
+        projectId: 'prj_self',
+        env: { [CANDIDATE_FIXTURE_ENV]: 'chat-workspace' } as NodeJS.ProcessEnv,
+      }),
+    ).toEqual([]);
+    expect(real.prepare('SELECT COUNT(*) AS n FROM sessions').get()).toEqual({ n: 0 });
+  });
+
+  it('is idempotent across repeated candidate boots', () => {
+    const database = seeded();
+    seedCandidateFixtures(database, { projectId: 'prj_self', env: chatEnv });
+    expect(database.prepare('SELECT COUNT(*) AS n FROM messages').get()).toEqual({ n: 2 });
   });
 });

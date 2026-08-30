@@ -29,6 +29,15 @@ export type ToolActor = 'user' | 'agent' | 'system';
 
 export type PolicyDecision = 'allow' | 'confirm' | 'deny';
 
+export type PolicyReasonCode =
+  | 'caller_ceiling'
+  | 'actor_risk_ceiling'
+  | 'base_allow'
+  | 'standing_grant'
+  | 'grant_definition_drift'
+  | 'non_grantable_risk'
+  | 'confirmation_required';
+
 export const RISK_LEVELS: RiskLevel[] = [
   'observe',
   'safe_action',
@@ -106,33 +115,56 @@ export interface PolicyInput {
 
 export interface PolicyOutcome {
   decision: PolicyDecision;
+  /** Stable classification used for security-sensitive follow-up decisions. */
+  code: PolicyReasonCode;
   /** Stable machine-readable reason, stored on every execution row. */
   reason: string;
 }
 
 export function decide(input: PolicyInput): PolicyOutcome {
   if (input.maxRisk && riskExceeds(input.risk, input.maxRisk)) {
-    return { decision: 'deny', reason: `above the caller ceiling ${input.maxRisk}` };
+    return {
+      decision: 'deny',
+      code: 'caller_ceiling',
+      reason: `above the caller ceiling ${input.maxRisk}`,
+    };
   }
 
   const base = BASE[input.actor][input.risk];
   if (base === 'deny') {
-    return { decision: 'deny', reason: `${input.actor} may not run ${input.risk} tools` };
+    return {
+      decision: 'deny',
+      code: 'actor_risk_ceiling',
+      reason: `${input.actor} may not run ${input.risk} tools`,
+    };
   }
   if (base === 'allow') {
-    return { decision: 'allow', reason: `${input.risk} is allowed for ${input.actor}` };
+    return {
+      decision: 'allow',
+      code: 'base_allow',
+      reason: `${input.risk} is allowed for ${input.actor}`,
+    };
   }
 
   if (input.hasGrant) {
     if (riskExceeds(input.risk, MAX_GRANTABLE_RISK)) {
       return {
         decision: 'confirm',
+        code: 'non_grantable_risk',
         reason: `${input.risk} always needs a human, a standing permission cannot cover it`,
       };
     }
-    return { decision: 'allow', reason: 'standing permission for this context' };
+    return {
+      decision: 'allow',
+      code: 'standing_grant',
+      reason: 'standing permission for this context',
+    };
   }
-  return { decision: 'confirm', reason: `${input.risk} needs your confirmation` };
+  return {
+    decision: 'confirm',
+    code: 'confirmation_required',
+    reason: `${input.risk} needs your confirmation`,
+  };
 }
 
 /** What the policy would decide right now, used to explain the catalog in the UI. */

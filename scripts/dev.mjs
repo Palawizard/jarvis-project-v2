@@ -39,6 +39,7 @@ export const RUNTIME_ENV_ALLOWLIST = Object.freeze([
   'JARVIS_HOME',
   'JARVIS_PORT',
   'JARVIS_WEB_PORT',
+  'JARVIS_LOG_LEVEL',
   'JARVIS_CONTROL_ORIGINS',
   'JARVIS_IMPLEMENTER_PROVIDER',
   'JARVIS_REVIEWER_PROVIDER',
@@ -251,6 +252,7 @@ export function readyBanner({ webPort, apiPort, token, sessionDir }) {
 
 const children = [];
 let shuttingDown = false;
+const pendingChildFailures = new Set();
 
 function killTree(child) {
   if (!child.pid || child.exitCode !== null) return;
@@ -260,13 +262,19 @@ function killTree(child) {
       windowsHide: true,
     });
   } else {
-    child.kill('SIGTERM');
+    try {
+      process.kill(-child.pid, 'SIGTERM');
+    } catch {
+      child.kill('SIGTERM');
+    }
   }
 }
 
 function shutdown(code) {
   if (shuttingDown) return;
   shuttingDown = true;
+  for (const timer of pendingChildFailures) clearTimeout(timer);
+  pendingChildFailures.clear();
   for (const child of children) killTree(child);
   setTimeout(() => process.exit(code), 400);
 }
@@ -280,6 +288,7 @@ function spawnPrefixed(name, executable, args, color, options = {}) {
   const child = spawn(executable, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
+    detached: !isWindows,
     ...options,
     env: { ...process.env, FORCE_COLOR: '1', ...(options.env ?? {}) },
   });
@@ -305,8 +314,13 @@ function start(name, executable, args, color, options = {}) {
   child.on('exit', (code) => {
     process.stdout.write(`${prefix}exited with code ${code}\n`);
     // Losing either half leaves a half-running Jarvis: tear the rest down.
-    // No-op once a Ctrl+C shutdown already latched its own exit code.
-    shutdown(code || 1);
+    // Windows may deliver Ctrl+C to a child before this launcher. Give the
+    // launcher's SIGINT handler one short turn to latch the clean exit first.
+    const timer = setTimeout(() => {
+      pendingChildFailures.delete(timer);
+      shutdown(code || 1);
+    }, 150);
+    pendingChildFailures.add(timer);
   });
   return child;
 }

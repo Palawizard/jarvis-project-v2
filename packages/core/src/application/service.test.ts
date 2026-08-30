@@ -279,7 +279,7 @@ function projectDefaults() {
       visualQa: {
         required: true,
         scenarios: [
-          { name: 'command', route: '/', viewports: ['desktop', 'mobile'] },
+          { name: 'chat-workspace', route: '/', viewports: ['desktop', 'mobile'] },
           { name: 'tools', route: '/', viewports: ['desktop', 'mobile'] },
         ],
       },
@@ -360,8 +360,8 @@ const PLANNED_SHOTS = [
 ];
 
 const DEFAULT_SHOTS = [
-  { name: 'command', route: '/', viewport: 'desktop' as const },
-  { name: 'command', route: '/', viewport: 'mobile' as const },
+  { name: 'chat-workspace', route: '/', viewport: 'desktop' as const },
+  { name: 'chat-workspace', route: '/', viewport: 'mobile' as const },
   { name: 'tools', route: '/', viewport: 'desktop' as const },
   { name: 'tools', route: '/', viewport: 'mobile' as const },
 ];

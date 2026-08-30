@@ -9,7 +9,19 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 8;
+
+/**
+ * A LIKE pattern for a term a human typed.
+ *
+ * `%` and `_` are wildcards in LIKE, so searching for "100%" or "a_b" silently
+ * matched far more than was asked. The values were always parameterised, so
+ * this is a matching bug rather than an injection one. `~` is the escape
+ * character because it needs no escaping in a TypeScript string or in SQL.
+ */
+export const LIKE_ESCAPE = '~';
+export const likeTerm = (value: string): string =>
+  `%${value.replace(/[~%_]/g, (char) => LIKE_ESCAPE + char)}%`;
 
 export const MIGRATIONS = new Map<number, string>([
   [
@@ -170,6 +182,55 @@ export const MIGRATIONS = new Map<number, string>([
     );`,
   ],
   [6, `ALTER TABLE jobs ADD COLUMN visual_qa_plan TEXT;`],
+  [
+    7,
+    // Conversations. The `sessions`/`messages` tables stay in place on purpose:
+    // renaming them would rewrite every existing row and every foreign key for
+    // an aesthetic gain, and the product-level name is what actually matters.
+    `ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE sessions ADD COLUMN archived_at TEXT;
+    ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'complete';
+    ALTER TABLE messages ADD COLUMN job_id TEXT;
+    ALTER TABLE messages ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
+
+    ALTER TABLE projects ADD COLUMN aliases TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE projects ADD COLUMN archived_at TEXT;
+
+    ALTER TABLE jobs ADD COLUMN archived_at TEXT;
+    ALTER TABLE jobs ADD COLUMN predecessor_job_id TEXT;
+    ALTER TABLE jobs ADD COLUMN origin_message_id TEXT;
+
+    -- Every pre-existing session becomes a named conversation. Deterministic and
+    -- local: the first user message is the title, exactly as a new one is named.
+    UPDATE sessions SET title = (
+      SELECT substr(trim(replace(replace(m.content, char(10), ' '), char(13), ' ')), 1, 60)
+        FROM messages m
+        WHERE m.session_id = sessions.id AND m.role = 'user' AND trim(m.content) <> ''
+        ORDER BY m.created_at ASC, m.rowid ASC LIMIT 1
+    ) WHERE title IS NULL OR trim(title) = '';
+    UPDATE sessions SET status = 'active' WHERE status NOT IN ('active','archived');
+
+    -- A deleted Job leaves a readable trace so a conversation card that still
+    -- references it renders a tombstone instead of breaking.
+    CREATE TABLE job_tombstones (
+      id         TEXT PRIMARY KEY,
+      session_id TEXT,
+      project_id TEXT,
+      goal       TEXT NOT NULL,
+      reason     TEXT NOT NULL DEFAULT '',
+      deleted_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_job_tombstones_session ON job_tombstones(session_id);
+
+    CREATE INDEX idx_sessions_activity ON sessions(status, updated_at DESC);
+    CREATE INDEX idx_jobs_session ON jobs(session_id, created_at DESC);`,
+  ],
+  [
+    8,
+    `ALTER TABLE tool_executions ADD COLUMN originating_actor TEXT;
+    ALTER TABLE tool_executions ADD COLUMN reason_code TEXT NOT NULL DEFAULT 'legacy';
+    UPDATE tool_executions SET originating_actor=actor WHERE originating_actor IS NULL;`,
+  ],
 ]);
 
 function schemaSql(): string {

@@ -1,11 +1,21 @@
+/**
+ * Boot one isolated Jarvis orchestrator for a single E2E test.
+ *
+ * The runtime fixture (tests/e2e/fixtures.ts) spawns this with a private
+ * JARVIS_HOME and a private port, so no state is shared between tests,
+ * repetitions or workers. Isolation is process-level on purpose: the product
+ * gains no test-only reset surface, and nothing here can run against a real
+ * Jarvis home, because the home is refused unless it lives under .jarvis/e2e.
+ */
 import fs from 'node:fs';
 import path from 'node:path';
 import { HumanControlAuth, loadConfig, openDb } from '../../packages/core/dist/index.js';
 
-const workspace = process.cwd();
-const e2eRoot = path.resolve(workspace, '.jarvis/e2e');
-const home = path.resolve(e2eRoot, 'runtime');
-if (!home.startsWith(`${e2eRoot}${path.sep}`)) throw new Error('unsafe E2E home');
+const e2eRoot = path.resolve(process.cwd(), '.jarvis/e2e');
+const home = path.resolve(process.env.JARVIS_HOME ?? '');
+if (!home.startsWith(`${e2eRoot}${path.sep}`)) {
+  throw new Error(`E2E runtime home must live under ${e2eRoot}, got ${process.env.JARVIS_HOME}`);
+}
 fs.rmSync(home, { recursive: true, force: true });
 
 const db = openDb(loadConfig({ home }));
@@ -14,19 +24,10 @@ const credential = control.pair(control.createBootstrap());
 db.close();
 if (!credential) throw new Error('E2E pairing failed');
 
-fs.mkdirSync(e2eRoot, { recursive: true });
-fs.writeFileSync(
-  path.join(e2eRoot, 'control-storage.json'),
-  JSON.stringify({
-    cookies: [],
-    origins: [
-      {
-        origin: 'http://127.0.0.1:4329',
-        localStorage: [{ name: 'jarvis-human-control', value: credential }],
-      },
-    ],
-  }),
-  { mode: 0o600 },
-);
+// Handed to the fixture through the runtime's own home, never through stdout:
+// a control credential must not reach logs or reporter output.
+fs.writeFileSync(path.join(home, 'e2e-control.json'), JSON.stringify({ credential }), {
+  mode: 0o600,
+});
 
 await import('../../apps/orchestrator/dist/index.js');

@@ -346,6 +346,20 @@ textarea {
 .tiny {
   font-size: 11px;
 }
+/* The awaiting-user reason. One line on desktop, where there is room for it;
+   the mobile rule below lets it wrap instead of truncating, because it is the
+   only place that reason is explained. */
+.job-note {
+  max-width: 430px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The value side of a stacked mobile card cell; min-width:0 lets it shrink
+   inside the grid column rather than forcing overflow. */
+.cell-value {
+  min-width: 0;
+}
 .nowrap {
   white-space: nowrap;
   overflow: hidden;
@@ -715,5 +729,525 @@ code {
   .event {
     grid-template-columns: 1fr;
     gap: 2px;
+  }
+}
+
+/* ------------------------------------------------------ conversation shell -- */
+.chat-app {
+  grid-template-columns: 286px minmax(0, 1fr);
+}
+.conversation-sidebar {
+  position: relative;
+  z-index: 20;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+  padding: 12px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.sidebar-brand,
+.sidebar-status,
+.page-title,
+.bulk-bar,
+.chat-header,
+.code-head,
+.palette-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.sidebar-brand .brand {
+  padding: 4px;
+}
+.sidebar-brand > .btn {
+  display: none;
+}
+.new-chat {
+  width: 100%;
+}
+.search-trigger,
+.archive-toggle {
+  display: flex;
+  justify-content: space-between;
+  border: 0;
+  background: none;
+  color: var(--text-dim);
+  padding: 5px 7px;
+  cursor: pointer;
+}
+kbd {
+  color: var(--text-faint);
+  font: 10px var(--mono);
+}
+.conversation-list {
+  flex: 1;
+  min-height: 80px;
+  overflow-y: auto;
+}
+.conversation-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  border-radius: 7px;
+}
+.conversation-row:hover,
+.conversation-row.active {
+  background: var(--bg-elev-2);
+}
+.conversation-row.active {
+  box-shadow: inset 2px 0 var(--accent);
+}
+.conversation-open {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 7px 8px;
+  text-align: left;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+.conversation-title,
+.conversation-preview {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.conversation-title {
+  font-size: 13px;
+}
+.conversation-preview {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.item-menu {
+  position: relative;
+}
+.item-menu summary {
+  list-style: none;
+  cursor: pointer;
+  color: var(--text-faint);
+  padding: 5px;
+}
+.item-menu summary::-webkit-details-marker {
+  display: none;
+}
+.item-menu > div {
+  position: absolute;
+  z-index: 30;
+  right: 0;
+  min-width: 155px;
+  padding: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--bg-elev-2);
+  box-shadow: 0 8px 28px #0008;
+}
+.item-menu > div button {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.item-menu > div button:hover {
+  background: var(--border);
+}
+.danger-text {
+  color: var(--err) !important;
+}
+.ok-text {
+  color: var(--ok);
+}
+.app-nav {
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.sidebar-status {
+  padding: 5px 7px 0;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.sidebar-status button {
+  border: 0;
+  background: none;
+  color: var(--warn);
+  cursor: pointer;
+  font-size: inherit;
+}
+.mobile-bar,
+.drawer-scrim {
+  display: none;
+}
+.theme-float {
+  position: fixed;
+  right: 14px;
+  top: 12px;
+  z-index: 8;
+}
+.page-title {
+  margin-bottom: 18px;
+}
+.page-title h1,
+.chat-header h1 {
+  margin: 0;
+  font-size: 20px;
+}
+.page-title p {
+  margin: 2px 0 0;
+  color: var(--text-dim);
+}
+.bulk-bar {
+  justify-content: flex-start;
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+}
+
+/* -------------------------------------------------------------- real chat -- */
+.chat-workspace {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  position: relative;
+}
+.chat-header {
+  padding: 14px 56px 14px 24px;
+  border-bottom: 1px solid var(--border);
+}
+.chat-header select {
+  width: min(260px, 40%);
+}
+.message-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 28px max(24px, calc((100% - 820px) / 2));
+  scroll-behavior: smooth;
+}
+.chat-welcome {
+  margin: 12vh auto 0;
+  max-width: 600px;
+  text-align: center;
+  color: var(--text-dim);
+}
+.chat-welcome h2 {
+  color: var(--text);
+  font-size: 24px;
+}
+.chat-message {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  gap: 14px;
+  margin-bottom: 26px;
+}
+.message-label {
+  padding-top: 3px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.message-content {
+  min-width: 0;
+}
+.message-content > p:first-child,
+.markdown > p:first-child {
+  margin-top: 0;
+}
+.markdown p {
+  white-space: pre-wrap;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  margin: 18px 0 8px;
+}
+.markdown blockquote {
+  margin: 10px 0;
+  padding: 4px 14px;
+  border-left: 3px solid var(--accent-dim);
+  color: var(--text-dim);
+}
+.markdown a {
+  color: var(--accent);
+}
+.code-block {
+  margin: 12px 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+.code-block pre {
+  border: 0;
+  border-radius: 0;
+}
+.code-head {
+  padding: 5px 8px;
+  background: var(--bg-elev-2);
+  color: var(--text-faint);
+  font: 11px var(--mono);
+}
+.job-card {
+  width: 100%;
+  margin: 10px 0;
+  padding: 11px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.job-card:hover {
+  border-color: var(--accent);
+}
+.job-card.deleted {
+  cursor: default;
+  opacity: 0.7;
+}
+.chat-composer {
+  width: min(860px, calc(100% - 32px));
+  margin: 0 auto 16px;
+  padding: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--bg-elev);
+  box-shadow: 0 8px 28px #0004;
+}
+.chat-composer textarea {
+  min-height: 42px;
+  max-height: 220px;
+  resize: none;
+  border: 0;
+  background: transparent;
+}
+.chat-composer .api-error {
+  margin: 8px 0 0;
+}
+.jump-latest {
+  position: absolute;
+  right: 24px;
+  bottom: 150px;
+  z-index: 4;
+}
+.link-button {
+  border: 0;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+}
+.chat-loading {
+  padding: 24px;
+}
+
+/* ------------------------------------------------------------ modal/search -- */
+dialog {
+  color: var(--text);
+}
+dialog::backdrop {
+  background: #05070abf;
+  backdrop-filter: blur(2px);
+}
+.confirm-dialog,
+.palette {
+  width: min(520px, calc(100vw - 28px));
+  max-height: calc(100vh - 28px);
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--bg-elev);
+  box-shadow: 0 24px 80px #000b;
+}
+.confirm-dialog h2 {
+  margin-top: 0;
+  font-size: 18px;
+}
+.confirm-dialog section {
+  margin: 12px 0;
+}
+.confirm-dialog ul {
+  margin: 5px 0;
+  padding-left: 22px;
+}
+.dialog-actions {
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+.palette {
+  top: 10vh;
+  margin: 0 auto;
+  padding: 12px;
+}
+.palette-results {
+  max-height: 55vh;
+  overflow-y: auto;
+  padding-top: 8px;
+}
+.palette-results > button {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 9px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.palette-results > button:hover,
+.palette-results > button:focus {
+  background: var(--bg-elev-2);
+}
+.palette-results strong,
+.palette-results small {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.palette-results small {
+  color: var(--text-faint);
+}
+.palette-foot {
+  margin-top: 8px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.settings-form {
+  display: grid;
+  gap: 9px;
+  margin-bottom: 12px;
+}
+.settings-form label {
+  display: grid;
+  gap: 3px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+@media (max-width: 760px) {
+  .chat-app {
+    display: block;
+  }
+  .conversation-sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(320px, 88vw);
+    transform: translateX(-105%);
+    transition: transform 0.16s ease;
+    box-shadow: 10px 0 40px #000a;
+  }
+  .drawer-open .conversation-sidebar {
+    transform: translateX(0);
+  }
+  .drawer-open .drawer-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 15;
+    border: 0;
+    background: #0009;
+  }
+  .sidebar-brand > .btn {
+    display: block;
+  }
+  .mobile-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elev);
+  }
+  .main {
+    height: 100%;
+  }
+  .chat-workspace {
+    height: calc(100% - 49px);
+  }
+  .chat-header {
+    align-items: flex-start;
+    padding: 12px 44px 12px 14px;
+  }
+  .chat-header select {
+    width: 42%;
+  }
+  .message-scroll {
+    padding: 20px 14px;
+  }
+  .chat-message {
+    grid-template-columns: 1fr;
+    gap: 3px;
+    margin-bottom: 22px;
+  }
+  .chat-composer {
+    width: calc(100% - 20px);
+    margin-bottom: 10px;
+  }
+  .theme-float {
+    top: 8px;
+    right: 8px;
+  }
+  .mobile-cards,
+  .mobile-cards tbody,
+  .mobile-cards tr,
+  .mobile-cards td {
+    display: block;
+    width: 100%;
+  }
+  .mobile-cards thead {
+    display: none;
+  }
+  .mobile-cards tr {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .mobile-cards td {
+    display: grid;
+    grid-template-columns: 72px minmax(0, 1fr);
+    gap: 8px;
+    padding: 4px 10px;
+    border: 0;
+    white-space: normal;
+  }
+  .job-note {
+    max-width: none;
+    overflow: visible;
+    white-space: normal;
+  }
+  .mobile-cards td::before {
+    content: attr(data-label);
+    color: var(--text-faint);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .page-title {
+    align-items: flex-start;
+  }
+  .item-menu > div {
+    position: fixed;
+    right: 12px;
   }
 }

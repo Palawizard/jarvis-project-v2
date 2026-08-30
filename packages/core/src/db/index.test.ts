@@ -175,7 +175,7 @@ describe('database migrations', () => {
     expect(
       migrated
         .prepare(
-          "SELECT status,input_validated,definition_revision,input_hash FROM tool_executions WHERE id='tex_v3'",
+          "SELECT status,input_validated,definition_revision,input_hash,originating_actor,reason_code FROM tool_executions WHERE id='tex_v3'",
         )
         .get(),
     ).toEqual({
@@ -183,6 +183,8 @@ describe('database migrations', () => {
       input_validated: 0,
       definition_revision: null,
       input_hash: null,
+      originating_actor: 'user',
+      reason_code: 'legacy',
     });
     for (const [table, id] of [
       ['agent_runs', 'run_v3'],

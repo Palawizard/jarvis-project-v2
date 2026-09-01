@@ -22,8 +22,45 @@ export interface Project {
     candidateRuntime?: unknown;
     visualQa?: { required?: boolean; routes?: string[] };
   };
+  profile: ProjectProfile | null;
+  analysis: ProjectAnalysisState | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/** What a bounded read-only analysis agent learned about a repository. */
+export interface ProjectProfile {
+  version: number;
+  purpose: string;
+  architecture: string;
+  languages: string[];
+  frameworks: string[];
+  modules: { name: string; path: string; purpose: string }[];
+  entrypoints: string[];
+  importantPaths: string[];
+  testStrategy: string;
+  buildWorkflow: string;
+  deploymentNotes: string;
+  conventions: string[];
+  integrations: string[];
+  dataStores: string[];
+  risks: string[];
+  inspectFirst: string[];
+  memorable: string[];
+  analyzedAt: string;
+  analyzedCommit: string;
+  provider: string | null;
+  model: string | null;
+  memoryIds: string[];
+}
+
+export interface ProjectAnalysisState {
+  status: 'queued' | 'running' | 'failed';
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+  provider?: string;
+  model?: string;
 }
 
 export interface UnregisterPreflight {
@@ -464,6 +501,10 @@ export interface Message {
     tool?: string;
     /** Server-resolved name for a pending action target. */
     target?: string;
+    /** Projects offered as exact choices when Jarvis asked which repository. */
+    candidates?: { id: string; name: string }[];
+    /** The user's own words this question is about, carried by trusted code. */
+    pendingRequest?: string;
   };
   createdAt: string;
 }
@@ -574,14 +615,19 @@ export const api = {
     request<{
       project: Project;
       snapshot: string;
+      analysis: { running: boolean; stale: boolean; head: string | null };
       jobs: Job[];
       memory: { items: Memory[]; total: number };
     }>(`/api/projects/${id}`),
-  addProject: (rootPath: string, name?: string, devUrl?: string) =>
+  addProject: (rootPath: string, name?: string, devUrl?: string, analyze?: boolean) =>
     request<Project>('/api/projects', {
       method: 'POST',
-      body: JSON.stringify({ rootPath, name, devUrl }),
+      body: JSON.stringify({ rootPath, name, devUrl, analyze }),
     }),
+  analyzeProject: (id: string) =>
+    request<ToolOutcome>(`/api/projects/${id}/analyze`, { method: 'POST' }),
+  cancelProjectAnalysis: (id: string) =>
+    request<ToolOutcome>(`/api/projects/${id}/analyze/cancel`, { method: 'POST' }),
   refreshProject: (id: string) =>
     request<ToolOutcome>(`/api/projects/${id}/refresh`, { method: 'POST' }),
   updateProject: (
@@ -665,6 +711,9 @@ export const api = {
     options?: {
       validationOnly?: boolean;
       candidateSource?: { baseSha: string; sourceSha: string };
+      /** Link the Job to the conversation and message that asked for it. */
+      sessionId?: string;
+      originMessageId?: string;
     },
   ) =>
     request<Job>('/api/jobs', {

@@ -144,6 +144,20 @@ export function ConfirmDialog({
   );
 }
 
+/**
+ * A person's own words, rendered as text and nothing else.
+ *
+ * Never Markdown, never HTML: React escapes the string, so `&`, `<`, `>`,
+ * quotes and any HTML entity the user typed are shown exactly as typed rather
+ * than decoded or interpreted. `pre-wrap` (see `.plain-text`) keeps the line
+ * breaks of a pasted multi-line request, which a bare `<p>` collapsed into one
+ * run-on paragraph — the long feature request that prompted this change was
+ * unreadable in the transcript for exactly that reason.
+ */
+export function PlainText({ children }: { children: string }) {
+  return <p className="plain-text">{children}</p>;
+}
+
 /** Safe, dependency-free Markdown for assistant prose. Raw HTML is always text. */
 export function Markdown({ children }: { children: string }) {
   const blocks = children.split(/(```[\s\S]*?```)/g).filter(Boolean);

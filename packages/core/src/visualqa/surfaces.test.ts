@@ -5,6 +5,7 @@ import {
   FIXTURE_CHAT_ID,
   FIXTURE_PAUSED_JOB_ID,
   SELF_VISUAL_SURFACES,
+  VISUAL_FIXTURE_PROFILES,
   resolveVisualPlan,
   selfSurfaceScenario,
 } from './surfaces.js';
@@ -245,7 +246,9 @@ describe('job-detail-paused scenario', () => {
   });
 
   it('declares resolvable evidence and real interactions for every viewport', () => {
-    const validFixtures = new Set(['paused-job', 'chat-workspace']);
+    // Derived, not repeated: a surface may only ask for a profile the candidate
+    // runtime can actually seed.
+    const validFixtures = new Set<string>(VISUAL_FIXTURE_PROFILES);
     for (const surface of SELF_VISUAL_SURFACES) {
       const scenario = selfSurfaceScenario(surface.name);
       expect(scenario.expectedSelector, scenario.name).toMatch(/^\[data-testid='[^']+'\]$/);

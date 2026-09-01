@@ -30,6 +30,17 @@ const action = (value) => '```jarvis-action\n' + JSON.stringify(value) + '\n```'
 /** Ordered: the first marker found in the prompt wins. */
 const SCRIPT = [
   ['E2E-NORMAL-QUESTION', 'Slow start grows the congestion window exponentially until loss.'],
+  // The dogfood phrases that must NOT create a Job. If trusted routing ever
+  // regresses into sending these to the model, the reply is recognisable in the
+  // transcript and the assertion says which one leaked.
+  [
+    'E2E-WHERE-IS-JARVIS',
+    'The Jarvis project is registered at the path shown in your project list.',
+  ],
+  [
+    'E2E-HOW-TO-PLUGIN',
+    'You would start from the provider adapter interface and register your plugin there.',
+  ],
   [
     'E2E-CREATE-SELF-JOB',
     'Starting that on Jarvis now.\n\n' +
@@ -85,7 +96,95 @@ function latestMessage(prompt) {
   return end === -1 ? rest : rest.slice(0, end);
 }
 
+/**
+ * The semantic router and the autostart verifier, scripted.
+ *
+ * Both are separate tool-free runs that answer in a strict JSON schema, so the
+ * fake has to speak that schema rather than prose. Which decision comes back is
+ * chosen by markers in the user's message, exactly as the conversational
+ * replies are: what the E2E run proves is that Jarvis wires an interpretation
+ * to the right outcome, never that a model interprets a sentence correctly.
+ */
+function routingReply(prompt) {
+  // Both regions are JSON now, so the fake reads them the way the model is meant
+  // to: the message out of its string literal, the candidates out of the trusted
+  // list. Nothing is scraped back out of prose.
+  const line = /^LATEST_USER_MESSAGE = (.*)$/m.exec(prompt)?.[1];
+  let message = '';
+  try {
+    message = line ? JSON.parse(line) : '';
+  } catch {
+    message = '';
+  }
+  const self = projectsOffered(prompt).find((project) => project.isJarvisItself)?.id ?? null;
+  const verifier = prompt.startsWith('You are an independent second check.');
+
+  if (message.includes('E2E-ROUTE-JARVIS') && self) {
+    return JSON.stringify(
+      verifier
+        ? { version: 1, decision: 'allow', targetProjectId: self }
+        : {
+            version: 1,
+            kind: 'code_change',
+            targetProjectId: self,
+            projectRelationship: 'repository_to_modify',
+            needsClarification: false,
+            clarificationReason: null,
+            clarificationQuestion: null,
+          },
+    );
+  }
+  if (message.includes('E2E-ROUTE-MANAGE')) {
+    return JSON.stringify({
+      version: 1,
+      kind: 'project_management',
+      targetProjectId: self,
+      projectRelationship: 'context_only',
+      needsClarification: false,
+      clarificationReason: null,
+      clarificationQuestion: null,
+    });
+  }
+  if (message.includes('E2E-ROUTE-CLARIFY')) {
+    return JSON.stringify({
+      version: 1,
+      kind: 'clarification_required',
+      targetProjectId: null,
+      projectRelationship: 'beneficiary',
+      needsClarification: true,
+      clarificationReason: 'target_project_unclear',
+      clarificationQuestion: 'Which repository should I change?',
+    });
+  }
+  // Everything unmarked is ordinary conversation, which is the safe default and
+  // also the one that must never produce a Job.
+  return JSON.stringify({
+    version: 1,
+    kind: 'normal_chat',
+    targetProjectId: null,
+    projectRelationship: 'none',
+    needsClarification: false,
+    clarificationReason: null,
+    clarificationQuestion: null,
+  });
+}
+
+/** The trusted candidate list, parsed back out of the prompt that offered it. */
+function projectsOffered(prompt) {
+  const start = prompt.indexOf('## Registered projects (trusted)');
+  if (start === -1) return [];
+  const open = prompt.indexOf('[', start);
+  const close = prompt.indexOf('\n]', open);
+  if (open === -1 || close === -1) return [];
+  try {
+    return JSON.parse(prompt.slice(open, close + 2));
+  } catch {
+    return [];
+  }
+}
+
 function replyFor(prompt) {
+  if (prompt.includes('LATEST_USER_MESSAGE = ')) return routingReply(prompt);
   const message = latestMessage(prompt);
   for (const [marker, reply] of SCRIPT) if (message.includes(marker)) return reply;
   return 'Understood.';

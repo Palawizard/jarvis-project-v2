@@ -5,6 +5,7 @@ import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
 import { resolveCli, type ResolvedCli } from './resolve.js';
 import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
+import { guardToolFreeEvents, toolFreeViolation } from './toolfree.js';
 import type {
   AgentEvent,
   AgentProvider,
@@ -118,6 +119,17 @@ export class CodexProvider implements AgentProvider {
     const model = options.model ?? this.config.agents.codexModel;
     const args = buildCodexArgs(options, model);
 
+    // Same defence in depth as the Claude adapter: Codex is not currently
+    // routed to `chat` (it never declares `toolFreeChat`), and if that ever
+    // changes a shell or file-change item must abort the run rather than become
+    // a conversational turn.
+    const violationAbort = new AbortController();
+    let violation: string | undefined;
+    const emit = guardToolFreeEvents(options.role, onEvent, (tool) => {
+      violation = tool;
+      violationAbort.abort();
+    });
+
     let threadId: string | undefined;
     let lastMessage = '';
     let usage: Record<string, unknown> | undefined;
@@ -131,13 +143,15 @@ export class CodexProvider implements AgentProvider {
       cwd: options.cwd,
       stdin: options.prompt,
       timeoutMs: options.timeoutMs ?? this.config.agents.runTimeoutMs,
-      ...(options.signal ? { signal: options.signal } : {}),
+      signal: options.signal
+        ? AbortSignal.any([options.signal, violationAbort.signal])
+        : violationAbort.signal,
       scope: 'codex',
       onLine: (event) => {
         switch (event.type) {
           case 'thread.started': {
             threadId = event.thread_id as string;
-            onEvent({
+            emit({
               kind: 'started',
               ...(threadId ? { sessionId: threadId } : {}),
               ...(model ? { model } : {}),
@@ -151,14 +165,14 @@ export class CodexProvider implements AgentProvider {
               case 'agent_message':
                 if (typeof item.text === 'string') {
                   lastMessage = item.text;
-                  onEvent({ kind: 'text', text: item.text });
+                  emit({ kind: 'text', text: item.text });
                 }
                 break;
               case 'reasoning':
-                if (typeof item.text === 'string') onEvent({ kind: 'thinking', text: item.text });
+                if (typeof item.text === 'string') emit({ kind: 'thinking', text: item.text });
                 break;
               case 'command_execution':
-                onEvent({
+                emit({
                   kind: 'tool_completed',
                   tool: 'shell',
                   isError: Number(item.exit_code ?? 0) !== 0,
@@ -166,7 +180,7 @@ export class CodexProvider implements AgentProvider {
                 });
                 break;
               case 'file_change':
-                onEvent({
+                emit({
                   kind: 'tool_completed',
                   tool: 'edit',
                   preview: JSON.stringify(item.changes ?? {}).slice(0, 400),
@@ -197,6 +211,12 @@ export class CodexProvider implements AgentProvider {
     });
 
     const { proposals, cleanedText } = extractMemoryProposals(lastMessage);
+
+    if (violation) {
+      const error = toolFreeViolation(violation);
+      onEvent({ kind: 'failed', error, ...(threadId ? { sessionId: threadId } : {}) });
+      return { status: 'failed', result: '', error, memoryProposals: [] };
+    }
 
     if (options.outputSchemaPath && lastMessage) {
       try {
@@ -278,6 +298,11 @@ export class CodexProvider implements AgentProvider {
 }
 
 export function buildCodexArgs(options: AgentStartOptions, model?: string): string[] {
+  // Everything else — reviewer, visual reviewer, chat and the project analyst —
+  // gets Codex's read-only sandbox. Read-only is not tool-free: for `chat` the
+  // real guarantee is that Codex never declares `toolFreeChat`, so the registry
+  // never routes a conversation to it, and `guardToolFreeEvents` aborts the run
+  // if one ever gets there.
   const writes =
     options.role === 'implementer' || options.role === 'fixer' || options.role === 'visual_fixer';
   // Exec-level options must precede the `resume` subcommand. Codex 0.147 rejects

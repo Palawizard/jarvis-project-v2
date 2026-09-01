@@ -9,6 +9,7 @@ import { EventBus } from './events/bus.js';
 import { MemoryService } from './memory/service.js';
 import { ContextPackBuilder } from './context/pack.js';
 import { ProjectService, normaliseProjectName, type ProjectConfig } from './projects/service.js';
+import { ProjectAnalysisService } from './projects/analysis.js';
 import { SessionService } from './sessions/service.js';
 import { JobService } from './jobs/service.js';
 import { JobPipeline } from './jobs/pipeline.js';
@@ -41,6 +42,7 @@ export class Jarvis {
   readonly memory: MemoryService;
   readonly context: ContextPackBuilder;
   readonly projects: ProjectService;
+  readonly projectAnalysis: ProjectAnalysisService;
   readonly sessions: SessionService;
   readonly jobs: JobService;
   readonly agents: AgentRegistry;
@@ -69,6 +71,13 @@ export class Jarvis {
     this.sessions = new SessionService(this.db, this.bus);
     this.jobs = new JobService(this.db, this.bus);
     this.agents = new AgentRegistry(config, { db: this.db, bus: this.bus });
+    this.projectAnalysis = new ProjectAnalysisService({
+      config,
+      bus: this.bus,
+      agents: this.agents,
+      projects: this.projects,
+      memory: this.memory,
+    });
     this.verification = new VerificationEngine(this.db, config.artifactsDir, this.bus);
     this.review = new ReviewEngine(this.db, this.agents, this.bus, this.config);
     this.visualQa = new VisualQaEngine(this.db, config.artifactsDir, this.bus);
@@ -124,6 +133,7 @@ export class Jarvis {
       {
         memory: this.memory,
         projects: this.projects,
+        projectAnalysis: this.projectAnalysis,
         jobs: this.jobs,
         sessions: this.sessions,
         pipeline: this.pipeline,
@@ -166,13 +176,19 @@ export class Jarvis {
     fixtures: string[];
   }> {
     const interruptedResponses = this.sessions.recoverInterruptedMessages();
+    // Analysis runs live in memory but record their state on the project row,
+    // so a crash mid-run would otherwise leave a project "analysing" forever.
+    const interruptedAnalyses = await this.projectAnalysis.recoverInterrupted();
     const recovered = { ...this.jobs.recoverInterrupted(), messages: interruptedResponses };
     const interruptedApplications = this.applications.recoverInterrupted();
     // A tool that died mid-action may have had an effect on the outside world,
     // so it is surfaced as interrupted and never replayed automatically.
     const tools = this.tools.recoverInterrupted();
-    if (recovered.jobs || recovered.runs || recovered.messages) {
-      log.warn('recovered interrupted work from a previous run', recovered);
+    if (recovered.jobs || recovered.runs || recovered.messages || interruptedAnalyses) {
+      log.warn('recovered interrupted work from a previous run', {
+        ...recovered,
+        analyses: interruptedAnalyses,
+      });
     }
     if (interruptedApplications) {
       log.warn('candidate applications require inspection after restart', {

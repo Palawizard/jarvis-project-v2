@@ -6,6 +6,7 @@ import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
 import { resolveCli, type ResolvedCli } from './resolve.js';
 import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
+import { guardToolFreeEvents, isToolFreeRole, toolFreeViolation } from './toolfree.js';
 import type {
   AgentEvent,
   AgentProvider,
@@ -55,6 +56,7 @@ export class ClaudeProvider implements AgentProvider {
       resumable: true,
       structuredOutput: true,
       toolFreeChat: true,
+      enforcesToolAllowlist: true,
       models: ['opus', 'sonnet', 'haiku'],
     };
 
@@ -127,6 +129,15 @@ export class ClaudeProvider implements AgentProvider {
       return { status: 'failed', result: '', error: message, memoryProposals: [] };
     }
 
+    // Defence in depth: a tool-free role that somehow reaches a tool aborts the
+    // run instead of surfacing the tool as conversation. See toolfree.ts.
+    const violationAbort = new AbortController();
+    let violation: string | undefined;
+    const emit = guardToolFreeEvents(options.role, onEvent, (tool) => {
+      violation = tool;
+      violationAbort.abort();
+    });
+
     let sessionId: string | undefined;
     let finalResult = '';
     let usage: Record<string, unknown> | undefined;
@@ -141,14 +152,16 @@ export class ClaudeProvider implements AgentProvider {
       cwd: options.cwd,
       stdin: buildClaudePrompt(options),
       timeoutMs: options.timeoutMs ?? this.config.agents.runTimeoutMs,
-      ...(options.signal ? { signal: options.signal } : {}),
+      signal: options.signal
+        ? AbortSignal.any([options.signal, violationAbort.signal])
+        : violationAbort.signal,
       scope: 'claude',
       onLine: (event) => {
         if (event.type === 'result') sawTerminalResult = true;
         const id = event.session_id as string | undefined;
         if (id) sessionId = id;
         handleClaudeEvent(event, {
-          onEvent,
+          onEvent: emit,
           pushText: (t) => textChunks.push(t),
           setResult: (r) => {
             finalResult = r;
@@ -169,6 +182,14 @@ export class ClaudeProvider implements AgentProvider {
 
     const raw = finalResult || textChunks.join('');
     const { proposals, cleanedText } = extractMemoryProposals(raw);
+
+    // Checked before every other outcome: whatever else the run produced, a
+    // violating run's text is discarded rather than shown as an answer.
+    if (violation) {
+      const error = toolFreeViolation(violation);
+      onEvent({ kind: 'failed', error, ...(sessionId ? { sessionId } : {}) });
+      return { status: 'failed', result: '', error, memoryProposals: [] };
+    }
 
     if (outcome.cancelled) {
       return {
@@ -243,6 +264,32 @@ export function buildClaudePrompt(options: AgentStartOptions): string {
   return `${options.prompt}\n\nInspect these local image files as image evidence:\n${options.imagePaths.map((file) => `- ${path.resolve(options.cwd, file)}`).join('\n')}`;
 }
 
+/**
+ * Tools that must never appear in a conversation, named explicitly.
+ *
+ * `AskUserQuestion` and `Task`/`Explore` are here for a reason: those are the
+ * ones the deployed regression surfaced. A provider-native question is not a
+ * Jarvis clarification, and a provider-native subagent exploring a directory is
+ * not conversation.
+ */
+export const CHAT_DENIED_TOOLS = [
+  'Bash',
+  'Edit',
+  'Write',
+  'NotebookEdit',
+  'Read',
+  'Glob',
+  'Grep',
+  'Task',
+  'Explore',
+  'AskUserQuestion',
+  'WebFetch',
+  'WebSearch',
+] as const;
+
+/** Everything the read-only analyst needs, and nothing that can run or write. */
+export const CHAT_ANALYST_TOOLS = ['Read', 'Glob', 'Grep'] as const;
+
 export function buildClaudeArgs(
   options: AgentStartOptions,
   model: string,
@@ -250,8 +297,12 @@ export function buildClaudeArgs(
 ): string[] {
   // The conversational agent has no business editing source: it answers, and it
   // may only *request* structured Jarvis actions that trusted code then decides.
+  // The analyst reads a disposable worktree and reports; it never writes either.
   const readOnly =
-    options.role === 'reviewer' || options.role === 'visual_reviewer' || options.role === 'chat';
+    options.role === 'reviewer' ||
+    options.role === 'visual_reviewer' ||
+    options.role === 'project_analyst' ||
+    isToolFreeRole(options.role);
   const args = [
     '-p',
     '--output-format',
@@ -267,9 +318,42 @@ export function buildClaudeArgs(
   if (options.safeMode) args.push('--safe-mode');
   if (options.ephemeral) args.push('--no-session-persistence');
   if (options.role === 'visual_reviewer') args.push('--tools', 'Read');
-  // General conversation runs with no tools at all. It is not in a worktree and
-  // has nothing legitimate to read from the filesystem.
-  if (options.role === 'chat') args.push('--tools', '');
+  // Reconnaissance reads the repository and reports. No Bash, no Edit, no Task:
+  // an analyst that can run commands is an implementer with a different prompt.
+  if (options.role === 'project_analyst') {
+    args.push('--tools', CHAT_ANALYST_TOOLS.join(','));
+  }
+  // `--tools` chooses WHICH built-ins exist; `--restricted` is what confines the
+  // file tools to the working directory. The analyst reads a repository the user
+  // registered but may not control, and it is told to read README and CLAUDE.md,
+  // which is the classic injection surface: without this, a hostile repository
+  // could point it at ~/.jarvis or ~/.ssh and smuggle what it found out through
+  // the profile strings, which are persisted and injected into later prompts.
+  // Conversation and routing get it too, as defence in depth behind having no
+  // tools at all.
+  if (options.role === 'project_analyst' || isToolFreeRole(options.role)) {
+    args.push('--restricted');
+  }
+  // Conversation and the two routing roles run with no tools at all. None of
+  // them is in a worktree, and none has anything legitimate to read from the
+  // filesystem: routing classifies the sentence in front of it and stops.
+  //
+  // Both flags are used on purpose. `--tools ''` is the documented way to
+  // disable the built-in set, and `--disallowed-tools` names the ones whose
+  // appearance in a conversation would be a security event, so a future release
+  // that reinterprets one flag still has to get past the other. Neither is
+  // trusted on its own: `guardToolFreeEvents` aborts the run if a tool call
+  // reaches Jarvis anyway.
+  if (isToolFreeRole(options.role)) {
+    args.push('--tools', '');
+    args.push('--disallowed-tools', CHAT_DENIED_TOOLS.join(','));
+    // `--tools` and `--disallowed-tools` name BUILT-IN tools, so neither says
+    // anything about an MCP server the user has configured. `--safe-mode`
+    // already disables those and every tool-free run passes it, but that makes
+    // the guarantee depend on a caller remembering an unrelated flag; this is
+    // the flag the CLI documents for the job, and it costs nothing.
+    args.push('--strict-mcp-config');
+  }
   for (const dir of new Set(
     options.imagePaths?.map((file) => path.dirname(path.resolve(options.cwd, file))) ?? [],
   )) {

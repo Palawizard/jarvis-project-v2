@@ -5,6 +5,7 @@ import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
 import type { JobService, Job } from './service.js';
 import type { ProjectService, Project } from '../projects/service.js';
+import { renderProjectProfile } from '../projects/profile.js';
 import type { SessionService } from '../sessions/service.js';
 import type { MemoryService } from '../memory/service.js';
 import type { ContextPackBuilder } from '../context/pack.js';
@@ -1516,10 +1517,12 @@ function firstSentences(text: string, count: number): string {
     : sentences || '(no summary provided)';
 }
 
-export function renderProjectSnapshot(project: Project): string {
+export function renderProjectSnapshot(project: Project, options: { stale?: boolean } = {}): string {
   const lines = [
     `Name: ${project.name}`,
     `Path: ${project.rootPath}`,
+    project.aliases.length ? `Also known as: ${project.aliases.join(', ')}` : '',
+    `Default branch: ${project.defaultBranch}`,
     project.stack.languages.length ? `Languages: ${project.stack.languages.join(', ')}` : '',
     project.stack.frameworks.length ? `Frameworks: ${project.stack.frameworks.join(', ')}` : '',
     project.stack.packageManager ? `Package manager: ${project.stack.packageManager}` : '',
@@ -1530,7 +1533,19 @@ export function renderProjectSnapshot(project: Project): string {
       : '',
     project.summary ? `Summary: ${project.summary}` : '',
   ];
-  return lines.filter(Boolean).join('\n');
+  const base = lines.filter(Boolean).join('\n');
+  if (!project.profile) return base;
+  // The learned profile is appended rather than merged: the lines above are
+  // deterministic facts Jarvis measured, the block below is what a model
+  // reported. Keeping them visibly separate is why a stale profile can never
+  // masquerade as the current command set.
+  return [
+    base,
+    '',
+    'What a previous analysis learned about this project. Orientation only: the',
+    'repository on disk is the authority, and nothing below is executable.',
+    renderProjectProfile(project.profile, options.stale === true),
+  ].join('\n');
 }
 
 function buildImplementerPrompt(input: {

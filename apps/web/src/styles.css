@@ -334,6 +334,21 @@ textarea {
   font-family: var(--mono);
   font-size: 12px;
 }
+/*
+ * A repository path has no spaces to break at, so at phone width it ran off
+ * the right edge of its card and took the branch and timestamp with it. Its
+ * own class rather than a rule on `.mono`, which also styles code and ids
+ * elsewhere and should keep breaking the way it does.
+ *
+ * `min-width: 0` matters as much as the wrap: this line sits inside a flex
+ * card, and a flex item's default `min-width: auto` refuses to shrink below
+ * its content, so wrapping alone would not have made it fit.
+ */
+.project-meta {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
 .dim {
   color: var(--text-dim);
 }
@@ -1250,4 +1265,67 @@ dialog::backdrop {
     position: fixed;
     right: 12px;
   }
+}
+
+/* Opt-in checkbox rows (register-a-project analysis toggle). */
+.check {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: 8px;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.check input {
+  margin-top: 2px;
+  flex: none;
+}
+.profile-grid {
+  display: grid;
+  grid-template-columns: minmax(96px, max-content) 1fr;
+  gap: 4px 12px;
+  margin: 10px 0 0;
+  font-size: 12px;
+}
+.profile-grid dt {
+  color: var(--text-faint);
+}
+.profile-grid dd {
+  margin: 0;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.profile-grid ul {
+  margin: 0;
+  padding-left: 16px;
+}
+@media (max-width: 560px) {
+  .profile-grid {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+  .profile-grid dd {
+    margin-bottom: 6px;
+  }
+}
+
+/*
+ * A user's message is shown verbatim. `pre-wrap` keeps the blank lines and
+ * indentation of a pasted request; without it a multi-paragraph feature
+ * request collapsed into a single unreadable run of text.
+ */
+.plain-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Exact project choices under a "which repository?" question. Clicking one is
+   the human naming the target themselves, so it needs to read as an action
+   rather than as decoration. */
+.target-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }

@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ToolRegistry, type ToolRegistryOptions } from './registry.js';
 import type { MemoryService } from '../memory/service.js';
 import type { ProjectService } from '../projects/service.js';
+import type { ProjectAnalysisService } from '../projects/analysis.js';
 import type { JobService } from '../jobs/service.js';
 import type { JobLifecycle } from '../jobs/lifecycle.js';
 import type { JobPipeline } from '../jobs/pipeline.js';
@@ -25,6 +26,7 @@ const KINDS = [
 export interface BuiltinToolDeps {
   memory: MemoryService;
   projects: ProjectService;
+  projectAnalysis: ProjectAnalysisService;
   jobs: JobService;
   sessions: SessionService;
   pipeline: JobPipeline;
@@ -258,6 +260,46 @@ export function registerBuiltinTools(
   });
 
   registry.register({
+    name: 'project.analyze',
+    revision: '1',
+    description:
+      'Start a bounded read-only agent analysis of a registered project. It reads a disposable ' +
+      'worktree pinned to the project’s committed HEAD, never the working checkout, and it ' +
+      'never edits, commits or runs anything. Spends provider quota.',
+    // Not `safe_action`: this spends provider quota and creates a real (if
+    // disposable) worktree and branch inside the user's repository, which is
+    // exactly why `job.create` sits here too. Nothing routes an agent to it
+    // today, and this is what would make that fail closed if anything ever did.
+    risk: 'reversible_modification',
+    input: z.object({ id: z.string() }).strict(),
+    async execute(input, ctx) {
+      const project = deps.projects.get(input.id);
+      if (!project) throw new Error('project not found');
+      // Returns as soon as the run is claimed: an analysis outlives any HTTP
+      // request, and the project row carries its status for whoever is watching.
+      // The execution id travels with the run so its terminal outcome is
+      // attributable, since this row necessarily settles before the work does.
+      if (!deps.projectAnalysis.start(project.id, ctx.executionId)) {
+        throw new Error('an analysis is already running for this project');
+      }
+      return deps.projects.get(project.id) ?? project;
+    },
+  });
+
+  registry.register({
+    name: 'project.analyze.cancel',
+    revision: '1',
+    description: 'Stop an in-flight project analysis. The previous profile is left untouched.',
+    risk: 'safe_action',
+    input: z.object({ id: z.string() }).strict(),
+    async execute(input) {
+      const cancelled = deps.projectAnalysis.cancel(input.id);
+      if (!cancelled) throw new Error('no analysis is running for this project');
+      return { cancelled: true };
+    },
+  });
+
+  registry.register({
     name: 'project.unregister',
     revision: '1',
     description:
@@ -274,7 +316,11 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'job.create',
-    revision: '3',
+    // 4: the input became `.strict()`, and the tool became idempotent in
+    // `originMessageId` -- a message that already has a Job gets that Job back
+    // rather than a second one. Both change what an approval means, so a
+    // standing permission bound to revision 3 has to be granted again.
+    revision: '4',
     description:
       'Create a development job against a project, optionally starting it. Runs in an isolated ' +
       'worktree and is never merged automatically.',
@@ -284,14 +330,22 @@ export function registerBuiltinTools(
     // an agent-originated request becomes a confirmation the human answers
     // rather than an unattended pipeline start.
     risk: 'reversible_modification',
-    input: z.object({
-      projectId: z.string(),
-      request: z.string().min(3),
-      acceptance: z.array(z.string()).default([]),
-      autostart: z.boolean().default(false),
-      originMessageId: z.string().nullish(),
-    }),
+    // `.strict()` like its neighbours. This is the one write-capable tool a
+    // conversation can reach, so an unexpected key is a refusal rather than
+    // something silently stripped on the way to starting an agent.
+    input: z
+      .object({
+        projectId: z.string(),
+        request: z.string().min(3),
+        acceptance: z.array(z.string()).default([]),
+        autostart: z.boolean().default(false),
+        originMessageId: z.string().nullish(),
+      })
+      .strict(),
     async execute(input, ctx) {
+      // Idempotent in `originMessageId`: see `JobService.create`. A retried
+      // turn, a double-clicked button and a confirmation approved twice all
+      // land on the Job that already exists.
       const job = deps.jobs.create({
         projectId: input.projectId,
         request: input.request,

@@ -31,7 +31,18 @@ export interface RoutingDecision {
 }
 
 export type AgentRole =
-  'implementer' | 'reviewer' | 'fixer' | 'visual_fixer' | 'visual_reviewer' | 'chat';
+  | 'implementer'
+  | 'reviewer'
+  | 'fixer'
+  | 'visual_fixer'
+  | 'visual_reviewer'
+  | 'chat'
+  /** Bounded read-only repository reconnaissance. Never edits, never commits. */
+  | 'project_analyst'
+  /** Tool-free structured classification of what the user asked for. */
+  | 'router'
+  /** The independent second opinion required before an unattended agent starts. */
+  | 'autostart_verifier';
 
 export interface ProviderCapabilities {
   id: ProviderId;
@@ -47,6 +58,15 @@ export interface ProviderCapabilities {
   structuredOutput: boolean;
   /** Provider can answer normal chat with no filesystem or execution tools. */
   toolFreeChat?: boolean;
+  /**
+   * Provider can be restricted to an exact list of built-in tools.
+   *
+   * Distinct from a read-only sandbox: Codex's `read-only` mode prevents writes
+   * but still runs shell commands, which is not what "reads the repository and
+   * reports" means. Roles that promise a tool allowlist route only to providers
+   * that declare this.
+   */
+  enforcesToolAllowlist?: boolean;
   cooldownUntil?: string;
   lastFailureAt?: string;
   lastSuccessAt?: string;

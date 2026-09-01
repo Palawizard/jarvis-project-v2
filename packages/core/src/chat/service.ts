@@ -1,5 +1,7 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { createLogger } from '../logger.js';
 import { redactSecrets } from '../memory/secrets.js';
 import type { JarvisConfig } from '../config.js';
 import type { EventBus } from '../events/bus.js';
@@ -10,12 +12,14 @@ import type { ContextPackBuilder } from '../context/pack.js';
 import type { MemoryService } from '../memory/service.js';
 import type { Memory, MemoryScope } from '../memory/types.js';
 import { classifyExplicitMemory, detectExplicitCommand } from '../memory/policy.js';
-import type { Project, ProjectService } from '../projects/service.js';
+import { renderProjectRegistry, type Project, type ProjectService } from '../projects/service.js';
 import type { Job, JobService } from '../jobs/service.js';
 import { renderProjectSnapshot } from '../jobs/pipeline.js';
 import type { Message, SessionService } from '../sessions/service.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { SearchHit } from '../tools/builtin.js';
+import { isToolFreeViolation } from '../agents/toolfree.js';
+import { SemanticRouter, type RoutedTurn, type RoutingAudit } from './router.js';
 import {
   ACTION_TOOLS,
   CHAT_ACTION_INSTRUCTIONS,
@@ -23,6 +27,8 @@ import {
   type ChatAction,
   type ChatActionName,
 } from './actions.js';
+
+const log = createLogger('chat');
 
 export interface ChatDeps {
   config: JarvisConfig;
@@ -65,12 +71,14 @@ const CONTEXT_TURNS = 12;
 /**
  * The conversational front door.
  *
- * Everything the user types arrives here, and exactly one of four things
- * happens: a deterministic memory operation with no model call, a structured
- * action requested by the model and decided by trusted code, a request for
- * human confirmation, or an ordinary answer. A normal message never creates a
- * Job — that only happens when an action explicitly asks for one and a project
- * resolves unambiguously.
+ * Everything the user types arrives here, and exactly one of five things
+ * happens: a deterministic memory operation with no model call; a Job, when two
+ * independent tool-free classifiers agree the message names a registered
+ * repository to change; a question back, when they do not; a structured action
+ * requested by the conversational model and decided by trusted code, possibly
+ * stopping at a human confirmation; or an ordinary answer.
+ *
+ * A normal message never creates a Job.
  */
 /** Upper bound on how often a partial streamed answer is written to the row. */
 const STREAM_PERSIST_MS = 250;
@@ -79,22 +87,60 @@ export class ChatService {
   /** One in-flight response per conversation, so Stop has something to abort. */
   private readonly running = new Map<string, AbortController>();
 
-  /** Empty, parent-owned, and never the Jarvis home. Created on first use. */
+  /**
+   * Turns that have reached the point of no return.
+   *
+   * The entry stays in `running` — a second send must still be refused — but
+   * `stop()` reports honestly that there is nothing left to prevent. The window
+   * is `job.create` itself: the permission evaluation, the row, and
+   * `pipeline.start`, none of which take an abort signal.
+   */
+  private readonly committed = new Set<string>();
+
+  /** Created once per process, outside the Jarvis home. See `scratchDir`. */
+  private scratch: string | undefined;
+
+  /**
+   * An empty, private, throwaway directory for general conversation.
+   *
+   * Deliberately NOT under `config.home`. It used to be `<home>/chat-scratch`,
+   * which put `jarvis.db` — every project's memory and the hashed control
+   * credential — one `..` away. That only mattered in the exact scenario this
+   * whole tool-free defence exists for: a provider release where `--tools ''`
+   * stops disabling tools. `mkdtemp` gives a unique 0700 directory nothing else
+   * can have pre-created, so the confinement does not rest on a relative path
+   * being awkward to guess.
+   */
   private scratchDir(): string {
-    const dir = path.join(this.deps.config.home, 'chat-scratch');
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    return dir;
+    if (this.scratch && fs.existsSync(this.scratch)) return this.scratch;
+    this.scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-chat-scratch-'));
+    fs.chmodSync(this.scratch, 0o700);
+    return this.scratch;
   }
 
-  constructor(private readonly deps: ChatDeps) {}
+  /** Semantic interpretation. Tool-free, bounded, and never an authority. */
+  private readonly router: SemanticRouter;
+
+  constructor(private readonly deps: ChatDeps) {
+    this.router = new SemanticRouter({ config: deps.config, agents: deps.agents });
+  }
 
   isResponding(conversationId: string): boolean {
     return this.running.has(conversationId);
   }
 
+  /**
+   * Stop the in-flight turn, if there still is one that can be stopped.
+   *
+   * Returns false — honestly — from the moment a turn starts committing a side
+   * effect it cannot take back, not merely once it has finished committing one.
+   * So this can prevent a Job from being created and can never claim to have
+   * cancelled one that already exists, nor one that is halfway into existing.
+   * Cancelling the work itself is `job.cancel`, a separate capability.
+   */
   stop(conversationId: string): boolean {
     const controller = this.running.get(conversationId);
-    if (!controller) return false;
+    if (!controller || this.committed.has(conversationId)) return false;
     controller.abort();
     return true;
   }
@@ -117,7 +163,117 @@ export class ChatService {
     const explicit = detectExplicitCommand(text);
     if (explicit) return this.handleMemoryCommand(conversation.id, explicit, userMessage);
 
-    return this.respond(conversation.id, userMessage);
+    return this.handleTurn(conversation.id, userMessage);
+  }
+
+  /**
+   * Route the turn, then answer it if routing did not settle it.
+   *
+   * Stage B: what KIND of thing is this? Decided by a dedicated tool-free
+   * classifier before the conversational model sees anything, because leaving
+   * it to the conversational model is what produced the regression this exists
+   * to prevent: asked to "code sur le projet Jarvis", the provider explored its
+   * own empty scratch directory and asked the human where the Jarvis repository
+   * was, and no Job was ever created.
+   *
+   * The classifier interprets; it decides nothing. Trusted code validates what
+   * comes back, resolves the project itself, and is the only thing that can
+   * reach a tool — and before an unattended agent starts, a second independent
+   * classifier has to agree. See `router.ts`.
+   *
+   * The placeholder is created HERE, before routing, and handed to whichever
+   * path settles the turn. Routing takes two provider runs, so creating it
+   * afterwards meant the longest part of a turn ran with no assistant row at
+   * all: the user watched nothing happen, and a crash in that window left a
+   * turn `retry()` refused, because there was no failed message to retry.
+   *
+   * One controller for the whole turn, for the same reason: two
+   * near-simultaneous sends (a double click, a retried fetch, two tabs) must not
+   * both get past the in-flight check and open two worktrees for one
+   * instruction, and a gap between routing and answering is a place for the
+   * second one to slip through.
+   */
+  private async handleTurn(conversationId: string, userMessage: Message): Promise<ChatTurn> {
+    const { sessions } = this.deps;
+    // A turn that already created a Job is finished, whatever the transcript
+    // looks like. `retry()` accepts an interrupted message, and crash recovery
+    // marks one interrupted the moment the process comes back — so a crash in
+    // the window between `job.create` and settling the assistant row used to
+    // present a Retry button that routed the same sentence again and opened a
+    // second worktree. Answering from the Job that exists costs no provider
+    // call and cannot produce a second one.
+    const existing = this.deps.jobs.byOriginMessage(userMessage.id);
+    if (existing) return this.restoreJobTurn(conversationId, userMessage, existing);
+    const placeholder = sessions.addMessage(conversationId, 'assistant', '', {
+      status: 'pending',
+    });
+    const controller = new AbortController();
+    this.running.set(conversationId, controller);
+    try {
+      const routed = await this.routeSemantically(
+        conversationId,
+        userMessage,
+        placeholder.id,
+        controller,
+      );
+      if (routed) return routed;
+      return await this.respond(conversationId, userMessage, placeholder.id, controller);
+    } catch (error) {
+      // The placeholder exists from the first line, so anything that throws on
+      // the way would otherwise leave a "thinking" bubble in the transcript
+      // forever: retry() only accepts a failed, stopped or interrupted message,
+      // so nothing short of a restart could clear it.
+      const reason = redactSecrets(error instanceof Error ? error.message : String(error));
+      if (sessions.getMessage(placeholder.id)?.status === 'pending') {
+        sessions.updateMessage(placeholder.id, {
+          content: reason,
+          status: 'failed',
+          metadata: { error: reason },
+        });
+      }
+      throw error;
+    } finally {
+      this.running.delete(conversationId);
+      this.committed.delete(conversationId);
+    }
+  }
+
+  /**
+   * Settle a turn from the Job it already created, without routing again.
+   *
+   * Idempotency is enforced underneath this as well — `JobService.create`
+   * returns the existing row for an origin message, and a unique index makes a
+   * duplicate impossible even under a concurrent write — so this is the
+   * behaviour, not the guarantee. What it adds is that the conversation ends up
+   * pointing at that Job instead of quietly starting a second one, and that a
+   * recovered turn spends nothing to get there.
+   */
+  private restoreJobTurn(conversationId: string, userMessage: Message, job: Job): ChatTurn {
+    const { sessions } = this.deps;
+    const reply = `Started **${job.goal}** on ${this.projectName(job.projectId)}.`;
+    const message = sessions.addMessage(conversationId, 'assistant', reply, {
+      status: 'complete',
+      jobId: job.id,
+      metadata: { activity: 'action', jobIds: [job.id] },
+    });
+    this.deps.bus.emit({
+      type: 'job.linked',
+      jobId: job.id,
+      sessionId: conversationId,
+      payload: { goal: job.goal, projectId: job.projectId },
+    });
+    log.info('restored an existing Job for a retried turn', {
+      jobId: job.id,
+      messageId: userMessage.id,
+    });
+    return {
+      conversationId,
+      kind: 'action',
+      reply,
+      userMessage,
+      assistantMessage: message,
+      job,
+    };
   }
 
   /**
@@ -141,7 +297,12 @@ export class ChatService {
     sessions.deleteMessage(last.id);
     const userMessage = sessions.lastUserMessage(conversationId);
     if (!userMessage) throw new Error('there is no user message to answer');
-    return this.respond(conversationId, userMessage);
+    // Through the full turn, routing included. Retry used to answer directly,
+    // which was harmless when routing did not exist and is not now: routing is
+    // the only path to a Job, so retrying "fix the login bug in Jarvis" after a
+    // provider outage would have quietly downgraded it to a chat answer, and
+    // nothing would have said why the work never started.
+    return this.handleTurn(conversationId, userMessage);
   }
 
   /** Replace the most recent user message and answer the new one. */
@@ -155,6 +316,15 @@ export class ChatService {
     }
     const lastUser = sessions.lastUserMessage(conversationId);
     if (!lastUser) throw new Error('there is no user message to edit');
+    // A turn that started work cannot be edited away. `committed` is cleared
+    // when the turn ends, so by the time the Job is running this conversation
+    // looks idle — and the edit deletes the assistant row carrying the Job's
+    // card, leaving an agent writing in a worktree that the transcript no
+    // longer mentions, while the re-sent message starts a second one. Rewriting
+    // the request is not how you stop work: `job.cancel` is.
+    if (this.deps.jobs.byOriginMessage(lastUser.id)) {
+      throw new Error('that message already started a Job; cancel the Job instead of editing it');
+    }
     // Everything after the message being replaced, found from the real end of
     // the transcript rather than from a window that may not contain it.
     for (const message of sessions
@@ -263,27 +433,219 @@ export class ChatService {
     };
   }
 
+  // ----------------------------------------------------- semantic routing --
+
+  /**
+   * Route one message semantically, and act only on what trusted code can prove.
+   *
+   * Returns null for "not my business" — the turn is an ordinary conversation,
+   * including every project-management request, which reaches the domain the
+   * way it always has: as a structured `jarvis-action` the responder emits and
+   * the permission boundary decides.
+   *
+   * What a classifier contributes is exactly one thing: a project id, chosen
+   * from a list this turn handed it and re-resolved here. The instruction the
+   * coding agent executes is the human's own message, carried by trusted code —
+   * see `pendingRequest`. Nothing a model wrote becomes a path, a command, an
+   * instruction or an authority.
+   */
+  private async routeSemantically(
+    conversationId: string,
+    userMessage: Message,
+    placeholderId: string,
+    controller: AbortController,
+  ): Promise<ChatTurn | null> {
+    const { sessions, projects } = this.deps;
+    const conversation = sessions.get(conversationId);
+    const active = projects.list({ status: 'active' });
+    // Nothing registered means nothing a code change could target, so there is
+    // no decision here worth a provider call.
+    if (active.length === 0) return null;
+
+    const affinity = conversation?.projectId ? projects.get(conversation.projectId) : null;
+    const history = sessions.messages(conversationId, CONTEXT_TURNS);
+    const asked = priorTargetQuestion(history, [userMessage.id, placeholderId]);
+    const awaiting = asked?.projectId ? projects.get(asked.projectId) : null;
+
+    const decision: RoutedTurn = await this.router.route({
+      text: userMessage.content,
+      projects: active,
+      affinity: affinity && !affinity.archivedAt ? affinity : null,
+      // USER messages only, and never an assistant turn.
+      //
+      // This used to replay both roles, minus a growing list of exclusions —
+      // first Jarvis's own target questions, then clarification activity — and
+      // each round of review found another route by which text nobody trusted
+      // arrived anyway. An assistant turn carries whatever the conversational
+      // model wrote, and `renderObservation` copies `project.summary` into one,
+      // so a registered repository's README could reach a classifier two hops
+      // later. Dropping the role entirely closes every one of those at once and
+      // leaves nothing to keep extending. Anaphora still resolves: "implémente
+      // ça" refers to what the USER asked for, and the repository comes from
+      // trusted affinity, not from what Jarvis said back.
+      recentUserMessages: history
+        .filter(
+          (message) =>
+            message.id !== userMessage.id && message.role === 'user' && message.content.trim(),
+        )
+        .slice(-2)
+        .map((message) => message.content),
+      priorConfirmation: awaiting && !awaiting.archivedAt ? awaiting : null,
+      priorAsked: Boolean(asked),
+      // Never a worktree, and never the Jarvis home: routing reads nothing.
+      cwd: this.scratchDir(),
+      signal: controller.signal,
+    });
+    log.info('semantic routing', decision.audit);
+
+    // A stop that landed while the classifiers were running ends the turn here.
+    // Falling through to `respond()` instead would answer at length a question
+    // the human had already told Jarvis to drop.
+    const stopped = (): ChatTurn => {
+      const reply = 'Stopped before starting any work.';
+      sessions.updateMessage(placeholderId, {
+        content: reply,
+        status: 'stopped',
+        metadata: { error: 'stopped by you', routing: decision.audit },
+      });
+      return {
+        conversationId,
+        kind: 'chat',
+        reply,
+        userMessage,
+        assistantMessage: sessions.getMessage(placeholderId),
+      };
+    };
+    if (controller.signal.aborted) return stopped();
+
+    if (decision.outcome.kind === 'conversation') {
+      // The responder settles this turn and owns the placeholder from here. The
+      // audit still has to survive: "routing could not be reached, so this
+      // became an ordinary answer" is exactly the case where a person asks why
+      // their Job never started, and it is the one branch that used to record
+      // nothing at all.
+      if (decision.audit.rejected) {
+        sessions.updateMessage(placeholderId, { metadata: { routing: decision.audit } });
+      }
+      return null;
+    }
+
+    if (decision.outcome.kind === 'clarification') {
+      const reply = decision.outcome.question;
+      // The user's own words are carried forward here, in trusted code, so the
+      // next turn can start the Job on what they actually asked for. Asking a
+      // model to remember it across turns loses it: the recent-turn window is
+      // truncated, and after two rounds of questions the original message has
+      // fallen out of it entirely.
+      sessions.updateMessage(placeholderId, {
+        content: reply,
+        status: 'complete',
+        metadata: {
+          activity: 'clarification',
+          routing: decision.audit,
+          pendingRequest: pendingRequest(history, userMessage, placeholderId),
+          candidates: decision.outcome.candidates.map((project) => ({
+            id: project.id,
+            name: project.name,
+          })),
+        },
+      });
+      return {
+        conversationId,
+        kind: 'clarification',
+        reply,
+        userMessage,
+        assistantMessage: sessions.getMessage(placeholderId),
+        ...(decision.outcome.candidates.length
+          ? { projectCandidates: decision.outcome.candidates }
+          : {}),
+      };
+    }
+
+    // Checked once more against the async gap above, because this is the last
+    // moment before a side effect: `stop()` must never report success for an
+    // operation that went on to start an agent anyway. From here `stop()`
+    // answers false — the Job is being created, and that cannot be taken back.
+    if (controller.signal.aborted) return stopped();
+    this.committed.add(conversationId);
+
+    // The project is passed by id so `resolveActionInput` resolves the exact row
+    // the classifiers agreed on rather than re-reading the sentence. The request
+    // is the human's own words, assembled by trusted code from this message and
+    // any question it is answering — never a model's restatement of them.
+    return await this.dispatch(
+      conversationId,
+      userMessage,
+      placeholderId,
+      '',
+      {
+        action: 'create_job',
+        project: decision.outcome.project.id,
+        request: pendingRequest(history, userMessage, placeholderId),
+        acceptance: [],
+      },
+      // Runs as the human, and this is the ONLY path that does.
+      //
+      // The agent actor exists because a model-emitted `create_job` is the
+      // conversational model's INFERENCE about what the human wanted — its own
+      // words, its own idea of the task — so it stops at a confirmation. What
+      // reaches the tool here contains no model output at all: the request is
+      // the person's message verbatim, and the project is a row trusted code
+      // resolved from an id it had itself offered. A model chose between
+      // candidates; it did not write anything that gets executed. That is the
+      // same authority as the "Start Job" button on the project page, which
+      // creates a Job with no confirmation at all — and this path is the
+      // stricter of the two, because it still goes through the permission
+      // boundary and still leaves a tool-execution audit row, which
+      // `POST /api/jobs` does not.
+      'user',
+      decision.audit,
+    );
+  }
+
   // --------------------------------------------------------------- chat path --
 
-  private async respond(conversationId: string, userMessage: Message): Promise<ChatTurn> {
+  private async respond(
+    conversationId: string,
+    userMessage: Message,
+    placeholderId: string,
+    controller: AbortController,
+  ): Promise<ChatTurn> {
     const { sessions, agents, context, projects, config } = this.deps;
     const conversation = sessions.get(conversationId);
     if (!conversation) throw new Error('conversation not found');
+    const placeholder = { id: placeholderId };
 
-    const placeholder = sessions.addMessage(conversationId, 'assistant', '', {
-      status: 'pending',
-    });
-    const controller = new AbortController();
-    this.running.set(conversationId, controller);
-
-    try {
-      const project = conversation.projectId ? projects.get(conversation.projectId) : null;
+    {
+      // Per-turn project resolution, before the provider is asked anything.
+      //
+      // This is NOT conversation affinity and it never writes
+      // `conversation.projectId`: it only decides which registered project's
+      // bounded metadata is worth injecting for THIS message, so "quelle stack
+      // utilise Jarvis ?" is answered from the registry instead of sending the
+      // model looking for a repository it cannot reach. Being wrong here costs
+      // an unused paragraph of context, which is why `selfMention: 'any'` is
+      // safe here and deliberately not used for anything that executes.
+      const affinity = conversation.projectId ? projects.get(conversation.projectId) : null;
+      const perTurn = projects.resolve(userMessage.content, {
+        affinityProjectId: conversation.projectId,
+        // Relaxed ONLY in a conversation that is not already about a project.
+        // `mentioned` outranks affinity inside `resolve`, so relaxing it always
+        // would mean that merely addressing the assistant by name ("Jarvis,
+        // what did we decide about auth?") retargets the turn's memory scope at
+        // the Jarvis project and drops the conversation's own project memory —
+        // which is the "unrelated project memory must never enter context"
+        // invariant, not a spare paragraph.
+        selfMention: conversation.projectId ? 'reference' : 'any',
+      });
+      const project = perTurn.status === 'resolved' ? perTurn.project : affinity;
+      const stale = project ? (await projects.profileStaleness(project)).stale : false;
       const pack = await context.build({
         role: 'chat',
         query: userMessage.content,
-        projectId: conversation.projectId,
+        projectId: project?.id ?? conversation.projectId,
         sessionId: conversationId,
-        projectSnapshot: project ? renderProjectSnapshot(project) : null,
+        projectSnapshot: project ? renderProjectSnapshot(project, { stale }) : null,
         sessionState: sessions.renderState(conversation.state),
       });
 
@@ -378,8 +740,15 @@ export class ChatService {
         // Keep whatever really arrived, exactly as the stop path does. The
         // failure belongs in metadata, which the UI already renders as a badge:
         // overwriting the content threw away an answer the user watched stream.
+        //
+        // The one exception is a tool-free protocol violation. There the prose
+        // is the provider narrating its own forbidden behaviour — "the current
+        // working folder is empty, where is the Jarvis repository?" — and
+        // showing it is most of the user-visible half of the bug this exists to
+        // prevent. Nothing from that run is kept.
+        const violated = isToolFreeViolation(result.error);
         sessions.updateMessage(placeholder.id, {
-          content: streamed || reply,
+          content: violated ? reply : streamed || reply,
           status: 'failed',
           metadata: { error: reply },
         });
@@ -393,20 +762,6 @@ export class ChatService {
       }
 
       return await this.applyResponse(conversationId, userMessage, placeholder.id, result.result);
-    } catch (error) {
-      // The placeholder was inserted before this block, so anything that throws
-      // on the way to the provider would otherwise leave a "thinking" bubble in
-      // the transcript forever: retry() only accepts a failed, stopped or
-      // interrupted message, so nothing short of a restart could clear it.
-      const reason = error instanceof Error ? error.message : String(error);
-      sessions.updateMessage(placeholder.id, {
-        content: redactSecrets(reason),
-        status: 'failed',
-        metadata: { error: redactSecrets(reason) },
-      });
-      throw error;
-    } finally {
-      this.running.delete(conversationId);
     }
   }
 
@@ -474,6 +829,16 @@ export class ChatService {
     placeholderId: string,
     prose: string,
     action: Exclude<ChatAction, { action: 'normal_chat' } | { action: 'clarify' }>,
+    /**
+     * Who is asking. `agent` — the default, and everything the model can reach —
+     * cannot touch a sensitive or destructive tool, so those become
+     * confirmations. `user` is passed only by `routeSemantically`, whose tool
+     * input carries no model-authored text: the request is the person's own
+     * message and the project is a row resolved from an id trusted code offered.
+     */
+    actor: 'agent' | 'user' = 'agent',
+    /** Why this turn is doing this, when a semantic route decided it. */
+    routing?: RoutingAudit,
   ): Promise<ChatTurn> {
     const { sessions, jobs, tools } = this.deps;
     const settle = (
@@ -485,7 +850,7 @@ export class ChatService {
       sessions.updateMessage(placeholderId, {
         content: reply,
         status: 'complete',
-        metadata: { activity: action.action, ...metadata },
+        metadata: { activity: action.action, ...(routing ? { routing } : {}), ...metadata },
       });
       return {
         conversationId,
@@ -511,7 +876,7 @@ export class ChatService {
     }
 
     const outcome = await tools.execute(toolName, resolved.input, {
-      actor: 'agent',
+      actor,
       sessionId: conversationId,
       projectId: resolved.projectId ?? null,
       ...(resolved.jobId ? { jobId: resolved.jobId } : {}),
@@ -570,11 +935,24 @@ export class ChatService {
 
     if (outcome.status === 'succeeded' && action.action === 'create_job') {
       const job = outcome.result as Job;
+      // The Job exists and, with autostart, an agent is already running in a
+      // worktree. Stop is a chat control: it can prevent a turn's side effect,
+      // and it cannot undo one. So the turn stops advertising itself as
+      // cancellable the moment the side effect commits — `stop()` now returns
+      // false, and `isResponding()` false, so the composer shows Send rather
+      // than Stop. Cancelling the work itself is `job.cancel`, a different
+      // capability with its own authority, and turning Stop into an implicit
+      // one would be exactly the conflation this avoids.
+      this.running.delete(conversationId);
       // Conversation state is linked inside `job.create` itself, so a Job the
       // human confirms later lands in the same place as one created here.
-      if (job.originMessageId === null) {
-        jobs.patch(job.id, { originMessageId: userMessage.id });
-      }
+      //
+      // There used to be a fallback here that patched `originMessageId` when
+      // the Job came back without one. It never did anything: `patch` does not
+      // write that column, so the call was a no-op that read like a guarantee.
+      // The real one is upstream — `resolveActionInput` puts the message id in
+      // the tool input, and `JobService.create` is idempotent in it — and a
+      // unique index makes a second Job for one message impossible regardless.
       this.deps.bus.emit({
         type: 'job.linked',
         jobId: job.id,
@@ -877,6 +1255,10 @@ export class ChatService {
   }
 
   private buildChatPrompt(userText: string, contextPack: string, conversationId: string): string {
+    // Every conversation gets the registry, whether or not a project was
+    // resolved for this turn: the model should never have to ask where a
+    // registered repository lives, and it cannot know what it is not told.
+    const registry = renderProjectRegistry(this.deps.projects.list({ status: 'active' }));
     const transcript = this.deps.sessions
       .recentMessages(conversationId, CONTEXT_TURNS)
       .filter((message) => message.content.trim())
@@ -897,6 +1279,7 @@ user's coding jobs. Talk like a knowledgeable colleague: direct, concrete, no fi
 Answer ordinary questions ordinarily — explanations, opinions and brainstorming are
 just conversation and must not turn into any Jarvis operation.
 
+${registry ? `# Registered Jarvis projects\nThese are the repositories Jarvis manages, with their real paths. Never ask the\nuser where one of them is, and never try to read one yourself: you have no\nfilesystem access at all, and a coding Job is what touches a repository.\n${registry}\n` : ''}
 ${contextPack ? `# Context Jarvis retrieved for you\n\n${contextPack}\n` : ''}
 ${linked ? `# Jobs linked to this conversation\n${linked}\n` : ''}
 ${transcript ? `# Conversation so far\n${transcript}\n` : ''}
@@ -913,6 +1296,48 @@ ${CHAT_ACTION_INSTRUCTIONS}`;
  * Assembled from the returned rows, never from what the model said: the answer
  * to "what did you find" has to be what was actually found.
  */
+/**
+ * What Jarvis asked last turn, if it asked which repository to change.
+ *
+ * Returns ids only. The QUESTION was phrased by a model — it has to be, so it
+ * can be asked in the user's language — and feeding that phrasing back into the
+ * next turn's prompt would put model-authored text into the trusted preamble of
+ * both classifiers, wearing Jarvis's voice and framed as the thing that settles
+ * the repository. That is a channel by which a planted sentence steers both
+ * "independent" checks identically, so nothing here returns any text.
+ */
+function priorTargetQuestion(
+  history: Message[],
+  ignore: string[],
+): { projectId: string | null; request: string | null } | null {
+  const before = history.filter((message) => !ignore.includes(message.id));
+  const last = before.at(-1);
+  if (!last || last.role !== 'assistant' || last.metadata.activity !== 'clarification') return null;
+  const routing = last.metadata.routing as RoutingAudit | undefined;
+  if (routing?.source !== 'semantic_router') return null;
+  const request = last.metadata.pendingRequest;
+  return {
+    projectId: routing.awaitingProjectId ?? null,
+    request: typeof request === 'string' && request.trim() ? request : null,
+  };
+}
+
+/**
+ * The instruction a Job should carry: the human's own words, and only those.
+ *
+ * When this message answers a question Jarvis asked, the request it is
+ * answering is prepended — both halves are things the person typed, so nothing
+ * is invented and nothing is dropped. The alternative, asking a model to
+ * restate the request, put model-authored text in front of an unattended
+ * write-capable agent and lost the original outright once the message fell out
+ * of the recent-turn window.
+ */
+function pendingRequest(history: Message[], userMessage: Message, placeholderId: string): string {
+  const pending = priorTargetQuestion(history, [userMessage.id, placeholderId])?.request;
+  const text = pending ? `${pending}\n\n${userMessage.content}` : userMessage.content;
+  return text.slice(0, 4000);
+}
+
 function renderObservation(name: ChatActionName, result: unknown): string {
   if (name === 'search') {
     const hits = result as SearchHit[];

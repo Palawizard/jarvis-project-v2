@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 10;
 
 /**
  * A LIKE pattern for a term a human typed.
@@ -230,6 +230,43 @@ export const MIGRATIONS = new Map<number, string>([
     `ALTER TABLE tool_executions ADD COLUMN originating_actor TEXT;
     ALTER TABLE tool_executions ADD COLUMN reason_code TEXT NOT NULL DEFAULT 'legacy';
     UPDATE tool_executions SET originating_actor=actor WHERE originating_actor IS NULL;`,
+  ],
+  [
+    9,
+    // Project analysis. Two additive columns and nothing else: existing rows
+    // read back as "never analysed", which is exactly what they are.
+    // `profile` holds the bounded structured result plus its analysedCommit;
+    // `analysis` holds only the transient run state, so a failed run can never
+    // damage the last good profile.
+    `ALTER TABLE projects ADD COLUMN profile TEXT;
+    ALTER TABLE projects ADD COLUMN analysis TEXT;`,
+  ],
+  [
+    10,
+    // ONE JOB PER CHAT MESSAGE, enforced by the database rather than by whoever
+    // happens to call `create`.
+    //
+    // Retry accepts an interrupted message and crash recovery marks one
+    // interrupted on restart, so a crash between creating a Job and settling the
+    // assistant row left a Retry button that would route the same sentence again
+    // and open a second worktree. `JobService.create` now returns the Job an
+    // origin message already has; this index is what makes that a guarantee
+    // instead of a check two concurrent writers can both pass.
+    //
+    // Existing rows are preserved. A duplicate can only have come from the bug
+    // above, and detaching the later link keeps the Job, its worktree and its
+    // history intact -- the alternative, a migration that fails on a unique
+    // violation, would leave the database unopenable.
+    `UPDATE jobs SET origin_message_id = NULL
+      WHERE origin_message_id IS NOT NULL
+        AND rowid NOT IN (
+          SELECT min(rowid) FROM jobs
+           WHERE origin_message_id IS NOT NULL
+           GROUP BY origin_message_id
+        );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS jobs_origin_message
+      ON jobs(origin_message_id) WHERE origin_message_id IS NOT NULL;`,
   ],
 ]);
 

@@ -15,6 +15,7 @@ class FakeProvider implements AgentProvider {
     readonly id: ProviderId,
     private readonly available = true,
     private readonly toolFreeChat = true,
+    private readonly enforcesToolAllowlist = true,
   ) {}
 
   async capabilities(): Promise<ProviderCapabilities> {
@@ -27,6 +28,7 @@ class FakeProvider implements AgentProvider {
       models: this.id === 'claude' ? ['opus', 'sonnet', 'haiku'] : [],
       structuredOutput: true,
       toolFreeChat: this.toolFreeChat,
+      enforcesToolAllowlist: this.enforcesToolAllowlist,
       ...(!this.available ? { reason: 'offline' } : {}),
     };
   }
@@ -87,6 +89,24 @@ describe('AgentRegistry v2', () => {
     const unavailable = await registry([new FakeProvider('codex', true, false)]).route('chat');
     expect(unavailable.provider).toBeNull();
     expect(unavailable.reason).toContain('cannot run tool-free chat');
+  });
+
+  it('routes the project analyst only to a provider that can be held to an allowlist', async () => {
+    // A read-only sandbox is not a tool allowlist: it prevents writes, but the
+    // agent can still run shell commands, which is not what "reads the
+    // repository and reports" means. Rather than route and quietly make a
+    // weaker guarantee, the role goes unserved.
+    const gated = await registry([
+      new FakeProvider('codex', true, false, false),
+      new FakeProvider('claude'),
+    ]).route('project_analyst', { prefer: 'codex' });
+    expect(gated.provider?.id).toBe('claude');
+
+    const unavailable = await registry([new FakeProvider('codex', true, false, false)]).route(
+      'project_analyst',
+    );
+    expect(unavailable.provider).toBeNull();
+    expect(unavailable.reason).toContain('read-only tool allowlist');
   });
 
   it('uses cross-provider review and same-provider fallback', async () => {

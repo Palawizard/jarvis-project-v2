@@ -4,6 +4,7 @@ import { newId, nowIso } from '../ids.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { ClaudeProvider } from './claude.js';
 import { CodexProvider } from './codex.js';
+import { isToolFreeRole } from './toolfree.js';
 import type {
   AgentProvider,
   AgentRole,
@@ -201,7 +202,7 @@ export class AgentRegistry {
   ): Promise<RoutingResult> {
     const caps = await this.capabilities();
     const usable = caps.filter(
-      (capability) => capability.available && (role !== 'chat' || capability.toolFreeChat === true),
+      (capability) => capability.available && roleAllowed(role, capability),
     );
     const profile = resolveModelProfile(opts.taskProfile);
     const order: ProviderId[] = [];
@@ -225,8 +226,10 @@ export class AgentRegistry {
           .map(
             (cap) =>
               `${cap.id}: ${
-                role === 'chat' && cap.available && cap.toolFreeChat !== true
-                  ? 'cannot run tool-free chat'
+                cap.available && !roleAllowed(role, cap)
+                  ? role === 'chat'
+                    ? 'cannot run tool-free chat'
+                    : 'cannot be restricted to a read-only tool allowlist'
                   : (cap.reason ?? 'unavailable')
               }`,
           )
@@ -380,4 +383,22 @@ function routingReason(
     return `no healthy alternative; fresh ${selected} context; ${profile} model profile`;
   }
   return `healthy provider fallback order; ${profile} model profile`;
+}
+
+/**
+ * May this provider serve this role at all?
+ *
+ * Three roles make a promise the provider itself has to keep. `chat`, `router`
+ * and `autostart_verifier` promise no tools; `project_analyst` promises an exact
+ * read-only allowlist, which a merely read-only sandbox does not give (it still
+ * runs shell commands). A provider that cannot make the guarantee is not routed,
+ * rather than being routed and quietly making a weaker one.
+ */
+function roleAllowed(role: AgentRole, capability: ProviderCapabilities): boolean {
+  // Conversation and the two routing roles all promise the same thing — the
+  // model reaches no provider-native tool — so they all need the same declared
+  // capability. A provider that cannot prove it is tool-free never sees one.
+  if (isToolFreeRole(role)) return capability.toolFreeChat === true;
+  if (role === 'project_analyst') return capability.enforcesToolAllowlist === true;
+  return true;
 }

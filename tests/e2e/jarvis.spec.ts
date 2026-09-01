@@ -30,6 +30,21 @@ async function newChat(page: Page): Promise<string> {
   return new URL(page.url()).pathname.split('/')[2] as string;
 }
 
+/**
+ * Wait until the turn in flight has finished.
+ *
+ * The composer shows Stop while Jarvis is working and Send when it is not, so
+ * this is the UI's own statement that the turn is over. Every assertion that
+ * something did NOT happen needs it: without it, "no Job exists" can just mean
+ * "no Job exists yet", and routing now takes two provider runs before anything
+ * is created.
+ */
+async function settled(page: Page): Promise<void> {
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible({
+    timeout: 60_000,
+  });
+}
+
 async function send(page: Page, text: string): Promise<void> {
   // Wait until no response is in flight: the composer shows Stop instead of
   // Send while one is. Then send with Enter, the documented primary
@@ -207,6 +222,15 @@ test('FLOW A2 — the destructive confirmation says what goes and what stays', a
   await expect(conversationRow(page, conversationId)).toBeVisible();
 });
 
+/**
+ * The regression this flow exists for.
+ *
+ * A real user typed this shape of message into a new conversation and got no
+ * Job: the conversational provider explored its own empty scratch directory and
+ * asked where the Jarvis repository was. Trusted code now recognises an explicit
+ * imperative development request, resolves the registered project itself, and
+ * creates exactly one Job — the conversational provider is never consulted.
+ */
 test('FLOW B — a coding request resolves the project and shows a live Job card', async ({
   page,
   app,
@@ -218,24 +242,21 @@ test('FLOW B — a coding request resolves the project and shows a live Job card
   const self = await selfProject(request, control);
 
   const conversationId = await newChat(page);
-  // No project chooser is touched: the sentence names Jarvis.
-  await send(page, 'Create a job on Jarvis to fix the mobile nav. E2E-CREATE-SELF-JOB');
-
-  // Starting a development Job is a modification of the user's world, so the
-  // agent's request becomes a confirmation it cannot answer itself.
-  const review = page.getByTestId(/^review-confirmation-/);
-  await expect(review).toBeVisible({ timeout: 30_000 });
-  await review.click();
-  const confirmation = page.getByTestId('confirm-dialog');
-  await expect(confirmation).toBeVisible();
-  // The human must be able to see WHAT is about to run, not just which tool.
-  await expect(confirmation).toContainText('Fix the mobile nav');
-  await confirmation.getByRole('button', { name: 'Confirm and run' }).click();
-  await expect(confirmation).toBeHidden();
+  // No project chooser is touched, and no path is ever asked for: the sentence
+  // names Jarvis, and Jarvis is a registered project.
+  await send(
+    page,
+    'code sur le projet Jarvis une nouvelle implémentation : rends la navigation mobile ' +
+      'atteignable. E2E-ROUTE-JARVIS',
+  );
 
   const card = page.locator('.job-card').first();
   await expect(card).toBeVisible({ timeout: 30_000 });
-  await expect(card).toContainText('Fix the mobile navigation');
+  await expect(card).toContainText('navigation mobile');
+  // Nothing asked the human where the repository is, and no confirmation stood
+  // between the instruction and the work.
+  await expect(page.getByTestId('confirm-dialog')).toBeHidden();
+  await expect(page.getByTestId('chat-view')).not.toContainText('chat-scratch');
 
   const jobs = (await request
     .get(`/api/jobs?sessionId=${conversationId}&archived=all`, { headers: headers(control) })
@@ -265,13 +286,198 @@ test('FLOW B — a coding request resolves the project and shows a live Job card
 
   // A follow-up resolves the linked Job without naming it.
   await send(page, 'How is that job doing? E2E-INSPECT-JOB');
-  await expect(
-    page.getByTestId('chat-view').getByText('Fix the mobile navigation').last(),
-  ).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId('chat-view').getByText('navigation mobile').last()).toBeVisible({
+    timeout: 30_000,
+  });
 
   // Opening the card navigates to the Job.
   await page.locator('.job-card').first().click();
   await expect(page.getByTestId('job-detail-view')).toBeVisible();
+});
+
+/**
+ * The other authority statement, kept beside FLOW B on purpose.
+ *
+ * FLOW B is the semantic route: two independent tool-free classifiers agree the
+ * message names a repository to change, trusted code resolves the row, and the
+ * Job starts. Here routing returns ordinary conversation, so the message reaches
+ * the conversational model — and a model-emitted `create_job` is that model's
+ * inference about what was wanted, which stops at a confirmation it cannot
+ * answer itself.
+ */
+test('FLOW B2 — a Job the MODEL asks for still needs the human', async ({ page, app, request }) => {
+  await app.open();
+  await expect(page.getByTestId('chat-view')).toBeVisible();
+  const control = await credential(page);
+  await selfProject(request, control);
+
+  const conversationId = await newChat(page);
+  await send(page, 'Something really should be done about the mobile nav. E2E-CREATE-SELF-JOB');
+
+  const review = page.getByTestId(/^review-confirmation-/);
+  await expect(review).toBeVisible({ timeout: 30_000 });
+  // Nothing has started yet.
+  const before = (await request
+    .get(`/api/jobs?sessionId=${conversationId}&archived=all`, { headers: headers(control) })
+    .then((response) => response.json())) as unknown[];
+  expect(before).toHaveLength(0);
+
+  await review.click();
+  const confirmation = page.getByTestId('confirm-dialog');
+  await expect(confirmation).toBeVisible();
+  // The human must be able to see WHAT is about to run, not just which tool.
+  await expect(confirmation).toContainText('Fix the mobile nav');
+  await confirmation.getByRole('button', { name: 'Confirm and run' }).click();
+  await expect(confirmation).toBeHidden();
+
+  const card = page.locator('.job-card').first();
+  await expect(card).toBeVisible({ timeout: 30_000 });
+  const jobs = (await request
+    .get(`/api/jobs?sessionId=${conversationId}&archived=all`, { headers: headers(control) })
+    .then((response) => response.json())) as Array<{ id: string }>;
+  expect(jobs).toHaveLength(1);
+  await stopJob(request, app, (jobs[0] as { id: string }).id);
+});
+
+/**
+ * The three outcomes of routing, driven through the real UI.
+ *
+ * The semantic matrix — which sentences mean "change this repository" — lives in
+ * the unit tests, where a scripted classifier makes what is being asserted
+ * explicit. What only the browser can show is this: a Job card appears when both
+ * classifiers agree, a question appears when they do not, and an answer appears
+ * when the message was never about changing code. In none of the last two does
+ * a Job exist.
+ */
+test('FLOW B3 — routing reaches exactly one of three outcomes', async ({ page, app, request }) => {
+  await app.open();
+  await expect(page.getByTestId('chat-view')).toBeVisible();
+  const control = await credential(page);
+  const self = await selfProject(request, control);
+
+  const jobsNow = async (conversationId: string) =>
+    (await request
+      .get(`/api/jobs?sessionId=${conversationId}&archived=all`, { headers: headers(control) })
+      .then((response) => response.json())) as Array<{ id: string; projectId: string }>;
+
+  // A — both classifiers agree on the repository: exactly one Job, started.
+  const building = await newChat(page);
+  await send(
+    page,
+    'code sur le projet Jarvis une nouvelle implémentation : ajoute un commentaire de test. ' +
+      'E2E-ROUTE-JARVIS',
+  );
+  await expect(page.locator('.job-card').first()).toBeVisible({ timeout: 30_000 });
+  const started = await jobsNow(building);
+  expect(started).toHaveLength(1);
+  expect((started[0] as { projectId: string }).projectId).toBe(self.id);
+  await expect(page.getByTestId('chat-view')).not.toContainText('chat-scratch');
+  await stopJob(request, app, (started[0] as { id: string }).id);
+
+  // B — a change is wanted, but not clearly to a registered repository. The
+  // question is asked in the transcript, nothing is created, and the registered
+  // projects are offered as exact choices. Clicking one is the human naming the
+  // repository, which needs no classifier at all — so it is the deterministic
+  // way out of a question a model might otherwise keep asking.
+  const plugin = await newChat(page);
+  await send(page, 'crée un plugin pour Jarvis E2E-ROUTE-CLARIFY');
+  await expect(page.getByTestId('chat-view')).toContainText(/which repository/i, {
+    timeout: 30_000,
+  });
+  await settled(page);
+  expect(await jobsNow(plugin)).toHaveLength(0);
+
+  await page.getByTestId(`target-choice-${self.id}`).first().click();
+  await expect.poll(async () => (await jobsNow(plugin)).length, { timeout: 30_000 }).toBe(1);
+  const chosen = await jobsNow(plugin);
+  expect((chosen[0] as { projectId: string }).projectId).toBe(self.id);
+  // The Job lands in the transcript, and the choices go away with it. Started
+  // work that leaves no trace reads as a button that did nothing, and the
+  // obvious response to that is to press it again.
+  await expect(page.locator('.job-card').first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId(`target-choice-${self.id}`)).toBeHidden();
+  expect(await jobsNow(plugin)).toHaveLength(1);
+  await stopJob(request, app, (chosen[0] as { id: string }).id);
+
+  // C — the project is the subject, not the target. An ordinary answer.
+  const article = await newChat(page);
+  await send(page, 'write an article on Jarvis');
+  await settled(page);
+  expect(await jobsNow(article)).toHaveLength(0);
+
+  // D — management. A registry operation must never become a coding Job, and
+  // the routing fixture really returns project_management here rather than
+  // reaching the same outcome by another road.
+  const registry = await newChat(page);
+  await send(page, 'archive the Jarvis project E2E-ROUTE-MANAGE E2E-NORMAL-QUESTION');
+  await settled(page);
+  expect(await jobsNow(registry)).toHaveLength(0);
+
+  // E — a question about where the project is, answered from the registry
+  // rather than by sending a model looking for a repository it cannot reach.
+  const where = await newChat(page);
+  await send(page, 'où est le projet Jarvis ? E2E-WHERE-IS-JARVIS');
+  await expect(page.getByTestId('chat-view')).toContainText('registered at the path', {
+    timeout: 30_000,
+  });
+  expect(await jobsNow(where)).toHaveLength(0);
+
+  // And a question about how to build something stays conversation.
+  const how = await newChat(page);
+  await send(page, 'comment coder un plugin pour Jarvis ? E2E-HOW-TO-PLUGIN');
+  await expect(page.getByTestId('chat-view')).toContainText('provider adapter interface', {
+    timeout: 30_000,
+  });
+  expect(await jobsNow(how)).toHaveLength(0);
+});
+
+/**
+ * Affinity improves interpretation; it is not standing permission to code — the
+ * difference between "implémente ça" and "crée une facture pour ce client" in
+ * the same project-bound conversation.
+ */
+test('FLOW B4 — affinity is a hint, not permission', async ({ page, app, request }) => {
+  await app.open();
+  const control = await credential(page);
+  const self = await selfProject(request, control);
+
+  const jobsNow = async (conversationId: string) =>
+    (await request
+      .get(`/api/jobs?sessionId=${conversationId}&archived=all`, { headers: headers(control) })
+      .then((response) => response.json())) as Array<{ id: string; projectId: string }>;
+
+  // Bind the conversation to Jarvis the trusted way: by starting a Job in it.
+  const conversationId = await newChat(page);
+  await send(page, 'fix the mobile nav in the Jarvis repo. E2E-ROUTE-JARVIS');
+  await expect(page.locator('.job-card').first()).toBeVisible({ timeout: 30_000 });
+  const first = await jobsNow(conversationId);
+  expect(first).toHaveLength(1);
+  await stopJob(request, app, (first[0] as { id: string }).id);
+
+  // Work for a client, in a conversation about Jarvis, is still not work on
+  // Jarvis: the Job count does not move.
+  await send(page, 'crée une facture pour ce client');
+  await settled(page);
+  expect(await jobsNow(conversationId)).toHaveLength(1);
+
+  await send(page, 'crée cette page pour le client Dupont');
+  await settled(page);
+  expect(await jobsNow(conversationId)).toHaveLength(1);
+
+  // An instruction that points back at the conversation's project does. Polled
+  // on the Jobs themselves rather than on a card count: one Job already renders
+  // a card against both its user and its assistant message, so "a second card
+  // is visible" was true before the second Job existed.
+  await send(page, 'implémente ça. E2E-ROUTE-JARVIS');
+  await expect
+    .poll(async () => (await jobsNow(conversationId)).length, { timeout: 30_000 })
+    .toBe(2);
+  const both = await jobsNow(conversationId);
+  for (const job of both) expect(job.projectId).toBe(self.id);
+  // Only the new one: the first was already stopped above, and stopping a
+  // cancelled Job is not a no-op the helper accepts.
+  const fresh = both.find((job) => job.id !== (first[0] as { id: string }).id);
+  await stopJob(request, app, (fresh as { id: string }).id);
 });
 
 test('FLOW C — Projects and Jobs are real management surfaces', async ({ page, app, request }) => {
@@ -295,6 +501,12 @@ test('FLOW C — Projects and Jobs are real management surfaces', async ({ page,
 
   await page.getByTestId('nav-projects').click();
   await expect(page.getByTestId('projects-view')).toBeVisible();
+  // Registering a project offers the analysis, explains what it costs, and does
+  // not make it a precondition.
+  const analyseOnAdd = page.getByTestId('analyze-on-add');
+  await expect(analyseOnAdd).toBeVisible();
+  await expect(analyseOnAdd.getByRole('checkbox')).toBeChecked();
+  await expect(analyseOnAdd).toContainText('Analyse the project');
   await page.getByLabel('Search projects').fill('jarvis');
   await expect(page.getByRole('cell', { name: /jarvis/ }).first()).toBeVisible();
   await page.getByLabel('Search projects').fill('no-such-project-anywhere');
@@ -309,6 +521,19 @@ test('FLOW C — Projects and Jobs are real management surfaces', async ({ page,
     .first();
   await selfRow.locator('details.item-menu summary').click();
   await expect(selfRow.getByRole('button', { name: 'Unregister' })).toBeDisabled();
+
+  // The project page offers analysis as a first-class action and says honestly
+  // that nothing has been read yet.
+  await page
+    .getByTestId('projects-view')
+    .locator('tr')
+    .filter({ hasText: 'self' })
+    .first()
+    .getByRole('cell')
+    .first()
+    .click();
+  await expect(page.getByTestId('analyze-project').first()).toContainText('Analyse project');
+  await expect(page.getByTestId('analysis-status')).toContainText('not analysed');
 
   await page.getByTestId('nav-jobs').click();
   await expect(page.getByTestId('jobs-view')).toBeVisible();

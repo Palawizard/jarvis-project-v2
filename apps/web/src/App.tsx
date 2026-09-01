@@ -193,6 +193,10 @@ function AuthenticatedApp() {
     )
       conversations.reload();
     if (lastEvent?.type.startsWith('tool.')) toolRequests.reload();
+    // Analysis is a multi-minute provider run whose only UI state lives on the
+    // project row. Without this the card sits on "analysing" until the user
+    // reloads the page, including when it has already succeeded.
+    if (lastEvent?.type.startsWith('project.')) projects.reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent]);
   useEffect(() => {
@@ -473,6 +477,7 @@ function AuthenticatedApp() {
           <ProjectsView
             projects={projects.data ?? []}
             selectedId={route.id}
+            lastEvent={lastEvent}
             onSelect={(id) => navigate({ name: 'projects', ...(id ? { id } : {}) })}
             onOpenJob={(id) => navigate({ name: 'job', id })}
             onChanged={projects.reload}

@@ -43,7 +43,27 @@ export {
   type ProjectResolution,
   type CandidateRuntimeConfig,
   type VisualInteraction,
+  renderProjectRegistry,
+  mentionsSelfProject,
 } from './projects/service.js';
+export {
+  classifyProjectReference,
+  tokenizeMessage,
+  type ProjectReference,
+  type MessageTokens,
+} from './projects/reference.js';
+export {
+  ProjectAnalysisService,
+  parseAnalystResult,
+  type ProjectAnalysisOutcome,
+} from './projects/analysis.js';
+export {
+  PROJECT_PROFILE_VERSION,
+  ProjectProfileResultSchema,
+  renderProjectProfile,
+  type ProjectProfile,
+  type ProjectAnalysisState,
+} from './projects/profile.js';
 export {
   SessionService,
   ConversationService,
@@ -56,6 +76,19 @@ export {
   type MessageStatus,
 } from './sessions/service.js';
 export { ChatService, type ChatTurn, type ChatTurnKind } from './chat/service.js';
+export {
+  SemanticRouter,
+  ROUTER_SCHEMA_VERSION,
+  RouterResultSchema,
+  VerifierResultSchema,
+  type RouterResult,
+  type RouterKind,
+  type ProjectRelationship,
+  type RoutingAudit,
+  type RoutingOutcome,
+  type RoutingRejection,
+  type RoutedTurn,
+} from './chat/router.js';
 export {
   ChatActionSchema,
   extractChatAction,

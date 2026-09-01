@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -36,6 +37,62 @@ describe('conversation project context routes', () => {
       const resolved = await jarvis.tools.approve(pending.execution.id);
       expect(resolved).toMatchObject({ status: 'failed', error: 'job is not running' });
       expect(jarvis.jobs.get(job.id)?.status).toBe('pending');
+    } finally {
+      jarvis.close();
+    }
+  });
+
+  it('refuses to start a Job inside an archived project', async () => {
+    // The clarification buttons in a transcript are rendered from a message
+    // stored earlier, so a project archived between the question and the click
+    // was still reachable through this route -- which creates the Job and
+    // autostarts an agent directly, without the tool boundary. Nothing
+    // downstream re-checked: `pipeline.execute` only resolves the row.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-archived-job-'));
+    roots.push(home);
+    const base = loadConfig({ home });
+    const jarvis = new Jarvis({ ...base, memory: { ...base.memory, embeddingsEnabled: false } });
+    try {
+      // Not the self project: Jarvis refuses to archive itself, and the case
+      // under test is an ordinary registered repository being filed away.
+      const root = path.join(home, 'side-project');
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(path.join(root, 'README.md'), '# fixture\n');
+      const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'ignore' });
+      git('init', '-b', 'main');
+      git('config', 'user.email', 'test@example.com');
+      git('config', 'user.name', 'Test');
+      git('add', '.');
+      git('commit', '-m', 'initial');
+      const project = await jarvis.projects.register({ name: 'side-project', rootPath: root });
+      const credential = jarvis.control.pair(jarvis.control.createBootstrap());
+      if (!credential) throw new Error('test pairing failed');
+      const app = createRoutes(jarvis);
+      const post = (body: unknown) =>
+        app.request('/api/jobs', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-jarvis-control': credential,
+            origin: base.controlOrigins[0] ?? '',
+          },
+          body: JSON.stringify(body),
+        });
+
+      const before = await post({ projectId: project.id, request: 'change the cache' });
+      expect(before.status).toBe(201);
+
+      jarvis.projects.setArchived(project.id, true);
+      const after = await post({
+        projectId: project.id,
+        request: 'change the cache',
+        autostart: true,
+      });
+
+      expect(after.status).toBe(400);
+      expect(((await after.json()) as { error?: string }).error).toMatch(/archived/i);
+      // Nothing was created, so nothing was started.
+      expect(jarvis.jobs.list({ projectId: project.id, archived: 'all' })).toHaveLength(1);
     } finally {
       jarvis.close();
     }

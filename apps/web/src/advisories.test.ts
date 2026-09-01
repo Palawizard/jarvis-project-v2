@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import { Markdown } from './components.tsx';
+import { Markdown, PlainText } from './components.tsx';
 import { confirmationState, describePendingTarget } from './views/Chat.tsx';
 import type { Job } from './api.ts';
 
@@ -14,6 +14,26 @@ describe('web reviewer advisories', () => {
     expect(prose).not.toContain('<table>');
     expect(prose).toContain('use grep | sort');
     expect(prose).toContain('<li>first item</li>');
+  });
+
+  it('renders a user message verbatim, escaped, with its line breaks kept', () => {
+    // The transcript of the real request that prompted this work contained
+    // literal-looking entities such as `&#x20;`. They are a copy/serialisation
+    // artefact, not something Jarvis renders: a user message is escaped text,
+    // so an entity the user typed is shown as the characters they typed.
+    const typed = 'a & b <script>alert("x")</script> ok\n\nsecond &#x20; paragraph';
+    const html = renderToStaticMarkup(PlainText({ children: typed }));
+
+    expect(html).toContain('a &amp; b');
+    expect(html).toContain('&lt;script&gt;');
+    expect(html).not.toContain('<script>');
+    expect(html).toContain('&quot;x&quot;');
+    // The entity survives as text rather than being decoded to a space.
+    expect(html).toContain('&amp;#x20;');
+    // And the blank line between paragraphs is still there, preserved by the
+    // class `.plain-text` carries.
+    expect(html).toContain('\n\nsecond');
+    expect(html).toContain('class="plain-text"');
   });
 
   it('offers confirmation only for an authoritative pending execution', () => {

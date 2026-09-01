@@ -5,12 +5,13 @@ import {
   type ConversationSummary,
   type JarvisEvent,
   type Job,
+  type Message,
   type Project,
   type ToolExecution,
   type ToolOutcome,
   type ToolExecutionStatus,
 } from '../api.ts';
-import { Badge, ConfirmDialog, Empty, Markdown, StageBadge } from '../components.tsx';
+import { Badge, ConfirmDialog, Empty, Markdown, PlainText, StageBadge } from '../components.tsx';
 import { useAsync } from '../hooks.ts';
 
 export function ChatView({
@@ -138,6 +139,33 @@ export function ChatView({
     }
   };
 
+  /**
+   * Answer "which repository?" by picking one, rather than by describing it.
+   *
+   * This is the deterministic way out of a clarification. A click is the
+   * person naming the project themselves, so no classifier is consulted and
+   * there is nothing left to interpret: the id is exact, and the request is
+   * the text trusted code carried forward from the message that was asked
+   * about. Typing an answer still works and still goes through routing.
+   */
+  const chooseTarget = async (message: Message, projectId: string) => {
+    const request = message.metadata.pendingRequest;
+    if (!request || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.createJob(projectId, request, [], true, {
+        sessionId: conversationId,
+        originMessageId: message.id,
+      });
+      detail.reload();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const approve = async () => {
     if (!confirm || !detail.data) return;
     setError(null);
@@ -236,7 +264,7 @@ export function ChatView({
                       {message.content || (message.status === 'pending' ? 'Thinking…' : '')}
                     </Markdown>
                   ) : (
-                    <p>{message.content}</p>
+                    <PlainText>{message.content}</PlainText>
                   )}
                   {message.status !== 'complete' && (
                     <Badge
@@ -263,6 +291,21 @@ export function ChatView({
                       onOpen={onOpenJob}
                     />
                   ))}
+                  {message.metadata.candidates?.length && !linked.length ? (
+                    <div className="target-choices" data-testid={`target-choices-${message.id}`}>
+                      {message.metadata.candidates.map((candidate) => (
+                        <button
+                          key={candidate.id}
+                          className="btn"
+                          data-testid={`target-choice-${candidate.id}`}
+                          disabled={busy}
+                          onClick={() => void chooseTarget(message, candidate.id)}
+                        >
+                          {candidate.name}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                   {message.metadata.executionId &&
                     (() => {
                       const execution = executions.get(message.metadata.executionId as string);

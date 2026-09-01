@@ -1,10 +1,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Db } from '../db/index.js';
-import { parseJson } from '../db/index.js';
+import { parseJson, transaction } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import { foldAccents } from '../memory/policy.js';
+import {
+  classifyProjectReference,
+  tokenizeMessage,
+  type MessageTokens,
+  type ProjectReference,
+} from './reference.js';
 import { repoStatus } from '../git/workspace.js';
+import { createLogger } from '../logger.js';
+import {
+  parseStoredAnalysisState,
+  parseStoredProfile,
+  type ProjectAnalysisState,
+  type ProjectProfile,
+} from './profile.js';
+
+const log = createLogger('projects');
 
 export interface ProjectCommands {
   install?: string;
@@ -102,6 +117,10 @@ export interface Project {
   /** Archived projects stay in the database and drop out of default resolution. */
   archivedAt: string | null;
   config: ProjectConfig;
+  /** What a bounded read-only analysis agent learned about this repository. */
+  profile: ProjectProfile | null;
+  /** In-flight or last-failed analysis run. Null once a run has succeeded. */
+  analysis: ProjectAnalysisState | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -122,6 +141,10 @@ function rowToProject(row: Row): Project {
     aliases: parseJson(row.aliases as string, [] as string[]),
     archivedAt: (row.archived_at as string) ?? null,
     config: parseJson(row.config as string, {} as ProjectConfig),
+    // Both tolerate anything: a profile written by an older or newer Jarvis
+    // simply reads back as "not analysed" rather than breaking the project.
+    profile: parseStoredProfile(row.profile),
+    analysis: parseStoredAnalysisState(row.analysis),
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
   };
@@ -135,17 +158,23 @@ export function normaliseProjectName(value: string): string {
 }
 
 /**
- * Does this message REFER to the Jarvis repository, or merely address Jarvis?
+ * Does this message name the Jarvis repository as the thing to act on?
  *
  * The rule is inverted on purpose. Two earlier rounds subtracted: strip the
  * address, treat whatever is left as a name -- and each round patched the one
  * phrasing the previous had missed ("Jarvis, ..." then "can you ..." then
  * "Jarvis fix the login bug"), because "not an address" is an open-ended set
  * and every miss silently retargets the conversation at Jarvis's own
- * repository. So a self synonym now counts as naming the project ONLY inside a
- * construction that cannot be address: a preposition, a possessive, or an
- * explicit noun. Everything else -- a bare mention anywhere in a sentence --
- * falls through to conversation affinity, and then to asking.
+ * repository. So a self synonym counts as naming the project ONLY inside a
+ * construction that cannot be address.
+ *
+ * A third round taught the same lesson from the other side: enumerating the
+ * constructions that DO count grew its own tail of false positives, because
+ * "pour Jarvis", "a Jarvis UI plugin" and "à Jarvis" are lexically close to
+ * phrases that do name the repository. So the judgement now lives in
+ * `classifyProjectReference`, which decides it from the grammar around the
+ * name, and this function is the boundary that says an address is not a
+ * reference.
  *
  * That is the safe direction for the two ways this can be wrong. Failing to
  * recognise a reference costs one clarifying question; treating an address as a
@@ -154,18 +183,8 @@ export function normaliseProjectName(value: string): string {
  * A message that is exactly the project's name still resolves at the `exact`
  * tier, which reads the real project name and needs nothing from here.
  */
-const SELF_REFERENCE = [
-  // The haystack is space-normalised and space-padded, so a leading and
-  // trailing space is the word boundary.
-  / (?:in|on|to|for|from|against|inside|within|onto|upon) (?:the )?(?:jarvis|yourself) /,
-  / jarvis (?:s )?(?:own )?(?:repo|repository|project|codebase|code|source|ui|itself) /,
-  / (?:the|this) jarvis /,
-  / your own (?:repo|repository|project|codebase|code|source|ui) /,
-];
-
-/** True when the message names the Jarvis repository as the thing to act on. */
-export function mentionsSelfProject(normalisedHaystack: string): boolean {
-  return SELF_REFERENCE.some((pattern) => pattern.test(normalisedHaystack));
+export function mentionsSelfProject(tokens: MessageTokens, keys: string[]): boolean {
+  return classifyProjectReference(tokens, keys) === 'strong';
 }
 
 /** Every name a project answers to, strongest first. */
@@ -174,6 +193,22 @@ export function projectNameKeys(project: Project): string[] {
   return [...new Set(keys.map(normaliseProjectName).filter(Boolean))];
 }
 
+/**
+ * What project is this message ABOUT?
+ *
+ * Deliberately has no field that could be mistaken for authority. This answers
+ * a context question — which profile to inject, which candidates to offer — and
+ * nothing here may start work. An earlier design carried a `targeting: 'strong'`
+ * flag here, and "strong reference" quietly became "permission to run an agent
+ * on that repository" twice.
+ *
+ * The repository an unattended agent runs in is never CHOSEN from text by this
+ * service. It is chosen in `chat/router.ts` — two independent tool-free
+ * classifications that must agree on an id trusted code offered them — and this
+ * function is then called with that exact id, which the `explicit project id`
+ * tier resolves. Ids are fixed-length and generated, so that tier cannot be
+ * reached by a sentence: it is a lookup, not an interpretation.
+ */
 export type ProjectResolution =
   | { status: 'resolved'; project: Project; confidence: number; reason: string }
   | { status: 'ambiguous'; candidates: Project[]; reason: string }
@@ -295,7 +330,11 @@ export class ProjectService {
     }
 
     const detected = detectStack(root);
-    const name = input.name?.trim() || path.basename(root);
+    // Bounded at registration, matching the 80 that `project.update` enforces.
+    // An unbounded name is not an injection risk — it is JSON-quoted wherever
+    // it is rendered — but it lands in the trusted region of every routing
+    // prompt, where one very long name would crowd out the other candidates.
+    const name = (input.name?.trim() || path.basename(root)).slice(0, 80);
     const now = nowIso();
     const project: Project = {
       id: newId('prj'),
@@ -310,6 +349,8 @@ export class ProjectService {
       aliases: normaliseAliases(input.aliases ?? []),
       archivedAt: null,
       config: input.config ?? {},
+      profile: null,
+      analysis: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -440,6 +481,50 @@ export class ProjectService {
     return this.get(id);
   }
 
+  /**
+   * Has the repository moved past the commit its profile was built from?
+   *
+   * A stale profile is never discarded — it is still the best orientation
+   * Jarvis has — but every surface that shows it says so, and re-analysis is
+   * always the human's call so a busy repository cannot silently burn quota.
+   */
+  async profileStaleness(
+    project: Project,
+  ): Promise<{ analysed: boolean; stale: boolean; head: string | null }> {
+    if (!project.profile) return { analysed: false, stale: false, head: null };
+    const status = await repoStatus(project.rootPath).catch(() => null);
+    const head = status?.head ?? null;
+    return {
+      analysed: true,
+      stale: Boolean(head && head !== project.profile.analyzedCommit),
+      head,
+    };
+  }
+
+  /**
+   * Record where an analysis run has got to.
+   *
+   * Deliberately a separate column from `profile`: a failed or in-flight run
+   * must never be able to damage the last good profile, and the UI has to be
+   * able to say "analysing" and "the previous answer is still this" at once.
+   */
+  setAnalysisState(id: string, state: ProjectAnalysisState | null): Project | null {
+    if (!this.get(id)) return null;
+    this.db
+      .prepare('UPDATE projects SET analysis = ?, updated_at = ? WHERE id = ?')
+      .run(state ? JSON.stringify(state) : null, nowIso(), id);
+    return this.get(id);
+  }
+
+  /** Store a completed profile and clear the run state in one transition. */
+  setProfile(id: string, profile: ProjectProfile): Project | null {
+    if (!this.get(id)) return null;
+    this.db
+      .prepare('UPDATE projects SET profile = ?, analysis = NULL, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(profile), nowIso(), id);
+    return this.get(id);
+  }
+
   /** Re-run detection against the current filesystem state. */
   refreshDetection(id: string): Project | null {
     const project = this.get(id);
@@ -487,8 +572,14 @@ export class ProjectService {
       id,
     );
     const historicalJobs = count('SELECT COUNT(*) AS n FROM jobs WHERE project_id = ?', id);
+    // Analysis-authored memories are Jarvis's own orientation notes, not the
+    // user's history, and the register dialog offers analysis by default. Left
+    // in the count they would make every freshly registered project
+    // soft-archive instead of unregister outright, silently changing the
+    // documented semantics for the common case.
     const memories = count(
-      `SELECT COUNT(*) AS n FROM memories WHERE scope='project' AND scope_id = ?`,
+      `SELECT COUNT(*) AS n FROM memories
+        WHERE scope='project' AND scope_id = ? AND source_type <> 'project_analysis'`,
       id,
     );
     if (project.isSelf) {
@@ -533,9 +624,26 @@ export class ProjectService {
     const preflight = this.unregisterPreflight(id);
     if (!preflight.eligible) throw new Error(preflight.reason);
     if (preflight.mode === 'hard') {
-      const removed =
-        Number(this.db.prepare('DELETE FROM projects WHERE id = ?').run(id).changes) > 0;
-      return { removed, mode: 'hard', reason: preflight.reason };
+      // One transaction, because `memories.scope_id` is a plain column with no
+      // foreign key: nothing in the schema would clean up after the row.
+      //
+      // The preflight discounts Jarvis's own analysis notes when deciding hard
+      // versus soft, so the hard path can now run while project-scoped memories
+      // still exist. Every one of them is scoped to a project that is about to
+      // stop existing, so every one of them goes with it — not only the source
+      // type the preflight discounted, since a dangling scope_id is dangling
+      // whoever wrote it.
+      return transaction(this.db, () => {
+        const purged = Number(
+          this.db.prepare(`DELETE FROM memories WHERE scope = 'project' AND scope_id = ?`).run(id)
+            .changes,
+        );
+        const removed =
+          Number(this.db.prepare('DELETE FROM projects WHERE id = ?').run(id).changes) > 0;
+        if (!removed) throw new Error('project not found');
+        if (purged) log.info('purged project memory with its registration', { id, purged });
+        return { removed, mode: 'hard' as const, reason: preflight.reason };
+      });
     }
     this.setArchived(id, true);
     return { removed: true, mode: 'soft', reason: preflight.reason };
@@ -553,11 +661,26 @@ export class ProjectService {
    * Several plausible projects never resolve silently: the caller is told to
    * ask. Archived projects are only candidates when explicitly named.
    */
-  resolve(text: string, options: { affinityProjectId?: string | null } = {}): ProjectResolution {
+  resolve(
+    text: string,
+    options: {
+      affinityProjectId?: string | null;
+      /**
+       * How a mention of the self project counts.
+       *
+       * `reference` (the default) is the strict rule every ACTION uses: only a
+       * construction that cannot be an address resolves the Jarvis repository,
+       * so "Jarvis fix the login bug" never retargets work at Jarvis itself.
+       *
+       * `any` is for read-only per-turn context enrichment, where a bare
+       * mention is enough. Being wrong there costs a paragraph of unused
+       * context, not a Job against the wrong repository.
+       */
+      selfMention?: 'reference' | 'any';
+    } = {},
+  ): ProjectResolution {
     const all = this.list();
-    const haystack = ` ${foldAccents(text)
-      .replace(/[^a-z0-9]+/g, ' ')
-      .trim()} `;
+    const tokens = tokenizeMessage(text);
 
     const byId = all.find((project) => text.includes(project.id));
     if (byId) {
@@ -565,43 +688,43 @@ export class ProjectService {
     }
 
     const exact: Project[] = [];
-    const mentioned: Project[] = [];
+    const mentioned: { project: Project; reference: ProjectReference }[] = [];
     for (const project of all) {
       const keys = projectNameKeys(project);
       if (keys.some((key) => normaliseProjectName(text) === key)) {
         exact.push(project);
         continue;
       }
+      const reference = classifyProjectReference(tokens, keys);
+      if (reference === 'none') continue;
       // The self project is excluded from generic name containment on purpose.
       // Its name, its repository basename and its aliases are all the word the
-      // user says to ADDRESS it, so any key-based match here fires on "Jarvis
-      // fix the login bug" and outranks the conversation's own project. It
-      // qualifies through an explicit reference instead; the exact tier above
-      // still resolves a message that is nothing but the name.
-      if (project.isSelf) {
-        if (mentionsSelfProject(haystack)) mentioned.push(project);
-        continue;
-      }
-      // Word-boundary containment on the normalised text, so "sitepilot" in
-      // "Implement OAuth in Sitepilot" matches and "pilot" alone does not.
-      if (keys.some((key) => key && haystack.includes(` ${key.replace(/-/g, ' ')} `))) {
-        mentioned.push(project);
-      }
+      // user says to ADDRESS it, so a bare match here fires on "Jarvis fix the
+      // login bug" and outranks the conversation's own project. It qualifies
+      // through a construction that cannot be address instead; the exact tier
+      // above still resolves a message that is nothing but the name.
+      if (project.isSelf && reference !== 'strong' && options.selfMention !== 'any') continue;
+      mentioned.push({ project, reference });
     }
 
+    const exactTier = exact.map((project) => ({
+      project,
+      reference: 'strong' as ProjectReference,
+    }));
     for (const [group, reason, confidence] of [
-      [exact, 'exact project name or alias', 1],
+      [exactTier, 'exact project name or alias', 1],
       [mentioned, 'project named in the message', 0.85],
     ] as const) {
-      const usable = group.filter((project) => !project.archivedAt);
+      const usable = group.filter((entry) => !entry.project.archivedAt);
       const pool = usable.length ? usable : group;
-      if (pool.length === 1) {
-        return { status: 'resolved', project: pool[0] as Project, confidence, reason };
+      const chosen = pool[0];
+      if (pool.length === 1 && chosen) {
+        return { status: 'resolved', project: chosen.project, confidence, reason };
       }
       if (pool.length > 1) {
         return {
           status: 'ambiguous',
-          candidates: pool,
+          candidates: pool.map((entry) => entry.project),
           reason: `${pool.length} projects match that name`,
         };
       }
@@ -620,6 +743,69 @@ export class ProjectService {
     }
     return { status: 'none', reason: 'no project was named and this conversation has no project' };
   }
+}
+
+/** Ceilings for the registry rendered into every conversation. */
+const REGISTRY_LIMITS = { projects: 12, aliases: 3, stack: 6, summary: 160, total: 2400 } as const;
+
+/**
+ * The compact list of projects Jarvis has registered, for a model prompt.
+ *
+ * The point is that the conversational model should never have to ask where a
+ * repository lives — that was the most visible symptom of the regression this
+ * fixes. It is informational only: `ProjectService.resolve` remains the sole
+ * authority for which project an operation actually targets, so a model that
+ * misreads this list can at worst name a project that trusted code then
+ * resolves for itself.
+ *
+ * Bounded on every axis, and deliberately narrow on content: names, aliases,
+ * path, stack, one-line summary and analysis status. Never `config`, which
+ * carries runtime commands and verification steps.
+ */
+export function renderProjectRegistry(projects: Project[]): string {
+  const cut = (value: string, max: number) =>
+    value.length > max ? `${value.slice(0, max - 1)}…` : value;
+  const entries = projects
+    .filter((project) => !project.archivedAt)
+    .slice(0, REGISTRY_LIMITS.projects)
+    .map((project) => {
+      const stack = [...project.stack.languages, ...project.stack.frameworks].slice(
+        0,
+        REGISTRY_LIMITS.stack,
+      );
+      const summary = project.summary?.replace(/\s+/g, ' ').trim();
+      return [
+        `- ${project.name}${project.isSelf ? ' (Jarvis itself)' : ''}`,
+        `  id: ${project.id}`,
+        `  path: ${project.rootPath}`,
+        project.aliases.length
+          ? `  aliases: ${project.aliases.slice(0, REGISTRY_LIMITS.aliases).join(', ')}`
+          : '',
+        stack.length ? `  stack: ${stack.join(', ')}` : '',
+        summary ? `  summary: ${cut(summary, REGISTRY_LIMITS.summary)}` : '',
+        project.profile
+          ? `  analysed: ${project.profile.analyzedAt} at ${project.profile.analyzedCommit.slice(0, 12)}`
+          : project.analysis
+            ? `  analysis: ${project.analysis.status}`
+            : '  analysed: never',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    });
+  if (entries.length === 0) return '';
+
+  const kept: string[] = [];
+  let used = 0;
+  for (const entry of entries) {
+    if (used + entry.length > REGISTRY_LIMITS.total) break;
+    kept.push(entry);
+    used += entry.length + 1;
+  }
+  if (kept.length === 0) return '';
+  const omitted = projects.filter((project) => !project.archivedAt).length - kept.length;
+  return [kept.join('\n'), omitted > 0 ? `- (${omitted} more not listed)` : '']
+    .filter(Boolean)
+    .join('\n');
 }
 
 /** Aliases are stored normalised so lookups never depend on how they were typed. */

@@ -16,7 +16,13 @@ export type MemoryKind =
 export type MemoryStatus = 'active' | 'superseded' | 'expired' | 'deleted';
 
 export type MemorySourceType =
-  'user_explicit' | 'job_consolidation' | 'agent_proposal' | 'system' | 'import';
+  | 'user_explicit'
+  | 'job_consolidation'
+  | 'agent_proposal'
+  /** Written by a bounded read-only project analysis run. */
+  | 'project_analysis'
+  | 'system'
+  | 'import';
 
 export interface MemorySourceRef {
   sessionId?: string;

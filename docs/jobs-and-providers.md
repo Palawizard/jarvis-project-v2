@@ -39,6 +39,70 @@ Planning is deterministic: inspect the committed base, create an isolated worktr
 - Every deterministic routing decision records role, provider, model, reason, overrides, availability, avoidance, task profile, and time.
 - Model profiles are cheap rules: mechanical work uses economy, ordinary work balanced, and high-risk/self-development quality. Explicit provider environment overrides remain authoritative when usable.
 
+### Roles and what each one may touch
+
+| Role | Working directory | Tools |
+| --- | --- | --- |
+| `implementer`, `fixer`, `visual_fixer` | Isolated job worktree | Full; Codex runs `workspace-write` |
+| `reviewer` | Job worktree, read-only | Read-only permission mode; Codex `read-only` |
+| `visual_reviewer` | Artifact directory | `Read` only |
+| `project_analyst` | Disposable worktree pinned to the project's committed HEAD, confined by `--restricted` | `Read,Glob,Grep` only — never Bash, Edit or Task |
+| `chat` | Empty scratch directory, never a repository and never the Jarvis home | **None** |
+| `router` | Empty scratch directory | **None** |
+| `autostart_verifier` | Empty scratch directory | **None** |
+
+The last three are deliberately separate roles even though their confinement is
+identical, because what they are trusted with is not. `chat` answers you and may
+*request* a structured action. `router` classifies one message into a bounded
+schema. `autostart_verifier` names the repository it thinks is meant, in a fresh
+context, and its agreement is required before any unattended write-capable agent
+starts. Folding them into one role would make "one model said so" sufficient
+again, which is the thing the split exists to prevent. Neither routing role can
+call a tool, create a Job, or reach the database.
+
+Their confinement is identical; their **inputs deliberately are not**. The
+verifier is shown the router's conclusion — three bounded values, so that
+trusted code can tell whether the two agree — and nothing else the router wrote:
+no reasoning, no wording, no clarification question. It is also shown strictly
+less than the router is: no transcript, no project summary or analysis profile,
+no memories and no rendered tool output. Two runs over the same inputs are one
+opinion counted twice, so a decision that only holds in the light of something
+another model wrote fails the second check by construction. See
+`docs/conversations.md` for the full provenance rule.
+
+Four roles make a promise the provider itself has to keep, so none is routed to
+a provider that cannot keep it. `chat`, `router` and `autostart_verifier`
+promise no tools and need `toolFreeChat`; `project_analyst` promises an exact
+read-only allowlist and needs `enforcesToolAllowlist`. Only Claude declares
+either today. Codex's `read-only` sandbox prevents writes but still runs shell
+commands, which is not the same guarantee, so it serves none of them — a role
+goes unserved rather than being served with a weaker promise than the one stated
+here.
+
+Every tool-free role is tool-free at two independent levels, because one of them
+is a flag in someone else's release process. Configuration: `--tools ''`
+disables the whole built-in set, `--disallowed-tools` additionally names by hand
+the tools whose appearance here would be a security event (`AskUserQuestion`,
+`Task`, `Explore`, `Bash`, `Edit`, `Read`, …), `--permission-mode plan` denies
+writes, and `--restricted` confines the file tools to the working directory —
+which is what the analyst needs, since it is told to read a registered
+repository's README and CLAUDE.md and those are somebody else's text. Runtime:
+if a tool-free run emits any provider-native tool-use event anyway, that is a
+**protocol violation** — the run is aborted, its output is discarded rather than
+shown as an answer or parsed as a decision, and the tool event is never
+forwarded, so nothing downstream can render a provider's own question as Jarvis
+UI or accept a provider subagent's exploration as conversation. Codex is never
+routed to any of them: it does not declare `toolFreeChat`, and its `read-only`
+sandbox is read-only, not tool-free. A structured `jarvis-action` block is text,
+not a tool call, and is unaffected.
+
+Routing runs use the balanced model profile and a 90-second ceiling rather than
+the 30-minute agent timeout: a one-sentence classification that has not answered
+in that long has failed, not thought harder. Every message in a workspace with a
+registered project spends one such run, and a message that routes to a code
+change spends two. There is no retry and no third opinion, so a turn costs at
+most two classifications however badly they go.
+
 Authentication is always delegated to the installed CLI. Jarvis never reads OAuth tokens or requires API credits.
 
 ## Verification and review

@@ -1,15 +1,19 @@
 import type { Db } from '../db/index.js';
 import { nowIso } from '../ids.js';
 import {
+  FIXTURE_ANALYSED_PROJECT_ID,
+  FIXTURE_ANALYSIS_FAILED_PROJECT_ID,
   FIXTURE_CHAT_ID,
   FIXTURE_PAUSED_JOB_ID,
+  VISUAL_FIXTURE_PROFILES,
   type VisualFixtureProfile,
 } from '../visualqa/surfaces.js';
+import { PROJECT_PROFILE_VERSION } from '../projects/profile.js';
 
 /** Env var through which the trusted parent asks a candidate for fixture state. */
 export const CANDIDATE_FIXTURE_ENV = 'JARVIS_CANDIDATE_QA_FIXTURES';
 
-const PROFILES: readonly VisualFixtureProfile[] = ['paused-job', 'chat-workspace'];
+const PROFILES: readonly VisualFixtureProfile[] = VISUAL_FIXTURE_PROFILES;
 
 /**
  * Which fixture profiles this process was asked to seed.
@@ -47,6 +51,10 @@ export function seedCandidateFixtures(
     }
     if (profile === 'chat-workspace') {
       seedChatWorkspace(db, opts.projectId);
+      seeded.push(profile);
+    }
+    if (profile === 'project-analysis') {
+      seedProjectAnalysis(db, opts.projectId);
       seeded.push(profile);
     }
   }
@@ -193,6 +201,104 @@ function seedChatWorkspace(db: Db, projectId: string): void {
     now,
     null,
     now,
+  );
+}
+
+/**
+ * Two synthetic projects, one per analysis state.
+ *
+ * They borrow the self project's `root_path` — a real repository — because the
+ * stale indicator is a comparison against a real HEAD. Pointing them at a
+ * non-existent path made `profileStaleness` return `head: null`, which is
+ * `stale: false`, so the "out of date" badge and its explanation were
+ * unreachable in the captured evidence and the scenario silently photographed a
+ * state it was not there to test. The analysed commit below exists in no
+ * repository, so against a real HEAD it is always stale.
+ */
+function seedProjectAnalysis(db: Db, selfProjectId: string): void {
+  const now = nowIso();
+  const selfRow = db.prepare('SELECT root_path FROM projects WHERE id = ?').get(selfProjectId) as
+    { root_path?: string } | undefined;
+  const rootPath = selfRow?.root_path ?? '/qafixture/project';
+  const insert = (
+    id: string,
+    name: string,
+    profile: string | null,
+    analysis: string | null,
+  ): void => {
+    db.prepare(
+      `INSERT OR REPLACE INTO projects (id, name, root_path, default_branch, stack, commands,
+        dev_url, summary, is_self, aliases, archived_at, config, profile, analysis, created_at,
+        updated_at)
+       VALUES (?,?,?,?,?,?,NULL,?,0,?,NULL,'{}',?,?,?,?)`,
+    ).run(
+      id,
+      name,
+      rootPath,
+      'main',
+      JSON.stringify({
+        languages: ['typescript'],
+        frameworks: ['react', 'hono'],
+        packageManager: 'pnpm',
+        hasTests: true,
+      }),
+      JSON.stringify({ install: 'pnpm install', test: 'pnpm test', build: 'pnpm build' }),
+      'Visual QA fixture project.',
+      JSON.stringify(['qafixture']),
+      profile,
+      analysis,
+      now,
+      now,
+    );
+  };
+
+  insert(
+    FIXTURE_ANALYSED_PROJECT_ID,
+    'qafixture-analysed',
+    JSON.stringify({
+      version: PROJECT_PROFILE_VERSION,
+      purpose: 'A local-first assistant that plans, runs and reviews coding jobs on this machine.',
+      architecture:
+        'A pnpm monorepo: a core domain package owning SQLite persistence, a Hono HTTP and SSE ' +
+        'orchestrator, and a React single-page UI served by Vite.',
+      languages: ['typescript'],
+      frameworks: ['react', 'hono', 'vite'],
+      modules: [
+        { name: 'core', path: 'packages/core', purpose: 'domain logic and SQLite persistence' },
+        { name: 'orchestrator', path: 'apps/orchestrator', purpose: 'HTTP and SSE surface' },
+        { name: 'web', path: 'apps/web', purpose: 'React operator interface' },
+      ],
+      entrypoints: ['apps/web/src/main.tsx', 'apps/orchestrator/src/server.ts'],
+      importantPaths: ['packages/core/src/db', 'packages/core/src/tools'],
+      testStrategy: 'Vitest unit tests beside the source; Playwright drives the browser surfaces.',
+      buildWorkflow: 'pnpm install, then pnpm dev for the whole stack.',
+      deploymentNotes: 'Runs locally under an external supervisor that owns activation.',
+      conventions: ['Every capability goes through the tool permission boundary.'],
+      integrations: ['Claude Code CLI', 'Codex CLI'],
+      dataStores: ['SQLite at ~/.jarvis/jarvis.db'],
+      risks: ['Migrations must preserve existing memories, jobs and projects.'],
+      inspectFirst: ['CLAUDE.md', 'packages/core/src/jarvis.ts'],
+      memorable: ['Jarvis memory is canonical; provider sessions are not product memory.'],
+      analyzedAt: '2026-08-24T09:30:00.000Z',
+      analyzedCommit: 'a'.repeat(40),
+      provider: 'claude',
+      model: 'sonnet',
+      memoryIds: [],
+    }),
+    null,
+  );
+
+  insert(
+    FIXTURE_ANALYSIS_FAILED_PROJECT_ID,
+    'qafixture-analysis-failed',
+    null,
+    JSON.stringify({
+      status: 'failed',
+      startedAt: '2026-08-24T09:30:00.000Z',
+      finishedAt: '2026-08-24T09:33:00.000Z',
+      error: 'Provider usage limit reached before the analysis finished.',
+      provider: 'claude',
+    }),
   );
 }
 

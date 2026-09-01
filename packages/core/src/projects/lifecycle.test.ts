@@ -191,6 +191,49 @@ describe('project aliases and natural resolution', () => {
     expect(projects.resolve('Jarvis fix the login bug').status).toBe('none');
   });
 
+  it('recognises French references to the self project, and only French ones', () => {
+    // The deployed regression: every self-reference construction was English,
+    // so "code sur le projet Jarvis ..." named the project unmistakably and
+    // resolved to nothing at all.
+    for (const text of [
+      'code sur le projet Jarvis une nouvelle implémentation',
+      'ajoute cette feature à Jarvis',
+      'corrige ce bug dans Jarvis',
+      'code ça sur Jarvis',
+      'où est le projet Jarvis',
+      'explique-moi le code de Jarvis',
+    ]) {
+      const resolved = projects.resolve(text, { affinityProjectId: sitepilot.id });
+      expect(`${text} -> ${resolved.status}`).toBe(`${text} -> resolved`);
+      if (resolved.status === 'resolved') expect(resolved.project.id).toBe(self.id);
+    }
+
+    // "à" and the English article "a" are the same token once accents are
+    // folded, so " a jarvis " used to match. Combined with the imperative
+    // router that started an agent on Jarvis's own repository from a sentence
+    // about somebody else's code.
+    for (const text of [
+      'write a jarvis plugin for slack',
+      'add a Jarvis webhook to the deploy script',
+      'create a jarvis dashboard widget',
+      'add a jarvis style logger',
+    ]) {
+      const resolved = projects.resolve(text, { affinityProjectId: sitepilot.id });
+      expect(`${text} -> ${resolved.status}`).toBe(`${text} -> resolved`);
+      if (resolved.status === 'resolved') expect(resolved.project.id).toBe(sitepilot.id);
+    }
+    expect(projects.resolve('write a jarvis plugin for slack').status).toBe('none');
+  });
+
+  it('separates a reference from a bare mention, and only relaxes on request', () => {
+    // Strict is what every ACTION uses. The relaxed form exists so a question
+    // in a conversation with no project still gets that project's context.
+    expect(projects.resolve('quelle stack utilise Jarvis').status).toBe('none');
+    const relaxed = projects.resolve('quelle stack utilise Jarvis', { selfMention: 'any' });
+    expect(relaxed.status).toBe('resolved');
+    if (relaxed.status === 'resolved') expect(relaxed.project.id).toBe(self.id);
+  });
+
   it('drops archived projects from default candidates but still resolves them when named', () => {
     projects.setArchived(sitepilot.id, true);
     expect(projects.list({ status: 'active' }).map((p) => p.id)).not.toContain(sitepilot.id);
@@ -246,6 +289,100 @@ describe('project unregister semantics', () => {
     expect(db.prepare('SELECT project_id FROM jobs WHERE id = ?').get(jobId)).toEqual({
       project_id: project.id,
     });
+  });
+
+  it('does not let its own analysis notes turn every project into a soft archive', async () => {
+    // Analysis is offered by default when a project is registered, and it
+    // writes project memories. Counted as history, those would make every
+    // freshly registered project soft-archive instead of unregistering
+    // outright — silently changing the documented semantics for the common
+    // case, from Jarvis's own notes rather than from anything the user did.
+    const project = await projects.register({ rootPath: repo('analysed') });
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO memories (id, scope, scope_id, kind, content, source_type, content_hash,
+        created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      'mem_analysis',
+      'project',
+      project.id,
+      'project_knowledge',
+      'Jarvis is a local-first assistant.',
+      'project_analysis',
+      'hash-analysis',
+      now,
+      now,
+    );
+
+    expect(projects.unregisterPreflight(project.id)).toMatchObject({ mode: 'hard', memories: 0 });
+
+    // ...and the hard path must then take those memories WITH it. `scope_id` is
+    // a plain column with no foreign key, so nothing in the schema would clean
+    // up after the row: discounting them from the decision without deleting
+    // them is how you get memory rows pointing at a project that no longer
+    // exists.
+    expect(projects.unregister(project.id)).toMatchObject({ removed: true, mode: 'hard' });
+    expect(projects.get(project.id)).toBeNull();
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM memories WHERE scope_id = ?').get(project.id),
+    ).toEqual({ n: 0 });
+  });
+
+  it('keeps the project and its memory intact when a hard unregister fails', async () => {
+    const project = await projects.register({ rootPath: repo('atomic') });
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO memories (id, scope, scope_id, kind, content, source_type, content_hash,
+        created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      'mem_atomic',
+      'project',
+      project.id,
+      'project_knowledge',
+      'Analysis note.',
+      'project_analysis',
+      'hash-atomic',
+      now,
+      now,
+    );
+    // A row that cannot be deleted: jobs.project_id is ON DELETE CASCADE, so
+    // instead make the project row itself unreachable mid-transaction by
+    // pointing the delete at a project that vanishes first. Simplest faithful
+    // stand-in: delete the row out from under the transaction.
+    db.prepare('DELETE FROM projects WHERE id = ?').run(project.id);
+
+    expect(() => projects.unregister(project.id)).toThrow();
+    // The memory delete rolled back with the failed project delete.
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM memories WHERE scope_id = ?').get(project.id),
+    ).toEqual({ n: 1 });
+  });
+
+  it('still soft-archives when the user stated something about the project', async () => {
+    const project = await projects.register({ rootPath: repo('remembered') });
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO memories (id, scope, scope_id, kind, content, source_type, content_hash,
+        created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      'mem_user',
+      'project',
+      project.id,
+      'constraint',
+      'Deploy only on Tuesdays.',
+      'user_explicit',
+      'hash-user',
+      now,
+      now,
+    );
+
+    expect(projects.unregisterPreflight(project.id)).toMatchObject({ mode: 'soft', memories: 1 });
+    projects.unregister(project.id);
+    // Soft: the row is archived, so the memory still has a project to belong to.
+    expect(projects.get(project.id)?.archivedAt).toBeTruthy();
+    expect(
+      db.prepare('SELECT COUNT(*) AS n FROM memories WHERE scope_id = ?').get(project.id),
+    ).toEqual({ n: 1 });
   });
 
   it('hard-removes only a registration nothing depends on', async () => {

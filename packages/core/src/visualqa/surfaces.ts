@@ -2,11 +2,20 @@ import type { Job } from '../jobs/service.js';
 import type { Project, VisualQaScenario } from '../projects/service.js';
 
 /** Fixture profiles a candidate runtime may be asked to seed for Visual QA. */
-export type VisualFixtureProfile = 'paused-job' | 'chat-workspace';
+export const VISUAL_FIXTURE_PROFILES = [
+  'paused-job',
+  'chat-workspace',
+  'project-analysis',
+] as const;
+
+export type VisualFixtureProfile = (typeof VISUAL_FIXTURE_PROFILES)[number];
 
 /** Deterministic id of the synthetic paused Job the `paused-job` fixture seeds. */
 export const FIXTURE_PAUSED_JOB_ID = 'job_qafixture_paused';
 export const FIXTURE_CHAT_ID = 'session_qafixture_chat';
+/** Projects the `project-analysis` fixture seeds, one per analysis state. */
+export const FIXTURE_ANALYSED_PROJECT_ID = 'prj_qafixture_analysed';
+export const FIXTURE_ANALYSIS_FAILED_PROJECT_ID = 'prj_qafixture_analysis_failed';
 
 export interface VisualQaPlan {
   source: 'job_override' | 'changed_surface' | 'project_default';
@@ -159,6 +168,35 @@ export const SELF_VISUAL_SURFACES: SelfSurface[] = [
     name: 'projects',
     patterns: [/^apps\/web\/src\/views\/Projects[^/]*\.tsx$/i],
     scenario: navSurface('nav-projects', 'projects-view'),
+  },
+  {
+    // An analysed project: the profile, its provenance, and the stale badge.
+    // The fixture points at a real repository and records an analysed commit
+    // that repository has never had, which is exactly the "the repository has
+    // moved on" state the badge exists for.
+    name: 'project-analysis',
+    patterns: [/^apps\/web\/src\/views\/Projects[^/]*\.tsx$/i],
+    scenario: {
+      route: `/projects/${FIXTURE_ANALYSED_PROJECT_ID}`,
+      fixture: 'project-analysis',
+      expectedSelector: testId('analysis-status'),
+      viewports: VIEWPORTS,
+    },
+  },
+  {
+    // The other half of the state machine: a failed run, its reason, and the
+    // retry. A project whose analysis failed must still look like a project.
+    name: 'project-analysis-failed',
+    patterns: [/^apps\/web\/src\/views\/Projects[^/]*\.tsx$/i],
+    scenario: {
+      route: `/projects/${FIXTURE_ANALYSIS_FAILED_PROJECT_ID}`,
+      fixture: 'project-analysis',
+      // The status row, not the button: the button renders on every project
+      // detail page whatever the analysis state, so it could not tell a failed
+      // run from any other and the scenario would pass without showing one.
+      expectedSelector: testId('analysis-status'),
+      viewports: VIEWPORTS,
+    },
   },
   {
     name: 'jobs-list',

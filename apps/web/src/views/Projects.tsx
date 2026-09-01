@@ -1,5 +1,11 @@
-import { useMemo, useState } from 'react';
-import { api, type Memory, type Project, type UnregisterPreflight } from '../api.ts';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  api,
+  type JarvisEvent,
+  type Memory,
+  type Project,
+  type UnregisterPreflight,
+} from '../api.ts';
 import {
   Badge,
   Card,
@@ -15,12 +21,14 @@ import { approvePending } from './Chat.tsx';
 export function ProjectsView({
   projects,
   selectedId,
+  lastEvent,
   onSelect,
   onOpenJob,
   onChanged,
 }: {
   projects: Project[];
   selectedId?: string;
+  lastEvent: JarvisEvent | null;
   onSelect: (id?: string) => void;
   onOpenJob: (id: string) => void;
   onChanged: () => void;
@@ -28,6 +36,7 @@ export function ProjectsView({
   return selectedId ? (
     <ProjectDetail
       id={selectedId}
+      lastEvent={lastEvent}
       onBack={() => onSelect()}
       onOpenJob={onOpenJob}
       onChanged={onChanged}
@@ -48,6 +57,10 @@ function ProjectList({
 }) {
   const [rootPath, setRootPath] = useState('');
   const [devUrl, setDevUrl] = useState('');
+  // On by default: a project Jarvis knows nothing about is a project it answers
+  // questions about badly. The cost is stated next to the box, and registration
+  // succeeds whatever the analysis does.
+  const [analyze, setAnalyze] = useState(true);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<'active' | 'archived' | 'all'>('active');
   const [sort, setSort] = useState<'name' | 'updated'>('name');
@@ -80,7 +93,7 @@ function ProjectList({
     setBusy(true);
     setError(null);
     try {
-      await api.addProject(rootPath.trim(), undefined, devUrl.trim() || undefined);
+      await api.addProject(rootPath.trim(), undefined, devUrl.trim() || undefined, analyze);
       setRootPath('');
       setDevUrl('');
       onChanged();
@@ -136,6 +149,21 @@ function ProjectList({
             Register
           </button>
         </div>
+        <label className="check" data-testid="analyze-on-add">
+          <input
+            type="checkbox"
+            checked={analyze}
+            onChange={(event) => setAnalyze(event.target.checked)}
+          />
+          <span>
+            Analyse the project after adding it
+            <span className="tiny faint">
+              {' '}
+              — a read-only coding agent reads the repository once to learn its stack and
+              architecture. Uses provider quota; registration succeeds either way.
+            </span>
+          </span>
+        </label>
         <p className="tiny faint">
           Jarvis registers metadata only. It never deletes the repository from disk, and coding Jobs
           use isolated worktrees.
@@ -308,16 +336,25 @@ function ProjectList({
 
 function ProjectDetail({
   id,
+  lastEvent,
   onBack,
   onOpenJob,
   onChanged,
 }: {
   id: string;
+  lastEvent: JarvisEvent | null;
   onBack: () => void;
   onOpenJob: (id: string) => void;
   onChanged: () => void;
 }) {
   const detail = useAsync(() => api.project(id), [id]);
+  // Analysis finishes minutes after the click, on the server. `lastEvent` is
+  // the same SSE stream the rest of the app watches; without this the profile
+  // appears only after a manual reload.
+  useEffect(() => {
+    if (lastEvent?.type.startsWith('project.')) detail.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastEvent]);
   const [request, setRequest] = useState('');
   const [memorySearch, setMemorySearch] = useState('');
   const [confirm, setConfirm] = useState<{ kind: 'purge' | 'forget'; memory?: Memory } | null>(
@@ -333,7 +370,7 @@ function ProjectDetail({
         {detail.error ? <div className="api-error">{detail.error}</div> : <Empty>Loading…</Empty>}
       </div>
     );
-  const { project, jobs, memory, snapshot } = detail.data;
+  const { project, jobs, memory, snapshot, analysis } = detail.data;
   const memories = memory.items.filter((item) =>
     [item.content, item.subject ?? '', item.sourceType].some((value) =>
       value.toLowerCase().includes(memorySearch.toLowerCase()),
@@ -378,17 +415,28 @@ function ProjectDetail({
           {project.isSelf && <Badge tone="accent">self-development target</Badge>}
           {project.archivedAt && <Badge>archived</Badge>}
         </div>
-        <button
-          className="btn sm"
-          onClick={() =>
-            void api.refreshProject(project.id).then(() => {
+        <div className="row">
+          <button
+            className="btn sm"
+            onClick={() =>
+              void api.refreshProject(project.id).then(() => {
+                detail.reload();
+                onChanged();
+              }, reportFailure)
+            }
+          >
+            Re-detect stack
+          </button>
+          <AnalyzeButton
+            project={project}
+            running={analysis.running}
+            onDone={() => {
               detail.reload();
               onChanged();
-            }, reportFailure)
-          }
-        >
-          Re-detect stack
-        </button>
+            }}
+            onError={reportFailure}
+          />
+        </div>
       </div>
       {error && (
         <div className="api-error" role="alert">
@@ -423,6 +471,15 @@ function ProjectDetail({
               detail.reload();
               onChanged();
             }}
+          />
+          <ProjectAnalysisCard
+            project={project}
+            analysis={analysis}
+            onChanged={() => {
+              detail.reload();
+              onChanged();
+            }}
+            onError={reportFailure}
           />
           <Card title="Repository state">
             <pre>{snapshot}</pre>
@@ -516,6 +573,187 @@ function ProjectDetail({
   );
 }
 
+type AnalysisMeta = { running: boolean; stale: boolean; head: string | null };
+
+/** True while a run is claimed, whether the server or the row says so. */
+function analysisInFlight(project: Project, analysis: AnalysisMeta): boolean {
+  return (
+    analysis.running ||
+    project.analysis?.status === 'running' ||
+    project.analysis?.status === 'queued'
+  );
+}
+
+function AnalyzeButton({
+  project,
+  running,
+  onDone,
+  onError,
+}: {
+  project: Project;
+  running: boolean;
+  onDone: () => void;
+  onError: (reason: unknown) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const inFlight =
+    running || project.analysis?.status === 'running' || project.analysis?.status === 'queued';
+  const label = inFlight
+    ? 'Analysing…'
+    : project.profile
+      ? 'Re-analyse project'
+      : 'Analyse project';
+  return (
+    <button
+      className="btn sm primary"
+      data-testid="analyze-project"
+      disabled={busy || inFlight}
+      title="Sends a read-only agent to read this repository. Uses provider quota."
+      onClick={() => {
+        setBusy(true);
+        void api
+          .analyzeProject(project.id)
+          .then(onDone, onError)
+          .finally(() => setBusy(false));
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+/**
+ * What Jarvis has learned about this project, and how current it is.
+ *
+ * Deliberately explicit about staleness rather than hiding an old profile: a
+ * profile from six commits ago is still the best orientation available, and
+ * pretending otherwise would mean re-analysing on every commit and burning
+ * provider quota for nothing.
+ */
+function ProjectAnalysisCard({
+  project,
+  analysis,
+  onChanged,
+  onError,
+}: {
+  project: Project;
+  analysis: AnalysisMeta;
+  onChanged: () => void;
+  onError: (reason: unknown) => void;
+}) {
+  const profile = project.profile;
+  const inFlight = analysisInFlight(project, analysis);
+  const failed = project.analysis?.status === 'failed';
+  return (
+    <Card
+      title="Project analysis"
+      actions={
+        inFlight ? (
+          <button
+            className="btn sm"
+            data-testid="cancel-analysis"
+            onClick={() => void api.cancelProjectAnalysis(project.id).then(onChanged, onError)}
+          >
+            Stop
+          </button>
+        ) : (
+          <AnalyzeButton
+            project={project}
+            running={analysis.running}
+            onDone={onChanged}
+            onError={onError}
+          />
+        )
+      }
+    >
+      <div className="row wrap" data-testid="analysis-status">
+        {inFlight && <Badge tone="run">analysing</Badge>}
+        {!inFlight && failed && <Badge tone="err">analysis failed</Badge>}
+        {!inFlight && !failed && profile && <Badge tone="ok">analysed</Badge>}
+        {!inFlight && !failed && !profile && <Badge>not analysed</Badge>}
+        {profile && analysis.stale && <Badge tone="warn">out of date</Badge>}
+      </div>
+      {failed && project.analysis?.error && (
+        <p className="tiny" role="alert">
+          {project.analysis.error}
+        </p>
+      )}
+      {!profile && !inFlight && (
+        <Empty>
+          Jarvis has not read this repository yet. Analysing it once lets Jarvis answer questions
+          about the project and gives coding Jobs a head start.
+        </Empty>
+      )}
+      {profile && (
+        <>
+          <p className="tiny faint">
+            {new Date(profile.analyzedAt).toLocaleString()} · commit{' '}
+            <span className="mono">{profile.analyzedCommit.slice(0, 12)}</span>
+            {profile.provider ? ` · ${profile.provider}` : ''}
+            {profile.model ? ` (${profile.model})` : ''}
+          </p>
+          {analysis.stale && (
+            <p className="tiny faint">
+              The repository has moved on since this analysis. It is still used as orientation —
+              re-analyse when it stops matching what you see.
+            </p>
+          )}
+          {profile.purpose && <p>{profile.purpose}</p>}
+          {profile.architecture && <p className="small dim">{profile.architecture}</p>}
+          <dl className="profile-grid">
+            <ProfileList label="Languages" values={profile.languages} inline />
+            <ProfileList label="Frameworks" values={profile.frameworks} inline />
+            <ProfileList
+              label="Modules"
+              values={profile.modules.map((module) =>
+                [module.name, module.path].filter(Boolean).join(' — '),
+              )}
+            />
+            <ProfileList label="Entrypoints" values={profile.entrypoints} />
+            <ProfileList label="Conventions" values={profile.conventions} />
+            <ProfileList label="Risks" values={profile.risks} />
+            <ProfileList label="Read first" values={profile.inspectFirst} />
+          </dl>
+          <p className="tiny faint">
+            Orientation only. Jarvis still runs the commands it detected itself — nothing an
+            analysis writes is ever executed.
+          </p>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function ProfileList({
+  label,
+  values,
+  inline,
+}: {
+  label: string;
+  values: string[];
+  inline?: boolean;
+}) {
+  if (values.length === 0) return null;
+  return (
+    <>
+      <dt>{label}</dt>
+      <dd>
+        {inline ? (
+          values.join(', ')
+        ) : (
+          <ul>
+            {/* Index keys: these lists are model-produced, render-only and never
+                reordered, and duplicate entries are possible. */}
+            {values.map((value, index) => (
+              <li key={`${index}-${value}`}>{value}</li>
+            ))}
+          </ul>
+        )}
+      </dd>
+    </>
+  );
+}
+
 function ProjectSettings({ project, onSaved }: { project: Project; onSaved: () => void }) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [name, setName] = useState(project.name);
@@ -575,7 +813,7 @@ function ProjectSettings({ project, onSaved }: { project: Project; onSaved: () =
           </div>
         )}
       </div>
-      <div className="tiny faint mono">
+      <div className="tiny faint mono project-meta">
         {project.rootPath} · {project.defaultBranch} · updated{' '}
         {new Date(project.updatedAt).toLocaleString()}
       </div>

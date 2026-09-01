@@ -25,8 +25,19 @@ const BOUNDS = {
   route: 200,
   value: 400,
   waitMs: 30_000,
-  /** Whole-catalog declared wait budget: bounded counts alone still allow hours. */
-  declaredMs: 30 * 60_000,
+  /**
+   * Whole-catalog worst-case budget: bounded counts alone still allow hours.
+   *
+   * It is not purely a "declared waiting" bound. Every capture also carries a
+   * fixed navigation and settle cost the engine pays regardless of what the
+   * catalog asks for (`ENGINE_CAPTURE_MS`), so the total grows with the number
+   * of scenarios times viewports. Thirty minutes started to bind on catalog
+   * SIZE rather than on pathological waits, which would have meant dropping
+   * required evidence for new UI to stay under it — the wrong trade. Forty-five
+   * still refuses a catalog that declares absurd waits, which is what this
+   * bound is for, and this is a worst case in which every selector times out.
+   */
+  declaredMs: 45 * 60_000,
   reasons: 200,
 } as const;
 

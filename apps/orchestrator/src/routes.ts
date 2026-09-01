@@ -212,6 +212,7 @@ export function createRoutes(jarvis: Jarvis): Hono {
       rootPath?: string;
       name?: string;
       devUrl?: string;
+      analyze?: unknown;
     };
     if (!body.rootPath) return fail('rootPath is required');
     try {
@@ -220,18 +221,32 @@ export function createRoutes(jarvis: Jarvis): Hono {
         ...(body.name ? { name: body.name } : {}),
         ...(body.devUrl ? { devUrl: body.devUrl } : {}),
       });
-      return c.json(project, 201);
+      // Registration is the operation the user asked for. Analysis is an extra
+      // that spends provider quota, so it is kicked off separately and its
+      // failure is recorded on the project rather than failing the creation.
+      if (body.analyze === true) {
+        await jarvis.tools
+          .execute('project.analyze', { id: project.id }, { actor: 'user', projectId: project.id })
+          .catch(() => undefined);
+      }
+      return c.json(jarvis.projects.get(project.id) ?? project, 201);
     } catch (error) {
       return fail(error instanceof Error ? error.message : String(error));
     }
   });
 
-  app.get('/api/projects/:id', (c) => {
+  app.get('/api/projects/:id', async (c) => {
     const project = jarvis.projects.get(c.req.param('id'));
     if (!project) return fail('project not found', 404);
+    const staleness = await jarvis.projects.profileStaleness(project);
     return c.json({
       project,
-      snapshot: renderProjectSnapshot(project),
+      snapshot: renderProjectSnapshot(project, { stale: staleness.stale }),
+      analysis: {
+        running: jarvis.projectAnalysis.isRunning(project.id),
+        stale: staleness.stale,
+        head: staleness.head,
+      },
       jobs: jarvis.jobs.list({ projectId: project.id, limit: 20 }),
       memory: jarvis.memory.list({ scope: 'project', scopeId: project.id, limit: 100 }),
     });
@@ -290,6 +305,30 @@ export function createRoutes(jarvis: Jarvis): Hono {
     const id = c.req.param('id');
     if (!jarvis.projects.get(id)) return fail('project not found', 404);
     return c.json(await jarvis.tools.execute('project.unregister', { id }, { actor: 'user' }));
+  });
+
+  /**
+   * Start a bounded read-only analysis. Returns immediately: the run outlives
+   * this request, and its state lives on the project row.
+   */
+  app.post('/api/projects/:id/analyze', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.projects.get(id)) return fail('project not found', 404);
+    return settled(
+      await jarvis.tools.execute('project.analyze', { id }, { actor: 'user', projectId: id }),
+    );
+  });
+
+  app.post('/api/projects/:id/analyze/cancel', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.projects.get(id)) return fail('project not found', 404);
+    return settled(
+      await jarvis.tools.execute(
+        'project.analyze.cancel',
+        { id },
+        { actor: 'user', projectId: id },
+      ),
+    );
   });
 
   app.post('/api/projects/:id/refresh', async (c) => {
@@ -635,6 +674,13 @@ export function createRoutes(jarvis: Jarvis): Hono {
     if (!body.projectId || !body.request) return fail('projectId and request are required');
     const project = jarvis.projects.get(body.projectId);
     if (!project) return fail('project not found', 404);
+    // Archived means "not somewhere work happens", and this route starts an
+    // agent inside a real checkout. Routing already refuses to offer or accept
+    // an archived project, but the clarification buttons in a transcript are
+    // rendered from a message stored earlier — so a project archived between
+    // the question and the click was still reachable here, and nothing
+    // downstream re-checked: `pipeline.execute` only resolves the row.
+    if (project.archivedAt) return fail('project is archived');
     if (body.validationOnly && !body.candidateSource) {
       return fail('validationOnly requires candidateSource');
     }
@@ -713,6 +759,14 @@ export function createRoutes(jarvis: Jarvis): Hono {
       validationOnly: body.validationOnly ?? false,
       ...(visualQa ? { visualQa } : {}),
     });
+    // The conversation has to end up pointing at the Job it asked for. The
+    // chat tool does this itself; this route is the path the candidate button
+    // in a clarification takes, and without it a Job started that way left no
+    // card in the transcript -- so the only visible outcome of clicking was
+    // that nothing appeared to happen, and the obvious response was to click
+    // again. (Clicking again is harmless now -- `create` is idempotent in
+    // `originMessageId` -- but invisible work is still a bug.)
+    if (body.originMessageId) jarvis.sessions.linkMessageJob(body.originMessageId, job.id);
     if (body.autostart) jarvis.pipeline.start(job.id);
     return c.json(job, 201);
   });

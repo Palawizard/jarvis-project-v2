@@ -8,6 +8,9 @@ import type { VisualQaPlan } from '../visualqa/surfaces.js';
 import type { ReviewFinding } from '../review/engine.js';
 import type { VisualReviewFinding } from '../visualqa/engine.js';
 import { redactSecrets } from '../memory/secrets.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('jobs');
 
 export type RepairKind = 'verification' | 'code_review' | 'visual';
 export interface RepairCheckpoint {
@@ -196,6 +199,31 @@ export class JobService {
     if (input.visualQa && input.visualQa.scenarios.length === 0) {
       throw new Error('job visual QA override requires at least one scenario');
     }
+    // ONE JOB PER CHAT MESSAGE. A message that has already produced a Job gets
+    // that Job back, from every caller, rather than a second one.
+    //
+    // The paths that need this do not all go through the same code: the chat
+    // dispatcher creates through `job.create`, the candidate button in a
+    // clarification goes straight to `POST /api/jobs`, and crash recovery
+    // re-offers a turn whose Job already exists. A check in any one of them
+    // leaves the others open, so it lives here, underneath all three — and
+    // `jobs_origin_message` in migration 10 is a unique index, so a duplicate
+    // is refused by the database even if two writers race past this read.
+    //
+    // Returning the existing row rather than throwing keeps callers simple and
+    // is safe downstream: `pipeline.start` is a no-op on a Job that is not
+    // queued, so an autostarting caller resumes a crashed handoff instead of
+    // launching a second agent.
+    if (input.originMessageId) {
+      const existing = this.byOriginMessage(input.originMessageId);
+      if (existing) {
+        log.info('reusing the Job this message already created', {
+          jobId: existing.id,
+          originMessageId: input.originMessageId,
+        });
+        return existing;
+      }
+    }
     const now = nowIso();
     const job: Job = {
       id: newId('job'),
@@ -278,6 +306,18 @@ export class JobService {
 
   get(id: string): Job | null {
     const row = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as Row | undefined;
+    return row ? rowToJob(row) : null;
+  }
+
+  /**
+   * The Job a chat message created, if it created one.
+   *
+   * Archived Jobs count: the question this answers is "did this message already
+   * start work", and archiving is a filing decision, not an undo.
+   */
+  byOriginMessage(messageId: string): Job | null {
+    const row = this.db.prepare('SELECT * FROM jobs WHERE origin_message_id = ?').get(messageId) as
+      Row | undefined;
     return row ? rowToJob(row) : null;
   }
 

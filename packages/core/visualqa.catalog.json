@@ -188,6 +188,32 @@
       "expectedSelectorTimeoutMs": 10000
     },
     {
+      "name": "project-analysis",
+      "matchers": [
+        {
+          "prefix": "apps/web/src/views/Projects"
+        }
+      ],
+      "route": "/projects/prj_qafixture_analysed",
+      "fixture": "project-analysis",
+      "expectedSelector": "[data-testid='analysis-status']",
+      "viewports": ["desktop", "mobile"],
+      "expectedSelectorTimeoutMs": 10000
+    },
+    {
+      "name": "project-analysis-failed",
+      "matchers": [
+        {
+          "prefix": "apps/web/src/views/Projects"
+        }
+      ],
+      "route": "/projects/prj_qafixture_analysis_failed",
+      "fixture": "project-analysis",
+      "expectedSelector": "[data-testid='analysis-status']",
+      "viewports": ["desktop", "mobile"],
+      "expectedSelectorTimeoutMs": 10000
+    },
+    {
       "name": "jobs-list",
       "matchers": [
         {

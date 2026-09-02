@@ -170,6 +170,7 @@ export {
 export {
   VisualQaEngine,
   isEvidenceCoverageFailure,
+  validateVisualEvidence,
   isCandidateDevServerNoise,
   isCandidateStreamAbort,
   EVIDENCE_COVERAGE_PREFIX,
@@ -177,7 +178,6 @@ export {
   type VisualReviewFinding,
 } from './visualqa/engine.js';
 export {
-  VisualReviewer,
   parseVisualReview,
   parseDurableVisualReview,
   serializeVisualReview,
@@ -196,9 +196,28 @@ export {
 export {
   resolveVisualPlanForCandidate,
   validateCatalog,
+  visualQaEligibility,
+  mobileRelevant,
   VisualQaPlanningError,
   VISUAL_QA_CATALOG_PATH,
 } from './visualqa/candidate-plan.js';
+export {
+  InteractiveVisualQaAgent,
+  type InteractiveVisualQaResult,
+  type VisualQaBrief,
+  type VisualQaCheck,
+  type VisualQaFinding,
+  type VisualQaVerdict,
+} from './visualqa/agent.js';
+export {
+  InteractiveVisualQaController,
+  BROWSER_ACTION,
+  BROWSER_ACTION_BATCH,
+  VISUAL_ACTION_SCHEMA_VERSION,
+  VISUAL_QA_BUDGET,
+  type BrowserAction,
+  type Observation,
+} from './visualqa/interactive.js';
 export {
   startCandidateRuntime,
   CandidateRuntimeUnsupportedError,

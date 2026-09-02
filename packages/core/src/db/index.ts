@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /**
  * A LIKE pattern for a term a human typed.
@@ -267,6 +267,15 @@ export const MIGRATIONS = new Map<number, string>([
 
     CREATE UNIQUE INDEX IF NOT EXISTS jobs_origin_message
       ON jobs(origin_message_id) WHERE origin_message_id IS NOT NULL;`,
+  ],
+  [
+    11,
+    // Interactive Visual QA outcome, recorded per Job.
+    //
+    // Additive and nullable: every existing Job keeps its evidence, its plan and
+    // its history, and reads back as NULL, which the approval path treats
+    // exactly as it did before this column existed.
+    `ALTER TABLE jobs ADD COLUMN visual_qa_status TEXT;`,
   ],
 ]);
 

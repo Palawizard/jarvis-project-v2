@@ -112,9 +112,12 @@ export interface Job {
   validationOnly: boolean;
   visualQaPlan: {
     source: string;
+    mode?: 'interactive';
     scenarios: Array<{ name: string; viewports?: Array<'desktop' | 'mobile'> }>;
     reasons: string[];
   } | null;
+  visualQaStatus:
+    'skipped' | 'passed' | 'product_defect' | 'inconclusive' | 'infrastructure_error' | null;
   episodeId: string | null;
   archivedAt: string | null;
   predecessorJobId: string | null;

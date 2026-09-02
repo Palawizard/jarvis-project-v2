@@ -706,7 +706,7 @@ export function candidateControlHeader(
   return { 'x-jarvis-control': credential };
 }
 
-async function confineNavigation(
+export async function confineNavigation(
   context: import('playwright').BrowserContext,
   page: import('playwright').Page,
   expectedOrigin: string,
@@ -844,7 +844,7 @@ function stableArtifactId(id: string): string {
   return createHash('sha256').update(id, 'utf8').digest('hex').slice(0, 32);
 }
 
-function sealScreenshot(screenshotPath: string): string {
+export function sealScreenshot(screenshotPath: string): string {
   const digest = createHash('sha256').update(fs.readFileSync(screenshotPath)).digest('hex');
   const sealed = screenshotPath.replace(/\.png$/i, `-${digest}.png`);
   fs.renameSync(screenshotPath, sealed);

@@ -19,6 +19,12 @@ export const FIXTURE_ANALYSIS_FAILED_PROJECT_ID = 'prj_qafixture_analysis_failed
 
 export interface VisualQaPlan {
   source: 'job_override' | 'changed_surface' | 'project_default';
+  /**
+   * How the evidence was produced. `interactive` plans are written AFTER the
+   * run from the checkpoints the agent actually captured; a plan without this
+   * field is a legacy static screenshot plan and is read exactly as before.
+   */
+  mode?: 'interactive';
   required?: boolean;
   scenarios: VisualQaScenario[];
   /** Deterministic `<changed file> -> <surface>` lines; never model-authored. */

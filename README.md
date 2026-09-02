@@ -91,7 +91,7 @@ Recoverable provider exhaustion, repair-budget exhaustion, and orchestrator rest
 - Provider authentication remains inside official CLIs.
 - Jobs never stash, force refs, resolve conflicts, push, or overwrite dirty user work.
 - Self-activation requires explicit user action and the external supervisor boundary.
-- Visual QA images remain evidence-only unless a real CLI reviewer successfully inspected them.
+- Visual QA is an interactive browser agent bound to the candidate origin; screenshots are its evidence checkpoints, and a run that could not reach the changed surface is recorded as inconclusive rather than passed.
 - Loopback is not authentication. Agent and candidate processes are hostile to the control plane: every private `/api/*` read or mutation requires the browser-held control credential, mutations also require the configured exact UI origin, and only `/health`, auth status/pairing, and CORS preflight remain unauthenticated. Bootstrap/control secrets are removed from child environments and never enter worktrees, URLs, events, or activation files.
 - Conversation is not authority. The chat model never touches SQLite, Git, approval state, or the supervisor: it may only request one of a fixed set of validated actions, which trusted code decides. It cannot confirm its own destructive request, approve a candidate, apply a change, or activate a self-upgrade.
 - Deleting a conversation never deletes its Jobs, your durable memory, or application evidence. Unregistering a project never deletes the repository from disk. An applied candidate can be archived but never hard-deleted.

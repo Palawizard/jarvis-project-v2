@@ -325,11 +325,14 @@ export function Pipeline({
   status,
   skipped = [],
   events = [],
+  resumeStage = null,
 }: {
   stage: JobStage;
   status: string;
   skipped?: JobStage[];
   events?: JarvisEvent[];
+  /** Where a paused job stopped. Without it, a paused stage looked complete. */
+  resumeStage?: JobStage | null;
 }) {
   // `fixing` belongs to the verify loop; show verification as the active step.
   const effective = stage === 'fixing' ? 'verifying' : stage;
@@ -338,11 +341,15 @@ export function Pipeline({
   const reached = new Set(
     transitions.map((event) => event.payload?.to).filter((value): value is JobStage => !!value),
   );
+  // A paused job has already "reached" the stage it stopped in, so without this
+  // the stage that actually blocked the job rendered a completed checkmark.
   const stoppedAt =
-    stage === 'failed' || stage === 'cancelled'
-      ? (transitions.findLast((event) => event.payload?.to === stage)?.payload?.from as
-          JobStage | undefined)
-      : undefined;
+    stage === 'paused'
+      ? (resumeStage ?? undefined)
+      : stage === 'failed' || stage === 'cancelled'
+        ? (transitions.findLast((event) => event.payload?.to === stage)?.payload?.from as
+            JobStage | undefined)
+        : undefined;
 
   return (
     <div className="pipeline">
@@ -355,7 +362,7 @@ export function Pipeline({
           icon = '–';
         } else if (stoppedAt === s) {
           state = 'failed';
-          icon = stage === 'cancelled' ? '■' : '✕';
+          icon = stage === 'cancelled' ? '■' : stage === 'paused' ? '!' : '✕';
         } else if (reached.has(s) && s !== effective) {
           state = 'done';
           icon = '✓';

@@ -17,7 +17,13 @@ export interface RepairCheckpoint {
   kind: RepairKind;
   verification?: { resultIds: string[]; cycle: number; failureSummary: string };
   review?: { id: string; findings: ReviewFinding[] };
-  visual?: { shotIds: string[]; findings: VisualReviewFinding[]; cycle: number };
+  visual?: {
+    shotIds: string[];
+    findings: VisualReviewFinding[];
+    cycle: number;
+    /** The failed check goals a targeted recheck must re-verify. */
+    recheckGoals?: string[];
+  };
 }
 import {
   assertTransition,
@@ -26,6 +32,15 @@ import {
   type JobStage,
   type JobStatus,
 } from './machine.js';
+
+/**
+ * The Visual QA outcome recorded on a Job.
+ *
+ * `skipped` is a real, deterministic answer ("no rendered UI changed"), not an
+ * absence: the approval path treats it differently from "visual QA never ran".
+ */
+export type VisualQaStatus =
+  'skipped' | 'passed' | 'product_defect' | 'inconclusive' | 'infrastructure_error';
 
 export interface Job {
   id: string;
@@ -59,6 +74,12 @@ export interface Job {
   visualQaConfig: { required?: boolean; scenarios: VisualQaScenario[] } | null;
   /** The scenario plan Visual QA actually resolved for this candidate diff. */
   visualQaPlan: VisualQaPlan | null;
+  /**
+   * What interactive Visual QA concluded for this candidate. `null` means it
+   * has not run yet (or predates the interactive pipeline); `skipped` means the
+   * deterministic eligibility check found no rendered UI change.
+   */
+  visualQaStatus: VisualQaStatus | null;
   episodeId: string | null;
   /** Archived Jobs keep every artifact and simply leave the default History. */
   archivedAt: string | null;
@@ -135,6 +156,7 @@ function rowToJob(row: Row): Job {
       null as { required?: boolean; scenarios: VisualQaScenario[] } | null,
     ),
     visualQaPlan: parseJson(row.visual_qa_plan as string, null as VisualQaPlan | null),
+    visualQaStatus: (row.visual_qa_status as VisualQaStatus) ?? null,
     episodeId: (row.episode_id as string) ?? null,
     archivedAt: (row.archived_at as string) ?? null,
     predecessorJobId: (row.predecessor_job_id as string) ?? null,
@@ -258,6 +280,7 @@ export class JobService {
       validationOnly: input.validationOnly ?? false,
       visualQaConfig: input.visualQa ?? null,
       visualQaPlan: null,
+      visualQaStatus: null,
       episodeId: null,
       archivedAt: null,
       predecessorJobId: input.predecessorJobId ?? null,
@@ -400,7 +423,7 @@ export class JobService {
           reviewed_head=?, visual_head=?, candidate_base_sha=?,
           candidate_source_sha=?, validation_only=?, visual_qa_config=?,
           visual_qa_plan=CASE WHEN ? THEN ? ELSE visual_qa_plan END,
-          episode_id=?, goal=?,
+          visual_qa_status=?, episode_id=?, goal=?,
           acceptance=?, updated_at=?, finished_at=? WHERE id=?`,
       )
       .run(
@@ -428,6 +451,7 @@ export class JobService {
         next.validationOnly ? 1 : 0,
         next.visualQaConfig ? JSON.stringify(next.visualQaConfig) : null,
         ...visualPlanBinding(patch),
+        next.visualQaStatus,
         next.episodeId,
         next.goal,
         JSON.stringify(next.acceptance),
@@ -463,7 +487,7 @@ export class JobService {
           visual_head=?, candidate_base_sha=?,
           candidate_source_sha=?, validation_only=?, visual_qa_config=?,
           visual_qa_plan=CASE WHEN ? THEN ? ELSE visual_qa_plan END,
-          episode_id=?, goal=?,
+          visual_qa_status=?, episode_id=?, goal=?,
           acceptance=?, updated_at=? WHERE id=?`,
       )
       .run(
@@ -489,6 +513,7 @@ export class JobService {
         next.validationOnly ? 1 : 0,
         next.visualQaConfig ? JSON.stringify(next.visualQaConfig) : null,
         ...visualPlanBinding(patch),
+        next.visualQaStatus,
         next.episodeId,
         next.goal,
         JSON.stringify(next.acceptance),

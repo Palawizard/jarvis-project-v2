@@ -19,7 +19,7 @@ import { AgentRegistry } from './agents/registry.js';
 import { VerificationEngine } from './verification/engine.js';
 import { ReviewEngine } from './review/engine.js';
 import { VisualQaEngine } from './visualqa/engine.js';
-import { VisualReviewer } from './visualqa/reviewer.js';
+import { InteractiveVisualQaAgent } from './visualqa/agent.js';
 import { CandidateApplicationService } from './application/service.js';
 import { UpgradeManager } from './upgrade/manager.js';
 import { registerBuiltinTools } from './tools/builtin.js';
@@ -49,7 +49,7 @@ export class Jarvis {
   readonly verification: VerificationEngine;
   readonly review: ReviewEngine;
   readonly visualQa: VisualQaEngine;
-  readonly visualReviewer: VisualReviewer;
+  readonly visualAgent: InteractiveVisualQaAgent;
   readonly pipeline: JobPipeline;
   readonly lifecycle: JobLifecycle;
   readonly chat: ChatService;
@@ -81,7 +81,7 @@ export class Jarvis {
     this.verification = new VerificationEngine(this.db, config.artifactsDir, this.bus);
     this.review = new ReviewEngine(this.db, this.agents, this.bus, this.config);
     this.visualQa = new VisualQaEngine(this.db, config.artifactsDir, this.bus);
-    this.visualReviewer = new VisualReviewer(
+    this.visualAgent = new InteractiveVisualQaAgent(
       this.db,
       this.agents,
       this.jobs,
@@ -119,7 +119,7 @@ export class Jarvis {
       verification: this.verification,
       review: this.review,
       visualQa: this.visualQa,
-      visualReviewer: this.visualReviewer,
+      visualAgent: this.visualAgent,
     });
     this.lifecycle = new JobLifecycle({
       jobs: this.jobs,
@@ -229,10 +229,11 @@ export class Jarvis {
         apiPortEnvironment: 'JARVIS_PORT',
         healthPath: '/health',
       },
-      // Self visual QA is planned from the candidate's own committed catalog
-      // (see visualqa/candidate-plan.ts), which never falls back to these
-      // defaults: the running parent's scenarios describe the running parent's
-      // UI. They remain only for the legacy pre-plan approval path.
+      // `required: true` means "a visual pass is required before this candidate
+      // may be applied", not "run Visual QA on every job": deterministic
+      // eligibility decides that from the diff. The scenario below is a route
+      // hint and the legacy pre-plan approval fallback; the interactive agent
+      // derives what to test from the feature itself.
       visualQa: { required: true, scenarios: [selfSurfaceScenario('chat-workspace')] },
       verification: {
         steps: [

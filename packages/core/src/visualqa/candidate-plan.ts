@@ -105,6 +105,66 @@ const needsMapping = (file: string) => SELF_WEB_FILE.test(file) && !NOT_RENDERED
 export const isSelfUiFile = (file: string) => SELF_WEB_FILE.test(file);
 
 /**
+ * Non-self projects: the original rendered-file heuristic. Widening it would
+ * photograph every repository that happens to contain a `.tsx`.
+ */
+const PROJECT_UI_FILE = /^(?:apps\/web\/|src\/.*\.(?:css|html|tsx|jsx|vue|svelte)$)/i;
+
+/**
+ * Deterministic Visual QA eligibility. No model call, ever.
+ *
+ * A backend-only, migration-only, CLI-only or docs-only candidate never starts
+ * a browser and never spends a visual model turn. `visualQa.required` is NOT an
+ * eligibility signal: it means "a visual pass is required before this candidate
+ * may be applied", which is a question about UI changes, not about every job.
+ */
+export function visualQaEligibility(input: {
+  job: Pick<Job, 'visualQaConfig'>;
+  project: Pick<Project, 'isSelf' | 'config'>;
+  changedFiles: string[];
+}): { eligible: boolean; reason: string; uiFiles: string[] } {
+  const files = input.changedFiles.map(normalise);
+  const uiFiles = files.filter((file) =>
+    input.project.isSelf ? needsMapping(file) : PROJECT_UI_FILE.test(file),
+  );
+  if (input.job.visualQaConfig) {
+    return {
+      eligible: true,
+      reason: 'the job carries an explicit visual QA configuration',
+      uiFiles,
+    };
+  }
+  if (!input.project.config.visualQa) {
+    return {
+      eligible: false,
+      reason: 'the project has no isolated visual-QA runtime configured',
+      uiFiles,
+    };
+  }
+  if (uiFiles.length === 0) {
+    return { eligible: false, reason: 'no rendered UI file changed in this candidate', uiFiles };
+  }
+  return {
+    eligible: true,
+    reason: `changed rendered UI: ${uiFiles.slice(0, 8).join(', ')}`,
+    uiFiles,
+  };
+}
+
+/**
+ * Whether the changed UI is responsive-relevant, so the agent is told to spend
+ * a viewport switch. Deterministic, and a hint rather than a requirement.
+ */
+export function mobileRelevant(changedFiles: string[]): boolean {
+  return changedFiles
+    .map(normalise)
+    .some(
+      (file) =>
+        /\.(?:css|scss)$/i.test(file) || /(?:^|\/)(?:App|components|Chat)[^/]*\.tsx$/i.test(file),
+    );
+}
+
+/**
  * Resolve self-development Visual QA from versioned declarative data committed
  * at the exact candidate HEAD. Jarvis never imports, loads or invokes candidate
  * code to build the plan, and it never reads the candidate worktree: the bytes

@@ -12,16 +12,27 @@ queued -> planning -> implementing -> verifying
                                      code fixer --commit--> verifying (max 2)
                                           |
                                           v pass/advisory
-                                      visual_qa
-                                          | high/medium
-                                          v
-                                    visual fixer --commit--> verifying
-                                          |                    -> fresh review
-                                          +---------------------> fresh visual QA (max 2)
-                                          |
-                                          v pass/advisory
+                                   UI changed?
+                                     no |        | yes
+                                        |        v
+                                        |   interactive visual QA (attempt 1)
+                                        |        |
+                                        |        +-- product_defect --> visual fixer (max 1)
+                                        |        |        --commit--> verifying -> fresh review
+                                        |        |        -> targeted visual recheck (failed
+                                        |        |           check goals only)
+                                        |        +-- inconclusive / infra --> ONE fresh retry
+                                        |        |        -> still inconclusive: record the
+                                        |        |           status and continue (never a
+                                        |        |           third attempt, never a fixer)
+                                        |        v pass
+                                        v        v
                                     awaiting_user -> approved -> FF-only applied
 ```
+
+Visual QA eligibility is deterministic and costs no model call: a candidate that changed no
+rendered UI records `visualQaStatus: 'skipped'` and no browser starts. There is no path with a
+third visual attempt, a second visual fixer, or a plan-repair loop; a new attempt needs a new Job.
 
 Any active stage may become `paused` or `cancelled`. Provider exhaustion, restart, or bounded repair exhaustion is recoverable and preserves the same worktree/head; `failed` is for irrecoverable setup or corrupt state. `awaiting_user` means a candidate passed configured gates and remains isolated. State transitions are validated centrally and persisted as events.
 
@@ -115,7 +126,7 @@ Structured severity, not the reviewer's prose/verdict alone, determines blocking
 
 ## Pause, resume, and validation-only recovery
 
-Running jobs checkpoint the logical stage, base, worktree, exact candidate HEAD, cycle counts, last provider/session, repair kind, and the relevant verification/review/visual evidence IDs and findings. On restart they become `paused` without replacing that evidence with the restart reason; `POST /api/jobs/:id/resume` first validates repository identity, worktree existence, exact expected HEAD, and understood cleanliness. Without an expected candidate checkpoint, planning recovery accepts only `HEAD === base SHA`. Implementation/fix may resume the same external session; a fresh fixer reconstructs the same persisted evidence prompt. Verification reruns; review is fresh; Visual QA restarts and recaptures.
+Running jobs checkpoint the logical stage, base, worktree, exact candidate HEAD, cycle counts, last provider/session, repair kind, and the relevant verification/review/visual evidence IDs and findings. On restart they become `paused` without replacing that evidence with the restart reason; `POST /api/jobs/:id/resume` first validates repository identity, worktree existence, exact expected HEAD, and understood cleanliness. Without an expected candidate checkpoint, planning recovery accepts only `HEAD === base SHA`. Implementation/fix may resume the same external session; a fresh fixer reconstructs the same persisted evidence prompt. Verification reruns; review is fresh; Visual QA restarts as a fresh interactive attempt against the exact HEAD.
 
 `POST /api/jobs` also accepts `validationOnly: true` with a pinned `candidateSource: { baseSha, sourceSha }`. Git plumbing verifies both commits and ancestry, creates the isolated job worktree from the explicit base, applies the exact binary base-to-source delta, proves tree parity, commits only on the job branch, skips implementation, and starts at verification. Validation-only jobs never invoke verification, code-review, or visual source fixers and never commit verification-produced changes; exact materialized HEAD, cleanliness, and source-tree parity are rechecked after every gate. It never checks out or mutates the source ref.
 

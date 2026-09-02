@@ -496,6 +496,43 @@ describe('approval validates the persisted visual QA plan', () => {
     const approved = await service.approve(prepared.job.id);
     expect(approved.status).toBe('approved');
   });
+
+  it('H: a recorded skip owes no visual evidence at all', async () => {
+    const prepared = await candidate();
+    projectDefaults();
+    jobs.patch(prepared.job.id, { visualQaStatus: 'skipped' });
+    const approved = await service.approve(prepared.job.id);
+    expect(approved.status).toBe('approved');
+    expect(jobs.get(prepared.job.id)?.visualHead).toBeNull();
+  });
+
+  it.each(['inconclusive', 'infrastructure_error'] as const)(
+    'I: %s reaches the human approval step instead of a dead end',
+    async (status) => {
+      const prepared = await candidate();
+      projectDefaults();
+      jobs.patch(prepared.job.id, { visualQaStatus: status });
+      // Never silently a pass: no visualHead, no reviewedBy, and the Job Detail
+      // view says the surface could not be judged. The human decides.
+      const approved = await service.approve(prepared.job.id);
+      expect(approved.status).toBe('approved');
+      expect(jobs.get(prepared.job.id)?.visualHead).toBeNull();
+      expect(
+        db.prepare('SELECT COUNT(*) AS n FROM visual_qa WHERE reviewed_by IS NOT NULL').get(),
+      ).toMatchObject({ n: 0 });
+    },
+  );
+
+  it('J: a recorded product defect still demands a passing visual review', async () => {
+    const prepared = await candidate();
+    projectDefaults();
+    jobs.patch(prepared.job.id, {
+      visualHead: prepared.head,
+      visualQaStatus: 'product_defect',
+    });
+    setPlan(prepared.job.id, CHANGED_SURFACE_PLAN);
+    await expect(service.approve(prepared.job.id)).rejects.toThrow(VISUAL_REJECTED);
+  });
 });
 
 describe('approval reads the durable visual review the pipeline actually persists', () => {

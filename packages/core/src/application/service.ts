@@ -402,7 +402,23 @@ export class CandidateApplicationService {
     const plan = this.persistedVisualPlan(jobId);
     const visualRequired =
       plan?.required ?? job.visualQaConfig?.required ?? project?.config.visualQa?.required;
-    if (visualRequired || job.visualHead) {
+    // A recorded Visual QA outcome is the authority on whether visual evidence
+    // is owed at all.
+    //
+    // `skipped` is a deterministic finding that nothing rendered changed, so
+    // there is no visual evidence to demand. `inconclusive` and
+    // `infrastructure_error` are honest statements that Jarvis could not judge
+    // the surface; they are NEVER promoted to a pass (`visualHead` stays null
+    // and `reviewed_by` stays unset), and the Job Detail view says so
+    // prominently. Whether to accept the candidate anyway is exactly the
+    // decision this human approval step exists to make, so it is not refused
+    // here. Self-activation still needs its own approval and the external
+    // supervisor on top of this.
+    const unjudged =
+      job.visualQaStatus === 'inconclusive' || job.visualQaStatus === 'infrastructure_error';
+    if (job.visualQaStatus === 'skipped' || unjudged) {
+      // fall through: no visual evidence is owed
+    } else if (visualRequired || job.visualHead) {
       if (job.visualHead !== job.headRef) {
         throw new CandidateApplicationError(
           'visual evidence identity is stale',

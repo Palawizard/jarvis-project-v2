@@ -47,6 +47,8 @@ export type JarvisEventType =
   | 'visual_qa.plan.resolved'
   | 'visual_qa.started'
   | 'visual_qa.captured'
+  | 'visual_qa.activity'
+  | 'visual_qa.skipped'
   // The machine could not make a request; the capture was retaken. Persisted so a
   // run that needed two attempts is distinguishable from one that did not.
   | 'visual_qa.retried'

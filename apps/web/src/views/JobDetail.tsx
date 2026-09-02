@@ -82,7 +82,10 @@ export function JobDetailView({
   const implementationRun = runs.findLast(
     (run) => (run.role === 'implementer' || run.role === 'fixer') && !!run.result,
   );
-  const skipped = project?.config.visualQa ? [] : (['visual_qa'] as const);
+  // Only a recorded skip is a skip. "The project has a visual runtime" says
+  // nothing about whether this candidate changed any UI.
+  const skipped =
+    job.visualQaStatus === 'skipped' || !project?.config.visualQa ? (['visual_qa'] as const) : [];
 
   return (
     <div className="page wide" data-testid="job-detail-view">
@@ -305,7 +308,10 @@ export function JobDetailView({
               status={job.status}
               skipped={[...skipped]}
               events={events}
+              resumeStage={job.resumeStage}
             />
+            {job.stage === 'visual_qa' && <VisualQaActivity events={events} />}
+            {job.visualQaStatus && <VisualQaOutcome status={job.visualQaStatus} />}
             <div className="mem-meta" style={{ marginTop: 12 }}>
               {job.branch && (
                 <span>
@@ -702,9 +708,18 @@ export function JobDetailView({
           )}
 
           <Card title="Visual QA evidence">
+            {job.visualQaStatus && (
+              <div style={{ marginBottom: 10 }}>
+                <VisualQaOutcome status={job.visualQaStatus} />
+              </div>
+            )}
             {job.visualQaPlan && (
               <div className="small dim" style={{ marginBottom: 10 }}>
-                <div>Visual QA plan ({job.visualQaPlan.source.replace(/_/g, ' ')}):</div>
+                <div>
+                  {job.visualQaPlan.mode === 'interactive'
+                    ? 'Evidence the QA agent captured:'
+                    : `Visual QA plan (${job.visualQaPlan.source.replace(/_/g, ' ')}):`}
+                </div>
                 {job.visualQaPlan.scenarios.map((scenario) => (
                   <div key={scenario.name} className="tiny">
                     {scenario.name} · {(scenario.viewports ?? ['desktop', 'mobile']).join(' · ')}
@@ -719,9 +734,11 @@ export function JobDetailView({
             )}
             {visualQa.length === 0 ? (
               <Empty>
-                {project?.config.visualQa
-                  ? 'No screenshots captured.'
-                  : 'Skipped — project has no isolated visual-QA runtime configured.'}
+                {!project?.config.visualQa
+                  ? 'Skipped — project has no isolated visual-QA runtime configured.'
+                  : job.visualQaStatus === 'skipped'
+                    ? 'Skipped — this candidate changed no rendered UI.'
+                    : 'No evidence captured.'}
               </Empty>
             ) : (
               <div className="shots">
@@ -894,6 +911,53 @@ function AuthenticatedArtifact({
     <img src={source} alt={alt} loading="lazy" />
   ) : (
     <div className="empty small">Loading evidence…</div>
+  );
+}
+
+/**
+ * What the QA agent is doing right now.
+ *
+ * The agent batches its browser actions, so this is one line per model turn
+ * rather than one per click -- enough to follow along, not a DOM firehose.
+ */
+function VisualQaActivity({ events }: { events: JarvisEvent[] }) {
+  const latest = events.findLast((event) => event.type === 'visual_qa.activity');
+  if (!latest) return null;
+  const turn = latest.payload?.turn;
+  // The ceiling travels in the event, so the UI never restates a budget that
+  // lives in VISUAL_QA_BUDGET and can change without it.
+  const of = latest.payload?.of;
+  const viewport = latest.payload?.viewport;
+  return (
+    <div className="small dim" style={{ marginTop: 10 }} data-testid="visual-qa-activity">
+      Visual QA
+      {typeof turn === 'number' ? ` ${turn}${typeof of === 'number' ? `/${of}` : ''}` : ''}:{' '}
+      {String(latest.payload?.activity ?? '')}
+      {viewport ? ` (${String(viewport)})` : ''}
+    </div>
+  );
+}
+
+/**
+ * What Visual QA actually concluded.
+ *
+ * The pipeline checkmark says a stage ran; this says what it found. They are
+ * different questions, and conflating them is what made "screenshots captured"
+ * read as "the UI is fine" while the Job paused.
+ */
+function VisualQaOutcome({ status }: { status: NonNullable<Job['visualQaStatus']> }) {
+  const label = {
+    skipped: 'Visual QA skipped — no rendered UI changed',
+    passed: 'Visual QA passed',
+    product_defect: 'Visual QA found a product defect',
+    inconclusive: 'Visual QA inconclusive — the changed surface could not be judged',
+    infrastructure_error: 'Visual QA infrastructure error — the browser or runtime failed',
+  }[status];
+  const tone = status === 'passed' ? 'ok' : status === 'skipped' ? undefined : 'err';
+  return (
+    <div className="row" style={{ marginTop: 10 }} data-testid={`visual-qa-${status}`}>
+      <Badge tone={tone}>{label}</Badge>
+    </div>
   );
 }
 

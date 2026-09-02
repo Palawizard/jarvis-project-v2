@@ -22,7 +22,8 @@ import type { Review, ReviewFinding, ReviewOptions } from '../review/engine.js';
 import { VerificationEngine, type VerificationReport } from '../verification/engine.js';
 import { JobPipeline } from './pipeline.js';
 import { nowIso } from '../ids.js';
-import type { VisualQaShot, VisualReviewFinding } from '../visualqa/engine.js';
+import type { VisualQaShot } from '../visualqa/engine.js';
+import type { InteractiveVisualQaResult, VisualQaBrief } from '../visualqa/agent.js';
 import type { JobStage } from './machine.js';
 
 const roots: string[] = [];
@@ -141,6 +142,7 @@ interface Harness {
   verificationCalls: number[];
   reviewHeads: string[];
   visualHeads: string[];
+  visualBriefs: VisualQaBrief[];
 }
 
 async function harness(options: {
@@ -148,7 +150,7 @@ async function harness(options: {
   provider?: FakeProvider;
   providers?: FakeProvider[];
   maxReviewFixCycles?: number;
-  visual?: 'repair' | 'infrastructure' | 'advisory' | 'insufficient_evidence' | 'unrelated';
+  visual?: 'repair' | 'infrastructure' | 'advisory' | 'inconclusive';
   selfDevelopment?: boolean;
   verification?: VerificationReport[];
   realVerification?: boolean;
@@ -209,8 +211,13 @@ async function harness(options: {
   const provider =
     options.provider ??
     new FakeProvider('claude', (call) => {
-      if (call.role === 'implementer')
+      if (call.role === 'implementer') {
         fs.writeFileSync(path.join(call.cwd, 'change.txt'), 'first\n');
+        if (options.visual) {
+          fs.mkdirSync(path.join(call.cwd, 'apps', 'web'), { recursive: true });
+          fs.writeFileSync(path.join(call.cwd, 'apps', 'web', 'style.css'), '.a{color:red}\n');
+        }
+      }
       if (call.role === 'fixer') fs.appendFileSync(path.join(call.cwd, 'change.txt'), 'fixed\n');
       if (call.role === 'visual_fixer')
         fs.appendFileSync(path.join(call.cwd, 'change.txt'), 'visual fixed\n');
@@ -311,69 +318,105 @@ async function harness(options: {
     review: review as never,
   });
   const visualHeads: string[] = [];
+  const visualBriefs: VisualQaBrief[] = [];
   if (options.visual) {
     let visualCall = 0;
-    const finding: VisualReviewFinding = {
-      severity: options.visual === 'advisory' ? 'low' : 'high',
-      scenarioName: options.visual === 'unrelated' ? 'memory' : 'tools',
-      route: '/',
-      viewport: 'desktop',
-      category: 'layout',
-      description: 'The Tools panel is clipped.',
-      recommendation: 'Allow the panel to wrap.',
-    };
     (
-      pipeline as unknown as { runVisualQa(input: { headRef: string; cwd: string }): unknown }
-    ).runVisualQa = async (input: { headRef: string; cwd: string }) => {
+      pipeline as unknown as {
+        runInteractiveVisualQa(input: {
+          headRef: string;
+          cwd: string;
+          brief: VisualQaBrief;
+          escalateModel?: boolean;
+        }): Promise<InteractiveVisualQaResult>;
+      }
+    ).runInteractiveVisualQa = async (input) => {
       visualCall++;
       visualHeads.push(input.headRef);
+      visualBriefs.push(input.brief);
+      const base = {
+        provider: 'codex' as const,
+        model: null,
+        turns: 2,
+        actions: 5,
+        checks: [],
+        findings: [],
+        evidence: [],
+      };
       if (options.visual === 'infrastructure') {
-        return { kind: 'infrastructure', error: 'Playwright launch failed' };
-      }
-      if (options.visual === 'insufficient_evidence') {
         return {
-          kind: 'insufficient_evidence',
-          error: 'Visual QA plan required evidence that was never captured: tools - desktop.',
+          ...base,
+          verdict: 'infrastructure_error',
+          summary: 'Playwright launch failed',
+          error: 'Playwright launch failed',
+        };
+      }
+      if (options.visual === 'inconclusive') {
+        return {
+          ...base,
+          verdict: 'qa_inconclusive',
+          summary: 'the changed surface could not be reached within the action budget',
+          checks: [
+            { goal: 'reach the Tools panel', status: 'not_reached', evidenceIds: [], note: '' },
+          ],
         };
       }
       const screenshotPath = path.join(home, 'screens', `visual-${visualCall}.png`);
       fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
       fs.writeFileSync(screenshotPath, 'fixture screenshot');
-      const shots: VisualQaShot[] = [
-        {
-          id: `shot-${visualCall}`,
-          scenarioName: 'tools',
-          route: '/',
-          viewport: 'desktop',
-          screenshotPath,
-          consoleErrors: [],
-          networkFailures: [],
-          status: 'captured',
-          error: null,
-          reviewedBy: 'codex',
-          reviewVerdict: blockingVisual(options.visual) && visualCall === 1 ? 'needs_fix' : 'pass',
-          reviewFindings: blockingVisual(options.visual) && visualCall === 1 ? [finding] : [],
-          headRef: input.headRef,
-          cycle: visualCall - 1,
-          createdAt: nowIso(),
-        },
-      ];
-      return blockingVisual(options.visual) && visualCall === 1
-        ? {
-            kind: 'product_needs_fix',
-            review: { verdict: 'needs_fix', findings: [finding], provider: 'codex', model: null },
-            shots,
-          }
-        : {
-            kind: 'pass',
-            review: {
-              verdict: 'pass',
-              findings: options.visual === 'advisory' ? [finding] : [],
-              provider: 'codex',
-              model: null,
-            },
-            shots,
-          };
+      const shot: VisualQaShot = {
+        id: `shot-${visualCall}`,
+        scenarioName: 'tools',
+        route: '/',
+        viewport: 'desktop',
+        screenshotPath,
+        consoleErrors: [],
+        networkFailures: [],
+        status: 'captured',
+        error: null,
+        reviewedBy: 'codex',
+        reviewVerdict: 'pass',
+        reviewFindings: [],
+        headRef: input.headRef,
+        cycle: visualCall - 1,
+        createdAt: nowIso(),
+      };
+      const defect = options.visual === 'repair' && visualCall === 1;
+      return {
+        ...base,
+        evidence: [shot],
+        verdict: defect ? 'product_defect' : 'pass',
+        summary: defect ? 'The Tools panel is clipped.' : 'The changed surface looks correct.',
+        checks: [
+          {
+            goal: 'the Tools panel renders without clipping',
+            status: defect ? 'failed' : 'passed',
+            evidenceIds: [shot.id],
+            note: '',
+          },
+        ],
+        findings: defect
+          ? [
+              {
+                severity: 'high' as const,
+                category: 'layout',
+                description: 'The Tools panel is clipped.',
+                recommendation: 'Allow the panel to wrap.',
+                evidenceIds: [shot.id],
+              },
+            ]
+          : options.visual === 'advisory'
+            ? [
+                {
+                  severity: 'low' as const,
+                  category: 'polish',
+                  description: 'Spacing is a little tight.',
+                  recommendation: 'Consider more padding.',
+                  evidenceIds: [shot.id],
+                },
+              ]
+            : [],
+      };
     };
   }
   return {
@@ -390,6 +433,7 @@ async function harness(options: {
     verificationCalls,
     reviewHeads,
     visualHeads,
+    visualBriefs,
   };
 }
 
@@ -416,12 +460,16 @@ async function runToRest(
   return finished;
 }
 
-function createPinnedSource(h: Harness): { base: string; source: string } {
+function createPinnedSource(h: Harness, ui = false): { base: string; source: string } {
   const git = (args: string[]) =>
     execFileSync('git', args, { cwd: h.repo, encoding: 'utf8' }).trim();
   const base = git(['rev-parse', 'HEAD']);
   git(['switch', '-qc', 'source']);
   fs.writeFileSync(path.join(h.repo, 'imported.bin'), Buffer.from([0, 1, 255, 128]));
+  if (ui) {
+    fs.mkdirSync(path.join(h.repo, 'apps', 'web'), { recursive: true });
+    fs.writeFileSync(path.join(h.repo, 'apps', 'web', 'imported.css'), '.b{color:blue}\n');
+  }
   git(['add', '-A']);
   git(['commit', '-qm', 'pinned source']);
   const source = git(['rev-parse', 'HEAD']);
@@ -443,6 +491,9 @@ async function pausedCandidate(
     jobId: job.id,
   });
   fs.writeFileSync(path.join(worktree.path, 'change.txt'), 'checkpoint\n');
+  // Rendered UI, so a visual_qa resume fixture is actually eligible for it.
+  fs.mkdirSync(path.join(worktree.path, 'apps', 'web'), { recursive: true });
+  fs.writeFileSync(path.join(worktree.path, 'apps', 'web', 'style.css'), '.c{color:green}\n');
   const head =
     resumeStage === 'implementing'
       ? worktree.baseRef
@@ -655,19 +706,19 @@ describe('job repair pipeline', () => {
     expect(h.provider.calls).toHaveLength(0);
     expect(h.verificationCalls).toHaveLength(1);
     expect(h.reviewHeads).toHaveLength(1);
-    // The pinned source changes no rendered self UI, so no parent-authored
-    // self scenario is borrowed and no evidence is captured.
+    // The pinned source changes no rendered self UI, so no browser starts and
+    // no visual model turn is spent.
     expect(h.visualHeads).toHaveLength(0);
-    // The decision is persisted as an explicit plan so the approval gate does
-    // not inherit the self project's standing required:true and block forever.
-    expect(job.visualQaPlan).toMatchObject({ required: false, scenarios: [] });
+    // The decision is recorded, so the approval gate does not inherit the self
+    // project's standing required:true and block forever.
+    expect(job.visualQaStatus).toBe('skipped');
     expect(
       h.bus
         .list({ jobId: job.id, limit: 200 })
         .some(
           (event) =>
-            event.type === 'visual_qa.plan.resolved' &&
-            event.payload.skipped === 'no changed rendered self UI',
+            event.type === 'visual_qa.skipped' &&
+            String(event.payload.reason).includes('no rendered UI file changed'),
         ),
     ).toBe(true);
     if (!job.worktreePath) throw new Error('import worktree missing');
@@ -791,7 +842,7 @@ describe('job repair pipeline', () => {
         blocking: false,
       }),
     });
-    const { base, source } = createPinnedSource(h);
+    const { base, source } = createPinnedSource(h, true);
     const job = await runToRest(h, {
       projectId: h.project.id,
       request: 'Visually review the exact pinned source.',
@@ -833,9 +884,9 @@ describe('job repair pipeline', () => {
     h.db.close();
   });
 
-  it('never invokes the visual fixer when required evidence was not captured', async () => {
+  it('retries inconclusive visual QA exactly once, then completes with the honest status', async () => {
     const h = await harness({
-      visual: 'insufficient_evidence',
+      visual: 'inconclusive',
       review: (_call, opts) => ({
         runId: null,
         provider: 'codex',
@@ -847,17 +898,31 @@ describe('job repair pipeline', () => {
       }),
     });
     const job = await runToRest(h);
-    expect(job.stage).toBe('paused');
-    expect(job.resumeStage).toBe('visual_qa');
-    expect(job.pauseReason).toContain('never captured');
+    // Inconclusive is not a product defect and not a dead end: the Job reaches
+    // a reviewable state carrying a status a human can act on.
+    expect(job.stage).toBe('awaiting_user');
+    expect(job.visualQaStatus).toBe('inconclusive');
+    expect(job.visualHead).toBeNull();
     expect(job.visualFixCycles).toBe(0);
+    // Exactly two attempts. Never a third, and never a source fixer.
+    expect(h.visualHeads).toHaveLength(2);
+    expect(h.visualHeads[0]).toBe(h.visualHeads[1]);
     expect(h.provider.calls.filter((call) => call.role === 'visual_fixer')).toHaveLength(0);
+    // The retry is a fresh look at the same HEAD, told why the first failed.
+    expect(h.visualBriefs[0]?.previousAttemptFailure).toBeUndefined();
+    expect(h.visualBriefs[1]?.previousAttemptFailure).toContain('qa_inconclusive');
+    expect(
+      h.bus
+        .list({ jobId: job.id, limit: 400 })
+        .filter((event) => event.type === 'visual_qa.retried'),
+    ).toHaveLength(1);
     h.db.close();
   });
 
-  it('never invokes the visual fixer for a blocking finding on an unplanned surface', async () => {
+  it('skips visual QA deterministically for a backend-only candidate', async () => {
+    // The default implementer writes only `change.txt`. Nothing rendered
+    // changed, so no browser starts and no visual model turn is spent.
     const h = await harness({
-      visual: 'unrelated',
       review: (_call, opts) => ({
         runId: null,
         provider: 'codex',
@@ -869,11 +934,17 @@ describe('job repair pipeline', () => {
       }),
     });
     const job = await runToRest(h);
-    // The finding is high severity, but it names a surface the resolved plan
-    // never selected: pre-existing, not this candidate's regression.
     expect(job.stage).toBe('awaiting_user');
-    expect(job.visualFixCycles).toBe(0);
-    expect(h.provider.calls.filter((call) => call.role === 'visual_fixer')).toHaveLength(0);
+    expect(job.visualQaStatus).toBe('skipped');
+    expect(h.visualHeads).toHaveLength(0);
+    expect(
+      h.bus
+        .list({ jobId: job.id, limit: 400 })
+        .filter((event) => event.type === 'visual_qa.skipped'),
+    ).toHaveLength(1);
+    expect(
+      h.bus.list({ jobId: job.id, limit: 400 }).some((event) => event.type === 'visual_qa.started'),
+    ).toBe(false);
     h.db.close();
   });
 
@@ -891,8 +962,16 @@ describe('job repair pipeline', () => {
       }),
     });
     const job = await runToRest(h);
-    expect(job.visualQaPlan?.source).toBe('project_default');
+    // The persisted plan is now the evidence the agent actually captured, not a
+    // predeclared screenshot list nobody was asked to produce.
+    expect(job.visualQaPlan?.mode).toBe('interactive');
     expect(job.visualQaPlan?.scenarios.map((scenario) => scenario.name)).toEqual(['tools']);
+    expect(job.visualQaPlan?.reasons[0]).toBe('interactive visual QA: pass');
+    expect(job.visualQaStatus).toBe('passed');
+    // Legacy project `visualQa.scenarios`/`routes` survive as route hints; they
+    // are no longer a coverage contract the run has to satisfy.
+    expect(h.visualBriefs[0]?.routeHints).toContain('/');
+    expect(h.visualBriefs[0]?.surfaceHints).not.toHaveLength(0);
     h.db.close();
   });
 
@@ -920,10 +999,20 @@ describe('job repair pipeline', () => {
       }),
     });
     const job = await runToRest(h);
-    expect(job.stage).toBe('paused');
-    expect(job.resumeStage).toBe('visual_qa');
-    expect(job.pauseReason).toContain('Visual-QA planning infrastructure');
-    expect(job.visualQaPlan).toBeNull();
+    // A catalog that cannot map the diff costs the agent some starting advice.
+    // It no longer pauses the Job: the agent explores the app either way.
+    expect(job.stage).toBe('awaiting_user');
+    expect(job.visualQaStatus).toBe('passed');
+    expect(h.visualHeads).toHaveLength(1);
+    expect(h.visualBriefs[0]?.surfaceHints.join(' ')).toContain('no surface hints');
+    expect(
+      h.bus
+        .list({ jobId: job.id, limit: 400 })
+        .some(
+          (event) =>
+            event.type === 'visual_qa.plan.resolved' && typeof event.payload.hintError === 'string',
+        ),
+    ).toBe(true);
     expect(h.provider.calls.filter((call) => call.role === 'visual_fixer')).toHaveLength(0);
     h.db.close();
   });
@@ -943,6 +1032,8 @@ describe('job repair pipeline', () => {
     });
     const job = await runToRest(h);
     expect(job.stage).toBe('awaiting_user');
+    expect(job.visualQaStatus).toBe('passed');
+    // Exactly ONE visual repair cycle, then a targeted recheck.
     expect(job.visualFixCycles).toBe(1);
     expect(h.provider.calls.filter((call) => call.role === 'visual_fixer')).toHaveLength(1);
     expect(h.verificationCalls).toHaveLength(2);
@@ -952,6 +1043,9 @@ describe('job repair pipeline', () => {
     expect(h.visualHeads[1]).toBe(h.reviewHeads[1]);
     expect(job.reviewedHead).toBe(job.headRef);
     expect(job.visualHead).toBe(job.headRef);
+    // The recheck verifies the failed check, not the whole app again.
+    expect(h.visualBriefs[0]?.recheckGoals).toBeUndefined();
+    expect(h.visualBriefs[1]?.recheckGoals).toEqual(['the Tools panel renders without clipping']);
     h.db.close();
   });
 
@@ -969,9 +1063,10 @@ describe('job repair pipeline', () => {
       }),
     });
     const job = await runToRest(h);
-    expect(job.stage).toBe('paused');
-    expect(job.resumeStage).toBe('visual_qa');
-    expect(job.pauseReason).toContain('Playwright launch failed');
+    expect(job.stage).toBe('awaiting_user');
+    expect(job.visualQaStatus).toBe('infrastructure_error');
+    expect(job.visualHead).toBeNull();
+    expect(h.visualHeads).toHaveLength(2);
     expect(h.provider.calls.filter((call) => call.role === 'visual_fixer')).toHaveLength(0);
     h.db.close();
   });
@@ -1589,7 +1684,3 @@ describe('provider-scoped session recovery', () => {
     h.db.close();
   });
 });
-
-function blockingVisual(visual: string | undefined): boolean {
-  return visual === 'repair' || visual === 'unrelated';
-}

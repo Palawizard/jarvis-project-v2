@@ -956,11 +956,18 @@ export class ChatService {
       return settle(prose || 'Nothing to do.', 'chat');
     }
 
+    const linkExecution = (execution: { id: string }): void => {
+      if (!sessions.updateMessage(placeholderId, { metadata: { executionId: execution.id } })) {
+        throw new Error('assistant placeholder disappeared before tool execution');
+      }
+    };
     const outcome = await tools.execute(toolName, resolved.input, {
       actor,
       sessionId: conversationId,
       projectId: resolved.projectId ?? null,
       ...(resolved.jobId ? { jobId: resolved.jobId } : {}),
+      // Link before the tool body can mutate anything. Recovery preserves it.
+      onExecution: linkExecution,
     });
 
     /**
@@ -987,7 +994,11 @@ export class ChatService {
     ): ChatTurn => settle(reply, kind, extra, { executionId: ran.execution.id, ...metadata });
 
     if (outcome.status === 'denied' && outcome.execution.reasonCode === 'actor_risk_ceiling') {
-      const asUser = await tools.escalateAgentRequest(outcome.execution.id, resolved.input);
+      const asUser = await tools.escalateAgentRequest(
+        outcome.execution.id,
+        resolved.input,
+        linkExecution,
+      );
       ran = asUser;
       if (asUser.status === 'pending_approval') {
         const reply = [

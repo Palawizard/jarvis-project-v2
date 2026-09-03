@@ -723,10 +723,14 @@ describe('standing permissions', () => {
       { actor: 'agent' },
     );
     if (denied.status !== 'denied') throw new Error('expected an agent denial');
-    const pending = await reg.escalateAgentRequest(denied.execution.id, {
-      text: 'same request',
-    });
+    const linked: string[] = [];
+    const pending = await reg.escalateAgentRequest(
+      denied.execution.id,
+      { text: 'same request' },
+      (execution) => linked.push(execution.id),
+    );
     if (pending.status !== 'pending_approval') throw new Error('expected human confirmation');
+    expect(linked).toEqual([pending.execution.id]);
     const failed = await reg.approve(pending.execution.id);
     expect(failed.status).toBe('failed');
 

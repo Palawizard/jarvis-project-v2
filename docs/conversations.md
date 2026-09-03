@@ -73,7 +73,12 @@ A request still waiting for your confirmation is denied first — an approval
 dialog whose message is about to disappear has no context left to answer.
 
 This rests on every assistant message produced by a tool execution carrying that
-execution's id, not only the ones that stopped at a confirmation.
+execution's id, not only the ones that stopped at a confirmation. The link is
+written when the execution row is created — before the tool body can change
+anything, not after it returns — and restart recovery keeps it. Otherwise a
+crash between an effect landing and the turn finishing would leave the effect in
+Jarvis with nothing in the transcript pointing at it, and the rewind would look
+safe.
 
 A conversation is named once, from its first user message, so rewinding past
 that message drops the derived name and lets the new wording name the

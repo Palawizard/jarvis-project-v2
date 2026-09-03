@@ -600,18 +600,24 @@ export class SessionService {
    */
   recoverInterruptedMessages(): number {
     const stale = this.db
-      .prepare(`SELECT id FROM messages WHERE status IN ('pending','streaming')`)
-      .all() as Array<{ id: string }>;
+      .prepare(`SELECT id, metadata FROM messages WHERE status IN ('pending','streaming')`)
+      .all() as Array<{ id: string; metadata: string }>;
     // Written directly rather than through updateMessage: that touches the
     // session, so every boot pushed each conversation holding an interrupted
     // answer to the top of the sidebar, ahead of genuinely newer ones.
-    const metadata = JSON.stringify({
-      error: 'Jarvis restarted while this response was being generated.',
-    });
+    const write = this.db.prepare(
+      "UPDATE messages SET status = 'interrupted', metadata = ? WHERE id = ?",
+    );
     for (const row of stale) {
-      this.db
-        .prepare("UPDATE messages SET status = 'interrupted', metadata = ? WHERE id = ?")
-        .run(metadata, row.id);
+      // Merged, not replaced. A turn that died mid-flight may already carry the
+      // id of the tool execution it started — the only record that it may have
+      // changed something durable — and overwriting it told the rewind guard in
+      // `editLastUserMessage` that the branch was safe to delete.
+      const metadata: MessageMetadata = {
+        ...parseJson(row.metadata, {} as MessageMetadata),
+        error: 'Jarvis restarted while this response was being generated.',
+      };
+      write.run(JSON.stringify(metadata), row.id);
     }
     return stale.length;
   }

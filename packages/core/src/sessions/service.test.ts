@@ -223,6 +223,7 @@ describe('transcript persistence and response recovery', () => {
     const done = sessions.addMessage(conversation.id, 'assistant', 'finished answer');
     const inFlight = sessions.addMessage(conversation.id, 'assistant', 'half an ans', {
       status: 'streaming',
+      metadata: { executionId: 'tex_interrupted' },
     });
     db.close();
 
@@ -235,6 +236,7 @@ describe('transcript persistence and response recovery', () => {
     const recovered = after.getMessage(inFlight.id);
     expect(recovered?.status).toBe('interrupted');
     expect(recovered?.content).toBe('half an ans');
+    expect(recovered?.metadata.executionId).toBe('tex_interrupted');
     expect(after.getMessage(done.id)?.status).toBe('complete');
     // An interrupted turn never re-enters the model's context as a real answer.
     expect(after.recentMessages(conversation.id).map((m) => m.id)).toEqual([done.id]);

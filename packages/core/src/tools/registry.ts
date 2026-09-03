@@ -69,6 +69,20 @@ export interface ToolCallContext {
   maxRisk?: RiskLevel | undefined;
   /** Internal audit link used by explicit re-issue. */
   parentExecutionId?: string | null;
+  /**
+   * Called with the execution row the instant it exists — before any tool body
+   * runs, and before `execute` resolves.
+   *
+   * A caller that must be able to say afterwards WHICH execution a durable
+   * effect came from cannot wait for the return value: the process can die
+   * between a mutation landing and the caller recording the id, leaving the
+   * effect with nothing pointing at it. Deliberately allowed to throw, which
+   * fails closed — the tool body has not run yet.
+   *
+   * In-process only. It never crosses a request boundary and confers no
+   * privilege: the actor is still the one the call site asserted.
+   */
+  onExecution?: ((execution: ToolExecution) => void) | undefined;
 }
 
 export type ToolExecutionStatus =
@@ -408,6 +422,7 @@ export class ToolRegistry {
   async escalateAgentRequest(
     executionId: string,
     rawInput: unknown,
+    onExecution?: ToolCallContext['onExecution'],
   ): Promise<ToolExecutionOutcome> {
     const previous = this.getExecution(executionId);
     if (!previous) throw new ToolPermissionError('tool execution not found', 'execution_not_found');
@@ -456,6 +471,7 @@ export class ToolRegistry {
       jobId: previous.jobId,
       agentRunId: previous.agentRunId,
       parentExecutionId: previous.id,
+      onExecution,
     });
     if (outcome.status === 'pending_approval' || outcome.status === 'denied') return outcome;
     throw new Error(
@@ -1066,6 +1082,10 @@ export class ToolRegistry {
       );
     const execution = this.getExecution(id);
     if (!execution) throw new Error('tool execution insert failed');
+    // Announced from the one place every recorded attempt passes through, so a
+    // caller can durably link itself to this row while the tool body still has
+    // not run. See `ToolCallContext.onExecution`.
+    args.ctx.onExecution?.(execution);
     return execution;
   }
 

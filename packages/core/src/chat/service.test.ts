@@ -1420,6 +1420,54 @@ describe('the deployed no-Job regression', () => {
       expect(h.sessions.getMessage(turn.assistantMessage?.id ?? '')).not.toBeNull();
     });
 
+    it('refuses rewind after recovering a crash behind a state-changing action', async () => {
+      const h = harness(withAction('Opened one.', { action: 'new_conversation', title: 'Side' }));
+      const conversation = h.sessions.create();
+      const create = h.sessions.create.bind(h.sessions);
+      // The assistant placeholder exactly as it stood at the instant the tool's
+      // mutation landed -- what a process exit one statement later leaves behind.
+      let linkedId = '';
+      let midContent = '';
+      let midMetadata = '';
+      h.sessions.create = (input: { title?: string; projectId?: string | null } = {}) => {
+        if (input.title === 'Side') {
+          const placeholder = h.sessions.lastMessage(conversation.id);
+          linkedId = String(placeholder?.metadata.executionId ?? '');
+          midContent = placeholder?.content ?? '';
+          midMetadata = JSON.stringify(placeholder?.metadata ?? {});
+        }
+        return create(input);
+      };
+
+      const turn = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'Open a separate conversation for this.',
+      });
+      const placeholderId = turn.assistantMessage?.id ?? '';
+      // Linked while the execution was still running, not after `execute` returned.
+      expect(linkedId).not.toBe('');
+      expect(h.sessions.list().some((session) => session.title === 'Side')).toBe(true);
+
+      // Put the durable rows back to that instant, then boot on top of them.
+      h.db
+        .prepare("UPDATE tool_executions SET status='running', finished_at=NULL WHERE id=?")
+        .run(linkedId);
+      h.db
+        .prepare("UPDATE messages SET content=?, status='streaming', metadata=? WHERE id=?")
+        .run(midContent, midMetadata, placeholderId);
+      expect(h.sessions.recoverInterruptedMessages()).toBe(1);
+      expect(h.tools.recoverInterrupted().interrupted).toBe(1);
+      // Recovery must not drop the link: it is the only thing left in the
+      // transcript pointing at the conversation the tool already created.
+      expect(h.sessions.getMessage(placeholderId)?.metadata.executionId).toBe(linkedId);
+
+      await expect(
+        h.chat.editLastUserMessage(conversation.id, 'Actually, do not open one.'),
+      ).rejects.toThrow(/changed state/);
+      expect(h.sessions.getMessage(turn.userMessage?.id ?? '')).not.toBeNull();
+      expect(h.sessions.getMessage(placeholderId)).not.toBeNull();
+    });
+
     it('edits straight through an action that only read', async () => {
       // An `observe` execution changed nothing, so deleting the messages around
       // it leaves nothing in Jarvis the transcript now contradicts. Blocking

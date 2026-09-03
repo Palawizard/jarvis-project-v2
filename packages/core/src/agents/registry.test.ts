@@ -79,16 +79,23 @@ describe('AgentRegistry v2', () => {
     expect(result.decision.reason).toContain('unavailable');
   });
 
-  it('routes chat only to a provider that can run without tools', async () => {
-    const result = await registry([
-      new FakeProvider('codex', true, false),
-      new FakeProvider('claude'),
-    ]).route('chat', { prefer: 'codex' });
-    expect(result.provider?.id).toBe('claude');
+  it('routes every tool-free role only to a provider that can run without tools', async () => {
+    // Conversation is not the only role that promises this. The two routing
+    // classifiers and the brief compiler make the same promise, so a provider
+    // that cannot prove it is tool-free serves none of them -- and the reason
+    // says which promise it failed, rather than naming the analyst's allowlist.
+    for (const role of ['chat', 'router', 'autostart_verifier', 'brief_compiler'] as const) {
+      const result = await registry([
+        new FakeProvider('codex', true, false),
+        new FakeProvider('claude'),
+      ]).route(role, { prefer: 'codex' });
+      expect(`${role}: ${result.provider?.id}`).toBe(`${role}: claude`);
 
-    const unavailable = await registry([new FakeProvider('codex', true, false)]).route('chat');
-    expect(unavailable.provider).toBeNull();
-    expect(unavailable.reason).toContain('cannot run tool-free chat');
+      const unavailable = await registry([new FakeProvider('codex', true, false)]).route(role);
+      expect(unavailable.provider).toBeNull();
+      expect(unavailable.decision.reason).toContain('cannot run tool-free');
+      expect(unavailable.decision.reason).not.toContain('read-only tool allowlist');
+    }
   });
 
   it('routes the project analyst only to a provider that can be held to an allowlist', async () => {

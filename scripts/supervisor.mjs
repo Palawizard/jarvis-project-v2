@@ -14,6 +14,7 @@ import {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clean = (value) => String(value ?? '').trim();
+const POSIX_DEATH_WATCH = new URL('./posix-death-watch.mjs', import.meta.url).pathname;
 const WINDOWS_JOB_RUNNER =
   process.platform === 'win32'
     ? Buffer.from(
@@ -614,26 +615,22 @@ async function spawnProcess(spec, repo, supervised, stdio = 'inherit', runtimeEn
   };
   // The wrapper reads its target from a private short-lived file; stdin stays
   // the contained process's own channel. Mirrors spawnContained in @jarvis/core.
-  const specPath =
-    process.platform === 'win32'
-      ? path.join(os.tmpdir(), `jarvis-contained-${randomUUID()}.json`)
-      : null;
+  // Both platforms use a wrapper: a Job Object on Windows, a death-watching
+  // group leader on POSIX, so a hard-killed supervisor never orphans a runtime
+  // that is still holding its port.
+  const specPath = path.join(os.tmpdir(), `jarvis-contained-${randomUUID()}.json`);
   const removeSpec = () => {
-    if (specPath) {
-      try {
-        fs.rmSync(specPath, { force: true });
-      } catch {
-        /* the wrapper deletes it as soon as it has read it */
-      }
+    try {
+      fs.rmSync(specPath, { force: true });
+    } catch {
+      /* the wrapper deletes it as soon as it has read it */
     }
   };
-  if (specPath) {
-    fs.writeFileSync(
-      specPath,
-      JSON.stringify({ executable: spec.executable, args: spec.args, cwd: repo, shell: false }),
-      { mode: 0o600 },
-    );
-  }
+  fs.writeFileSync(
+    specPath,
+    JSON.stringify({ executable: spec.executable, args: spec.args, cwd: repo, shell: false }),
+    { mode: 0o600 },
+  );
   const child =
     process.platform === 'win32'
       ? spawn(
@@ -664,17 +661,18 @@ async function spawnProcess(spec, repo, supervised, stdio = 'inherit', runtimeEn
             windowsHide: true,
           },
         )
-      : spawn(spec.executable, spec.args, {
+      : spawn(process.execPath, [POSIX_DEATH_WATCH], {
           cwd: repo,
-          env,
+          // Bootstrap-only; the wrapper drops it before creating the target.
+          env: { ...env, JARVIS_CONTAINED_SPEC_PATH: specPath },
           stdio,
           shell: false,
           detached: true,
           windowsHide: true,
         });
+  child.once('error', removeSpec);
+  child.once('close', removeSpec);
   if (process.platform === 'win32') {
-    child.once('error', removeSpec);
-    child.once('close', removeSpec);
     child.stdin.on('error', () => {
       /* spawn/early-exit errors are reported on the child itself */
     });

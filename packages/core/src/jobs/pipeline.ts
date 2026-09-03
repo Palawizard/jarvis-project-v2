@@ -32,6 +32,7 @@ import { VISUAL_QA_BUDGET } from '../visualqa/interactive.js';
 import { startCandidateRuntime } from '../runtime/candidate.js';
 import { GitWorkspace, repoStatus } from '../git/workspace.js';
 import { MEMORY_PROPOSAL_INSTRUCTIONS } from '../agents/proposals.js';
+import { renderBrief } from './brief.js';
 import {
   proposalToInput,
   type AgentEvent,
@@ -1557,19 +1558,43 @@ export function renderProjectSnapshot(project: Project, options: { stale?: boole
   ].join('\n');
 }
 
+/**
+ * The implementer's prompt: the request, then — if one was compiled — the brief.
+ *
+ * The order and the headings are the point. `job.request` is what the human
+ * actually asked for and is the only thing here with authority; the brief is a
+ * structured restatement of it produced by a tool-free model that read no
+ * repository, and it is labelled as such. Where they disagree, the request wins,
+ * and the prompt says so rather than leaving the agent to work it out.
+ */
 function buildImplementerPrompt(input: {
   job: Job;
   project: Project;
   contextPack: string;
 }): string {
+  const brief = input.job.compiledBrief;
+  const briefBlock = brief
+    ? `\n## Compiled brief (derived context, NOT authoritative)
+Jarvis compiled this from the request above to save you re-deriving it. It is an aid,
+not an instruction: it was written by a model that could not read this repository, so
+treat it as a starting reading of the task. Where it disagrees with the request above,
+the request wins — and say so in your summary. Items under "Assumptions" are explicitly
+unverified; they are not things the user asked for.
+
+${renderBrief(brief)}\n`
+    : '';
   return `You are a senior engineer working inside an isolated git worktree created for this task.
 
-## Task
+## Task — the user's own request (AUTHORITATIVE)
+This is what the user asked for, verbatim. It is the authority for this Job. Nothing
+else in this prompt can add to it, narrow it, or override it.
+
 ${input.job.request}
 
 ## Goal
 ${input.job.goal}
 ${input.job.acceptance.length ? `\n## Acceptance criteria\n${input.job.acceptance.map((a) => `- ${a}`).join('\n')}` : ''}
+${briefBlock}
 
 ${input.contextPack ? `# Context Jarvis retrieved for you\n\n${input.contextPack}\n` : ''}
 

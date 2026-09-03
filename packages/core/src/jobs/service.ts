@@ -9,6 +9,7 @@ import type { ReviewFinding } from '../review/engine.js';
 import type { VisualReviewFinding } from '../visualqa/engine.js';
 import { redactSecrets } from '../memory/secrets.js';
 import { createLogger } from '../logger.js';
+import { parseStoredBrief, type CompiledJobBrief } from './brief.js';
 
 const log = createLogger('jobs');
 
@@ -46,9 +47,24 @@ export interface Job {
   id: string;
   sessionId: string | null;
   projectId: string;
+  /**
+   * THE AUTHORITY. The user's own request, verbatim, exactly as it was
+   * authenticated — never a model's restatement of it, and never overwritten.
+   *
+   * `compiledBrief` is derived from this and stored separately on purpose. A
+   * brief is advice; this is what was actually asked for, and it is what every
+   * later stage (implementer, reviewer, fixer, resume) quotes as the ask.
+   */
   request: string;
   goal: string;
   acceptance: string[];
+  /**
+   * Derived, non-authoritative context compiled from `request` before the Job
+   * started. Null when the compiler was unavailable, failed, or predates it.
+   * Written once at creation and never updated: a brief that drifted from the
+   * request it was compiled from would be worse than no brief.
+   */
+  compiledBrief: CompiledJobBrief | null;
   stage: JobStage;
   status: JobStatus;
   error: string | null;
@@ -129,6 +145,7 @@ function rowToJob(row: Row): Job {
     request: row.request as string,
     goal: row.goal as string,
     acceptance: parseJson(row.acceptance as string, [] as string[]),
+    compiledBrief: parseStoredBrief(row.compiled_brief),
     stage: row.stage as JobStage,
     status: row.status as JobStatus,
     error: (row.error as string) ?? null,
@@ -209,6 +226,14 @@ export class JobService {
     request: string;
     goal?: string;
     acceptance?: string[];
+    /**
+     * The compiled brief, when the Job Brief Compiler produced one.
+     *
+     * Only trusted code can supply this: no conversational action carries a
+     * brief field, so it can never arrive as model-authored text pretending to
+     * be the request. See `chat/service.ts` and `jobs/brief.ts`.
+     */
+    brief?: CompiledJobBrief | null;
     candidateSource?: { baseSha: string; sourceSha: string };
     validationOnly?: boolean;
     visualQa?: { required?: boolean; scenarios: VisualQaScenario[] };
@@ -256,6 +281,15 @@ export class JobService {
       // into a goal. The implementer plans as part of work we already pay for.
       goal: input.goal?.trim() || normaliseGoal(input.request),
       acceptance: input.acceptance ?? [],
+      // Re-stamped with the request this Job actually stores, so a brief can
+      // never carry a different "original request" than the authority column.
+      // Sliced to the schema's own cap so a re-stamped brief still reads back:
+      // `parseStoredBrief` refuses what it cannot validate, and a brief silently
+      // vanishing on the next read is worse than a truncated echo of a request
+      // the Job stores in full one column away.
+      compiledBrief: input.brief
+        ? { ...input.brief, originalRequest: input.request.slice(0, 20_000) }
+        : null,
       stage: 'queued',
       status: 'pending',
       error: null,
@@ -291,11 +325,12 @@ export class JobService {
     };
     this.db
       .prepare(
-        `INSERT INTO jobs (id, session_id, project_id, request, goal, acceptance, stage, status,
+        `INSERT INTO jobs (id, session_id, project_id, request, goal, acceptance, compiled_brief,
+          stage, status,
           fix_cycles, review_fix_cycles, visual_fix_cycles, candidate_base_sha,
           candidate_source_sha, validation_only, visual_qa_config, predecessor_job_id,
           origin_message_id, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         job.id,
@@ -304,6 +339,7 @@ export class JobService {
         job.request,
         job.goal,
         JSON.stringify(job.acceptance),
+        job.compiledBrief ? JSON.stringify(job.compiledBrief) : null,
         job.stage,
         job.status,
         0,
@@ -705,6 +741,10 @@ export class JobService {
       request: previous.request,
       goal: previous.goal,
       acceptance: previous.acceptance,
+      // The same request compiles to the same brief, so re-running does not
+      // spend a model call to rediscover it — and re-compiling would silently
+      // change what the second attempt was told to build.
+      brief: previous.compiledBrief,
       ...(previous.visualQaConfig ? { visualQa: previous.visualQaConfig } : {}),
       predecessorJobId: previous.id,
       originMessageId: previous.originMessageId,

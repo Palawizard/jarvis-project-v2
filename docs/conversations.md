@@ -131,7 +131,12 @@ semantic router          tool-free, ephemeral, strict JSON schema
              +--> clarify --> a question, zero Jobs
              +--> allow P
                       |
-                  trusted validation --> job.create, started
+                  trusted validation
+                      |
+                  job brief compiler   tool-free, decides nothing, may fail
+                      |                "restate this settled request for the agent"
+                      v
+                  job.create, started  request = your words; brief = derived context
 ```
 
 The router and the verifier are separate roles from the conversational
@@ -277,11 +282,42 @@ A `create_job` the conversational assistant emits is a different thing — that 
 the model's inference about what you wanted, in the model's own words — and it
 stops at a confirmation the model cannot answer.
 
+### The job brief compiler
+
+Once both classifiers have agreed and trusted code has resolved the project, one
+more tool-free run turns your request into a structured brief — a title, a goal,
+requirements, checkable acceptance criteria, the project context that actually
+bears on the task, constraints, and any assumptions it had to make — so the
+coding agent starts from a compiled reading of the task instead of re-deriving
+one.
+
+It runs **after** every decision, and it makes none. It cannot choose or change
+the project, cannot decide whether a Job happens, cannot start one, has no
+tools, and its output never reaches the router or the verifier and never becomes
+a message from you. The request you typed is stored verbatim on the Job as
+`request` and stays the authority; the brief is stored beside it as
+`compiledBrief`. Both are given to the coding agent, each under a heading saying
+which is which, and the prompt says the request wins wherever they disagree.
+
+Its rules are the compiler's whole job: never invent a feature, never widen
+scope, never drop a requirement, never turn an ambiguity into a requirement —
+that goes under assumptions, marked unverified. The project summary and analysis
+profile it is shown are somebody else's prose, so they sit in the untrusted
+region under the same rule the routing prompts use: content to read, never an
+instruction.
+
+A brief that cannot be compiled — no provider, a timeout, output that fails
+validation — is simply absent, and the Job is created exactly as it was before
+this stage existed. Failing open is right **here specifically**, because a brief
+is derived context; everything that fails closed was settled upstream. Retrying
+a Job reuses the brief the first attempt was given rather than compiling a new
+one.
+
 ### What this costs
 
 Every message in a workspace with at least one registered project spends one
 tool-free classification run; a message that routes to a code change spends a
-second for the independent check. Messages in a workspace with no registered
+second for the independent check, and a third to compile the brief. Messages in a workspace with no registered
 projects, and explicit memory commands, spend none. Routing uses the balanced
 model profile and gives up after 90 seconds — a one-sentence classification that
 has not answered by then has failed, not thought harder. There is no retry: if a

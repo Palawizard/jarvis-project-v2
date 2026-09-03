@@ -42,7 +42,12 @@ export type AgentRole =
   /** Tool-free structured classification of what the user asked for. */
   | 'router'
   /** The independent second opinion required before an unattended agent starts. */
-  | 'autostart_verifier';
+  | 'autostart_verifier'
+  /**
+   * Tool-free compilation of an already-authorised request into a development
+   * brief. Decides nothing: see `jobs/brief.ts`.
+   */
+  | 'brief_compiler';
 
 export interface ProviderCapabilities {
   id: ProviderId;

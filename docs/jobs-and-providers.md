@@ -36,7 +36,7 @@ third visual attempt, a second visual fixer, or a plan-repair loop; a new attemp
 
 Any active stage may become `paused` or `cancelled`. Provider exhaustion, restart, or bounded repair exhaustion is recoverable and preserves the same worktree/head; `failed` is for irrecoverable setup or corrupt state. `awaiting_user` means a candidate passed configured gates and remains isolated. State transitions are validated centrally and persisted as events.
 
-Planning is deterministic: inspect the committed base, create an isolated worktree, and build an auditable Context Pack. This avoids a model call whose only purpose would be restating the request.
+Planning is deterministic: inspect the committed base, create an isolated worktree, and build an auditable Context Pack. No model call happens inside the pipeline whose only purpose would be restating the request — the structured brief, when there is one, was compiled once before the Job existed (see `docs/conversations.md`) and is carried on the Job as derived context beside the user's own request.
 
 ## Providers
 
@@ -61,15 +61,19 @@ Planning is deterministic: inspect the committed base, create an isolated worktr
 | `chat` | Empty scratch directory, never a repository and never the Jarvis home | **None** |
 | `router` | Empty scratch directory | **None** |
 | `autostart_verifier` | Empty scratch directory | **None** |
+| `brief_compiler` | Empty scratch directory | **None** |
 
-The last three are deliberately separate roles even though their confinement is
+The last four are deliberately separate roles even though their confinement is
 identical, because what they are trusted with is not. `chat` answers you and may
 *request* a structured action. `router` classifies one message into a bounded
 schema. `autostart_verifier` names the repository it thinks is meant, in a fresh
 context, and its agreement is required before any unattended write-capable agent
-starts. Folding them into one role would make "one model said so" sufficient
-again, which is the thing the split exists to prevent. Neither routing role can
-call a tool, create a Job, or reach the database.
+starts. `brief_compiler` runs only once both have agreed, and is trusted with
+nothing at all: it restates a settled request as derived context for the
+implementer, and the Job stores the user's own words separately as the
+authority. Folding them into one role would make "one model said so" sufficient
+again, which is the thing the split exists to prevent. None of the three
+non-conversational roles can call a tool, create a Job, or reach the database.
 
 Their confinement is identical; their **inputs deliberately are not**. The
 verifier is shown the router's conclusion — three bounded values, so that
@@ -81,9 +85,9 @@ opinion counted twice, so a decision that only holds in the light of something
 another model wrote fails the second check by construction. See
 `docs/conversations.md` for the full provenance rule.
 
-Four roles make a promise the provider itself has to keep, so none is routed to
-a provider that cannot keep it. `chat`, `router` and `autostart_verifier`
-promise no tools and need `toolFreeChat`; `project_analyst` promises an exact
+Five roles make a promise the provider itself has to keep, so none is routed to
+a provider that cannot keep it. `chat`, `router`, `autostart_verifier` and
+`brief_compiler` promise no tools and need `toolFreeChat`; `project_analyst` promises an exact
 read-only allowlist and needs `enforcesToolAllowlist`. Only Claude declares
 either today. Codex's `read-only` sandbox prevents writes but still runs shell
 commands, which is not the same guarantee, so it serves none of them — a role

@@ -4,6 +4,7 @@ import type { MemoryService } from '../memory/service.js';
 import type { ProjectService } from '../projects/service.js';
 import type { ProjectAnalysisService } from '../projects/analysis.js';
 import type { JobService } from '../jobs/service.js';
+import { StoredJobBriefSchema } from '../jobs/brief.js';
 import type { JobLifecycle } from '../jobs/lifecycle.js';
 import type { JobPipeline } from '../jobs/pipeline.js';
 import type { SessionService } from '../sessions/service.js';
@@ -316,11 +317,16 @@ export function registerBuiltinTools(
 
   registry.register({
     name: 'job.create',
+    // 5: an optional `brief` field, the Job Brief Compiler's derived context.
+    // It changes what the coding agent is told (not what it is authorised to
+    // do, and not `request`, which stays the authority), so an approval bound
+    // to revision 4 has to be granted again.
+    //
     // 4: the input became `.strict()`, and the tool became idempotent in
     // `originMessageId` -- a message that already has a Job gets that Job back
     // rather than a second one. Both change what an approval means, so a
     // standing permission bound to revision 3 has to be granted again.
-    revision: '4',
+    revision: '5',
     description:
       'Create a development job against a project, optionally starting it. Runs in an isolated ' +
       'worktree and is never merged automatically.',
@@ -340,6 +346,13 @@ export function registerBuiltinTools(
         acceptance: z.array(z.string()).default([]),
         autostart: z.boolean().default(false),
         originMessageId: z.string().nullish(),
+        // Derived context, never authority. `request` above is the user's own
+        // message and stays the instruction; this is the compiled brief that
+        // accompanies it. No conversational action carries this field, so a
+        // model cannot put one here -- only trusted code that ran the compiler
+        // after routing settled. Re-validated against the compiler's own caps
+        // so an over-long or unknown-shaped brief is refused at the boundary.
+        brief: StoredJobBriefSchema.nullish(),
       })
       .strict(),
     async execute(input, ctx) {
@@ -350,6 +363,7 @@ export function registerBuiltinTools(
         projectId: input.projectId,
         request: input.request,
         acceptance: input.acceptance,
+        brief: input.brief ?? null,
         sessionId: ctx.sessionId ?? null,
         originMessageId: input.originMessageId ?? null,
       });

@@ -107,6 +107,18 @@ export {
   type RepairKind,
   type RepairCheckpoint,
 } from './jobs/service.js';
+export {
+  JobBriefCompiler,
+  buildBriefPrompt,
+  renderBrief,
+  parseStoredBrief,
+  CompiledJobBriefSchema,
+  StoredJobBriefSchema,
+  JARVIS_JOB_CONSTRAINTS,
+  JOB_BRIEF_SCHEMA_VERSION,
+  type CompiledJobBrief,
+  type BriefCompilerInput,
+} from './jobs/brief.js';
 export { JobLifecycle, type StaleJobReport, type JobDeletionPlan } from './jobs/lifecycle.js';
 export {
   canTransition,

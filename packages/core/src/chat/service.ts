@@ -14,6 +14,7 @@ import type { Memory, MemoryScope } from '../memory/types.js';
 import { classifyExplicitMemory, detectExplicitCommand } from '../memory/policy.js';
 import { renderProjectRegistry, type Project, type ProjectService } from '../projects/service.js';
 import type { Job, JobService } from '../jobs/service.js';
+import { JobBriefCompiler, type CompiledJobBrief } from '../jobs/brief.js';
 import { renderProjectSnapshot } from '../jobs/pipeline.js';
 import type { Message, SessionService } from '../sessions/service.js';
 import type { ToolRegistry } from '../tools/registry.js';
@@ -131,8 +132,15 @@ export class ChatService {
   /** Semantic interpretation. Tool-free, bounded, and never an authority. */
   private readonly router: SemanticRouter;
 
+  /**
+   * Structured restatement of an already-authorised request. Runs strictly
+   * after routing has settled, decides nothing, and fails to `null`.
+   */
+  private readonly briefs: JobBriefCompiler;
+
   constructor(private readonly deps: ChatDeps) {
     this.router = new SemanticRouter({ config: deps.config, agents: deps.agents });
+    this.briefs = new JobBriefCompiler({ config: deps.config, agents: deps.agents });
   }
 
   isResponding(conversationId: string): boolean {
@@ -643,6 +651,30 @@ export class ChatService {
       };
     }
 
+    if (controller.signal.aborted) return stopped();
+
+    // JOB BRIEF COMPILER. Everything that decides anything is already decided:
+    // both classifiers agreed, the project row is resolved, and a Job is going
+    // to be created. This stage only restates the request the person typed as a
+    // structured brief for the coding agent.
+    //
+    // It runs HERE — after the verifier, before creation — and not one step
+    // earlier, because a stage that ran before the verdict could influence it.
+    // Its output goes nowhere near the router or the verifier, is never written
+    // back as a user message, and never replaces `request`: it travels beside
+    // it as a separate field the implementer prompt labels as derived advice.
+    //
+    // A null brief is a normal outcome (no provider, a timeout, malformed
+    // output) and costs the agent some orientation, nothing else. Fail-open is
+    // right for derived context and would be wrong for anything above it.
+    const request = pendingRequest(history, userMessage, placeholderId);
+    const brief = await this.briefs.compile({
+      request,
+      project: decision.outcome.project,
+      cwd: this.scratchDir(),
+      signal: controller.signal,
+    });
+
     // Checked once more against the async gap above, because this is the last
     // moment before a side effect: `stop()` must never report success for an
     // operation that went on to start an agent anyway. From here `stop()`
@@ -662,7 +694,7 @@ export class ChatService {
       {
         action: 'create_job',
         project: decision.outcome.project.id,
-        request: pendingRequest(history, userMessage, placeholderId),
+        request,
         acceptance: [],
       },
       // Runs as the human, and this is the ONLY path that does.
@@ -670,10 +702,12 @@ export class ChatService {
       // The agent actor exists because a model-emitted `create_job` is the
       // conversational model's INFERENCE about what the human wanted — its own
       // words, its own idea of the task — so it stops at a confirmation. What
-      // reaches the tool here contains no model output at all: the request is
-      // the person's message verbatim, and the project is a row trusted code
-      // resolved from an id it had itself offered. A model chose between
-      // candidates; it did not write anything that gets executed. That is the
+      // reaches the tool here contains no model output in any authoritative
+      // position: the request is the person's message verbatim, and the project
+      // is a row trusted code resolved from an id it had itself offered. A model
+      // chose between candidates, and a second one wrote the `brief` field,
+      // which is derived advice the implementer prompt labels as such and which
+      // no stage treats as the instruction. That is the
       // same authority as the "Start Job" button on the project page, which
       // creates a Job with no confirmation at all — and this path is the
       // stricter of the two, because it still goes through the permission
@@ -681,6 +715,7 @@ export class ChatService {
       // `POST /api/jobs` does not.
       'user',
       decision.audit,
+      brief,
     );
   }
 
@@ -920,6 +955,16 @@ export class ChatService {
     actor: 'agent' | 'user' = 'agent',
     /** Why this turn is doing this, when a semantic route decided it. */
     routing?: RoutingAudit,
+    /**
+     * The compiled brief, for a `create_job` a semantic route decided.
+     *
+     * A separate parameter rather than a field on `ChatAction` on purpose:
+     * `ChatActionSchema` is what a model may emit and it is `.strict()`, so
+     * there is no shape in which model-authored text can arrive here calling
+     * itself a brief. Only `routeSemantically`, which ran the compiler itself
+     * on the person's own words, ever passes one.
+     */
+    brief?: CompiledJobBrief | null,
   ): Promise<ChatTurn> {
     const { sessions, jobs, tools } = this.deps;
     const settle = (
@@ -956,12 +1001,17 @@ export class ChatService {
       return settle(prose || 'Nothing to do.', 'chat');
     }
 
+    // The brief rides along as derived context; `request` in the input above is
+    // still the person's own message, and `job.create` stores the two apart.
+    const input =
+      brief && action.action === 'create_job' ? { ...resolved.input, brief } : resolved.input;
+
     const linkExecution = (execution: { id: string }): void => {
       if (!sessions.updateMessage(placeholderId, { metadata: { executionId: execution.id } })) {
         throw new Error('assistant placeholder disappeared before tool execution');
       }
     };
-    const outcome = await tools.execute(toolName, resolved.input, {
+    const outcome = await tools.execute(toolName, input, {
       actor,
       sessionId: conversationId,
       projectId: resolved.projectId ?? null,
@@ -994,11 +1044,7 @@ export class ChatService {
     ): ChatTurn => settle(reply, kind, extra, { executionId: ran.execution.id, ...metadata });
 
     if (outcome.status === 'denied' && outcome.execution.reasonCode === 'actor_risk_ceiling') {
-      const asUser = await tools.escalateAgentRequest(
-        outcome.execution.id,
-        resolved.input,
-        linkExecution,
-      );
+      const asUser = await tools.escalateAgentRequest(outcome.execution.id, input, linkExecution);
       ran = asUser;
       if (asUser.status === 'pending_approval') {
         const reply = [

@@ -227,8 +227,8 @@ export class AgentRegistry {
             (cap) =>
               `${cap.id}: ${
                 cap.available && !roleAllowed(role, cap)
-                  ? role === 'chat'
-                    ? 'cannot run tool-free chat'
+                  ? isToolFreeRole(role)
+                    ? 'cannot run tool-free'
                     : 'cannot be restricted to a read-only tool allowlist'
                   : (cap.reason ?? 'unavailable')
               }`,
@@ -388,16 +388,18 @@ function routingReason(
 /**
  * May this provider serve this role at all?
  *
- * Three roles make a promise the provider itself has to keep. `chat`, `router`
- * and `autostart_verifier` promise no tools; `project_analyst` promises an exact
- * read-only allowlist, which a merely read-only sandbox does not give (it still
- * runs shell commands). A provider that cannot make the guarantee is not routed,
- * rather than being routed and quietly making a weaker one.
+ * Some roles make a promise the provider itself has to keep. The tool-free set
+ * (`chat`, `router`, `autostart_verifier`, `brief_compiler`) promises no tools;
+ * `project_analyst` promises an exact read-only allowlist, which a merely
+ * read-only sandbox does not give (it still runs shell commands). A provider
+ * that cannot make the guarantee is not routed, rather than being routed and
+ * quietly making a weaker one.
  */
 function roleAllowed(role: AgentRole, capability: ProviderCapabilities): boolean {
-  // Conversation and the two routing roles all promise the same thing — the
-  // model reaches no provider-native tool — so they all need the same declared
-  // capability. A provider that cannot prove it is tool-free never sees one.
+  // Conversation, the two routing roles and the brief compiler all promise the
+  // same thing — the model reaches no provider-native tool — so they all need
+  // the same declared capability. A provider that cannot prove it is tool-free
+  // never sees one.
   if (isToolFreeRole(role)) return capability.toolFreeChat === true;
   if (role === 'project_analyst') return capability.enforcesToolAllowlist === true;
   return true;

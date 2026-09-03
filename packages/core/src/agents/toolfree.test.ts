@@ -16,13 +16,15 @@ import type { AgentEvent } from './types.js';
  * for looked exactly like the second case: the conversational provider used
  * `AskUserQuestion` and `Explore`, and Jarvis had no way to notice.
  *
- * Three roles are covered, not one. `chat` answers the human; `router` and
+ * Four roles are covered, not one. `chat` answers the human; `router` and
  * `autostart_verifier` classify one message each, and the second one's
  * agreement is what stands between a sentence and an autonomous agent editing
  * real source. A classifier that could read the filesystem to "check" its
- * answer would be a coding agent nobody asked for.
+ * answer would be a coding agent nobody asked for. `brief_compiler` restates an
+ * already-authorised request for the implementer, and one that could read the
+ * repository would be an implementer running before the Job exists.
  */
-const TOOL_FREE = ['chat', 'router', 'autostart_verifier'] as const;
+const TOOL_FREE = ['chat', 'router', 'autostart_verifier', 'brief_compiler'] as const;
 const fixtures = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-toolfree-'));
 
 afterAll(() => {

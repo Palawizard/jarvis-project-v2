@@ -399,6 +399,8 @@ export function JobDetailView({
             )}
           </Card>
 
+          {job.compiledBrief && <CompiledBrief brief={job.compiledBrief} />}
+
           <Card title="Implementation summary">
             {implementationRun?.result ? (
               <div style={{ whiteSpace: 'pre-wrap' }}>{implementationRun.result}</div>
@@ -958,6 +960,44 @@ function VisualQaOutcome({ status }: { status: NonNullable<Job['visualQaStatus']
     <div className="row" style={{ marginTop: 10 }} data-testid={`visual-qa-${status}`}>
       <Badge tone={tone}>{label}</Badge>
     </div>
+  );
+}
+
+/**
+ * The compiled brief, shown UNDER the request and labelled as derived.
+ *
+ * Deliberately a second card rather than a prettier rendering of the request:
+ * the request is what the human asked for and the brief is a model's reading of
+ * it, and someone auditing a candidate has to be able to tell which is which.
+ */
+function CompiledBrief({ brief }: { brief: NonNullable<Job['compiledBrief']> }) {
+  const list = (label: string, items: string[]) =>
+    items.length > 0 ? (
+      <div style={{ marginTop: 10 }}>
+        <div className="small dim">{label}</div>
+        <ul className="small" style={{ marginBottom: 0 }}>
+          {items.map((item, index) => (
+            <li key={index}>{item}</li>
+          ))}
+        </ul>
+      </div>
+    ) : null;
+  return (
+    <Card title="Compiled brief">
+      <div className="small dim">
+        Derived context for the coding agent, compiled from the request above. Not authoritative
+        {brief.model ? ` — ${brief.provider ?? 'provider'} / ${brief.model}` : ''}.
+      </div>
+      <div style={{ marginTop: 10, fontWeight: 600 }}>{brief.title}</div>
+      <div className="small" style={{ whiteSpace: 'pre-wrap' }}>
+        {brief.goal}
+      </div>
+      {list('Requirements', brief.requirements)}
+      {list('Acceptance criteria', brief.acceptanceCriteria)}
+      {list('Relevant project context', brief.relevantProjectContext)}
+      {list('Constraints', brief.constraints)}
+      {list('Assumptions (unverified)', brief.assumptions)}
+    </Card>
   );
 }
 

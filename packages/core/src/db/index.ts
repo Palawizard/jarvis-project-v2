@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /**
  * A LIKE pattern for a term a human typed.
@@ -276,6 +276,16 @@ export const MIGRATIONS = new Map<number, string>([
     // its history, and reads back as NULL, which the approval path treats
     // exactly as it did before this column existed.
     `ALTER TABLE jobs ADD COLUMN visual_qa_status TEXT;`,
+  ],
+  [
+    12,
+    // The compiled job brief, stored BESIDE `jobs.request` and never over it.
+    //
+    // Additive and nullable. `request` keeps holding the user's own message
+    // verbatim — that column is the authority and this migration does not touch
+    // it — and every existing Job reads back with no brief, which is what it
+    // has: it was created before the compiler existed.
+    `ALTER TABLE jobs ADD COLUMN compiled_brief TEXT;`,
   ],
 ]);
 

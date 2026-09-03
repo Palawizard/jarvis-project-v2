@@ -3,17 +3,21 @@ import type { AgentEvent, AgentRole } from './types.js';
 /**
  * Roles that must reach the model with no provider-native tools at all.
  *
- * All three run in an empty scratch directory with no repository to read and
+ * All four run in an empty scratch directory with no repository to read and
  * nothing to change. Conversation may ASK Jarvis for things, but only through
  * the trusted `jarvis-action` path — plain text the domain validates, not a
  * provider tool call. The two routing roles do not even do that: they classify
  * one message into a bounded schema and stop, and a classifier that can read
- * the filesystem to "check" its answer is a coding agent nobody asked for.
+ * the filesystem to "check" its answer is a coding agent nobody asked for. The
+ * brief compiler is the same shape: it restates an already-authorised request
+ * into a bounded schema, and a compiler that could go and read the repository
+ * would be an implementer that runs before the Job exists.
  */
 const TOOL_FREE_ROLES: ReadonlySet<AgentRole> = new Set<AgentRole>([
   'chat',
   'router',
   'autostart_verifier',
+  'brief_compiler',
 ]);
 
 export function isToolFreeRole(role: AgentRole): boolean {

@@ -90,9 +90,23 @@ export interface Job {
   id: string;
   projectId: string;
   sessionId: string | null;
+  /** The user's own request, verbatim. The authority for the Job. */
   request: string;
   goal: string;
   acceptance: string[];
+  /** Derived, non-authoritative context compiled from `request` before work started. */
+  compiledBrief: {
+    title: string;
+    goal: string;
+    requirements: string[];
+    acceptanceCriteria: string[];
+    relevantProjectContext: string[];
+    constraints: string[];
+    assumptions: string[];
+    originalRequest: string;
+    provider: string | null;
+    model: string | null;
+  } | null;
   stage: JobStage;
   status: string;
   error: string | null;

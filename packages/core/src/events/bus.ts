@@ -15,6 +15,11 @@ export type JarvisEventType =
   | 'job.archived'
   | 'job.deleted'
   | 'job.linked'
+  // The brief compiler, which runs before a Job exists and so carries a session
+  // rather than a job id. Payloads hold counts and reasons, never brief content.
+  | 'job.brief.compilation.started'
+  | 'job.brief.compilation.completed'
+  | 'job.brief.compilation.failed'
   | 'candidate.approved'
   | 'candidate.apply.started'
   | 'candidate.apply.completed'

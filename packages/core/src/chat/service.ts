@@ -140,7 +140,11 @@ export class ChatService {
 
   constructor(private readonly deps: ChatDeps) {
     this.router = new SemanticRouter({ config: deps.config, agents: deps.agents });
-    this.briefs = new JobBriefCompiler({ config: deps.config, agents: deps.agents });
+    this.briefs = new JobBriefCompiler({
+      config: deps.config,
+      agents: deps.agents,
+      bus: deps.bus,
+    });
   }
 
   isResponding(conversationId: string): boolean {
@@ -668,12 +672,22 @@ export class ChatService {
     // output) and costs the agent some orientation, nothing else. Fail-open is
     // right for derived context and would be wrong for anything above it.
     const request = pendingRequest(history, userMessage, placeholderId);
-    const brief = await this.briefs.compile({
-      request,
-      project: decision.outcome.project,
-      cwd: this.scratchDir(),
-      signal: controller.signal,
-    });
+    // ONE JOB PER MESSAGE means one brief per message. `handleTurn` already
+    // checked this before routing; it is checked again because routing spends
+    // two provider calls, and another writer — `POST /api/jobs` from the
+    // clarification candidate button carries the same `originMessageId` — can
+    // create the Job inside that window. `job.create` would then hand the
+    // existing Job back and ignore `brief` entirely, so compiling one here
+    // spends a third provider call on something nothing ever reads.
+    const brief = this.deps.jobs.byOriginMessage(userMessage.id)
+      ? null
+      : await this.briefs.compile({
+          request,
+          project: decision.outcome.project,
+          cwd: this.scratchDir(),
+          sessionId: conversationId,
+          signal: controller.signal,
+        });
 
     // Checked once more against the async gap above, because this is the last
     // moment before a side effect: `stop()` must never report success for an

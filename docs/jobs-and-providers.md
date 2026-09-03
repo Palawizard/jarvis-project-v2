@@ -61,7 +61,7 @@ Planning is deterministic: inspect the committed base, create an isolated worktr
 | `chat` | Empty scratch directory, never a repository and never the Jarvis home | **None** |
 | `router` | Empty scratch directory | **None** |
 | `autostart_verifier` | Empty scratch directory | **None** |
-| `brief_compiler` | Empty scratch directory | **None** |
+| `brief_compiler` | Scratch directory holding nothing but the JSON Schema its own answer is constrained to | **None** |
 
 The last four are deliberately separate roles even though their confinement is
 identical, because what they are trusted with is not. `chat` answers you and may

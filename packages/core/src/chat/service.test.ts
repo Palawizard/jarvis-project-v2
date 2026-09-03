@@ -71,7 +71,22 @@ class ScriptedProvider implements AgentProvider {
     const scripted = this.reply(options.prompt, options.role);
     if (typeof scripted !== 'string') return scripted;
     onEvent({ kind: 'text', text: scripted });
-    return { status: 'completed', result: scripted, memoryProposals: [] };
+    // What both real adapters do with `outputSchemaPath`: the final message is
+    // returned parsed, and a run that was never schema-constrained has none.
+    let structured: unknown;
+    if (options.outputSchemaPath) {
+      try {
+        structured = JSON.parse(scripted);
+      } catch {
+        /* an answer the provider could not constrain has no structured output */
+      }
+    }
+    return {
+      status: 'completed',
+      result: scripted,
+      memoryProposals: [],
+      ...(structured !== undefined ? { structuredOutput: structured } : {}),
+    };
   }
 }
 

@@ -114,10 +114,12 @@ export {
   parseStoredBrief,
   CompiledJobBriefSchema,
   StoredJobBriefSchema,
+  BRIEF_OUTPUT_SCHEMA,
   JARVIS_JOB_CONSTRAINTS,
   JOB_BRIEF_SCHEMA_VERSION,
   type CompiledJobBrief,
   type BriefCompilerInput,
+  type BriefCompilationFailure,
 } from './jobs/brief.js';
 export { JobLifecycle, type StaleJobReport, type JobDeletionPlan } from './jobs/lifecycle.js';
 export {

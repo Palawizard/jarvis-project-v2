@@ -301,17 +301,31 @@ which is which, and the prompt says the request wins wherever they disagree.
 
 Its rules are the compiler's whole job: never invent a feature, never widen
 scope, never drop a requirement, never turn an ambiguity into a requirement —
-that goes under assumptions, marked unverified. The project summary and analysis
-profile it is shown are somebody else's prose, so they sit in the untrusted
-region under the same rule the routing prompts use: content to read, never an
-instruction.
+that goes under assumptions, marked unverified. The only thing anybody else
+wrote that it is shown at all is your request, in the untrusted region under the
+same rule the routing prompts use: content to read, never an instruction. The
+project summary and analysis profile are deliberately **not** given to it —
+prose it can restate as project context would reach the coding agent as a
+compiled fact — and the coding agent receives that material on its own path
+instead, labelled as a previous analysis.
 
-A brief that cannot be compiled — no provider, a timeout, output that fails
-validation — is simply absent, and the Job is created exactly as it was before
-this stage existed. Failing open is right **here specifically**, because a brief
-is derived context; everything that fails closed was settled upstream. Retrying
-a Job reuses the brief the first attempt was given rather than compiling a new
-one.
+The brief comes back through the provider's own structured-output mechanism: a
+JSON Schema is written into the run's scratch directory and passed to the CLI,
+and the answer is re-validated against Jarvis's own schema afterwards, because a
+provider's enforcement is not Jarvis's trust boundary. `originalRequest` is
+always re-stamped from the authenticated message, so the model's copy of it
+never matters. Scraping JSON out of prose remains only for a provider that does
+not support structured output at all.
+
+A brief that cannot be compiled is simply absent, and the Job is created exactly
+as it was before this stage existed. Failing open is right **here specifically**,
+because a brief is derived context; everything that fails closed was settled
+upstream. Each attempt records `job.brief.compilation.started` and then either
+`completed` or `failed` with the precise reason — provider unavailable, provider
+failed, cancelled, timed out, empty output, structured output missing, or schema
+rejected — carrying counts and field paths, never brief content. Retrying a Job
+reuses the brief the first attempt was given rather than compiling a new one,
+and a message that has already produced a Job is never compiled a second time.
 
 ### What this costs
 

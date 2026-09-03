@@ -16,6 +16,7 @@ import { loadConfig, type JarvisConfig } from '../config.js';
 import { openDb, type Db } from '../db/index.js';
 import { EventBus } from '../events/bus.js';
 import { GitWorkspace } from '../git/workspace.js';
+import { JOB_BRIEF_SCHEMA_VERSION, type CompiledJobBrief } from './brief.js';
 import { JobService } from './service.js';
 import { ProjectService, type Project, type ProjectCommands } from '../projects/service.js';
 import type { Review, ReviewFinding, ReviewOptions } from '../review/engine.js';
@@ -71,6 +72,33 @@ const success = (result = 'done', sessionId?: string): AgentRunResult => ({
   result,
   ...(sessionId ? { sessionId } : {}),
   memoryProposals: [],
+});
+
+const APPROVES = {
+  review: (_call: number, opts: ReviewOptions) => ({
+    runId: null,
+    provider: 'codex',
+    verdict: 'approve' as const,
+    summary: 'approved',
+    findings: [],
+    headRef: opts.headRef,
+    blocking: false,
+  }),
+};
+
+const fixtureBrief = (): CompiledJobBrief => ({
+  schemaVersion: JOB_BRIEF_SCHEMA_VERSION,
+  title: 'Add OAuth login',
+  goal: 'A user can sign in with Google.',
+  requirements: ['Add a Google OAuth provider'],
+  acceptanceCriteria: ['Signing in lands on the dashboard'],
+  relevantProjectContext: [],
+  constraints: [],
+  assumptions: [],
+  originalRequest: 'Add OAuth login.',
+  compiledAt: nowIso(),
+  provider: 'claude',
+  model: null,
 });
 
 const highFinding = (): ReviewFinding => ({
@@ -595,6 +623,34 @@ describe('job repair pipeline', () => {
     expect(h.provider.calls.find((call) => call.role === 'fixer')?.prompt).toContain(
       highFinding().description,
     );
+    h.db.close();
+  });
+
+  it('puts the user request above the compiled brief in the implementer prompt', async () => {
+    const h = await harness(APPROVES);
+    await runToRest(h, { projectId: '', request: 'Add OAuth login.', brief: fixtureBrief() });
+    const prompt = h.provider.calls.find((call) => call.role === 'implementer')?.prompt ?? '';
+
+    // Order is the guarantee: authority first, derived context second, and the
+    // brief's own contents only inside the section that says what they are.
+    const request = prompt.indexOf("## Task — the user's own request (AUTHORITATIVE)");
+    const briefHeading = prompt.indexOf('Compiled brief (derived context, NOT authoritative)');
+    const requirement = prompt.indexOf('Add a Google OAuth provider');
+    expect(request).toBeGreaterThanOrEqual(0);
+    expect(briefHeading).toBeGreaterThan(request);
+    expect(requirement).toBeGreaterThan(briefHeading);
+    // The request itself is above the brief heading, not only its own heading.
+    expect(prompt.indexOf('Add OAuth login.')).toBeLessThan(briefHeading);
+    h.db.close();
+  });
+
+  it('names no brief at all in the implementer prompt when none was compiled', async () => {
+    const h = await harness(APPROVES);
+    await runToRest(h, { projectId: '', request: 'Add OAuth login.' });
+    const prompt = h.provider.calls.find((call) => call.role === 'implementer')?.prompt ?? '';
+
+    expect(prompt).toContain("## Task — the user's own request (AUTHORITATIVE)");
+    expect(prompt).not.toContain('Compiled brief');
     h.db.close();
   });
 

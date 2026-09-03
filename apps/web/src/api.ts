@@ -677,10 +677,11 @@ export const api = {
     request<{ stopped: boolean }>(`/api/conversations/${id}/stop`, { method: 'POST' }),
   retryResponse: (id: string) =>
     request<ChatTurn>(`/api/conversations/${id}/retry`, { method: 'POST' }),
-  editLastMessage: (id: string, text: string) =>
+  /** Without `messageId`, edits the latest user message; with one, resumes from it. */
+  editLastMessage: (id: string, text: string, messageId?: string) =>
     request<ChatTurn>(`/api/conversations/${id}/edit-last`, {
       method: 'POST',
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, messageId }),
     }),
 
   search: (query: string) => request<SearchHit[]>(`/api/search?q=${encodeURIComponent(query)}`),

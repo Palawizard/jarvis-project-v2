@@ -193,6 +193,109 @@ test('FLOW A — Jarvis opens as a chat assistant and ordinary talk creates no J
   expect(consoleErrors).toEqual([]);
 });
 
+test('FLOW A1 — an earlier message can be edited, cancelled, resent and copied', async ({
+  page,
+  app,
+  context,
+  request,
+}) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await app.open();
+  await expect(page.getByTestId('chat-view')).toBeVisible();
+  const conversationId = await newChat(page);
+  const control = await credential(page);
+
+  const transcript = async () => {
+    const response = await request.get(`/api/conversations/${conversationId}`, {
+      headers: headers(control),
+    });
+    return (await response.json()) as {
+      messages: Array<{ id: string; role: string; content: string }>;
+    };
+  };
+
+  const FIRST = 'First question about slow start. E2E-NORMAL-QUESTION';
+  await send(page, FIRST);
+  await expect(page.getByTestId('chat-view').getByText('congestion window')).toBeVisible();
+  await send(page, 'Second question, built on the first. E2E-MARKDOWN');
+  await expect(page.getByTestId('chat-view').getByText('Heading')).toBeVisible();
+  await settled(page);
+
+  const firstUser = (await transcript()).messages.find((message) => message.role === 'user');
+  expect(firstUser?.content).toBe(FIRST);
+  const composer = page.getByLabel('Message Jarvis');
+
+  // Editing an OLD message, not the last one: the banner has to say that the
+  // rest of the conversation goes with it.
+  await page.getByTestId(`edit-message-${firstUser?.id}`).click();
+  await expect(composer).toHaveValue(FIRST);
+  await expect(page.getByTestId('editing-banner')).toContainText('everything after it');
+
+  // Cancel is a real way out: nothing is sent and nothing is deleted.
+  await page.getByTestId('editing-banner').getByRole('button', { name: 'Cancel' }).click();
+  await expect(page.getByTestId('editing-banner')).toHaveCount(0);
+  await expect(composer).toHaveValue('');
+  expect((await transcript()).messages.map((message) => message.id)).toContain(firstUser?.id);
+
+  // Resend. The request must name the message the person clicked Edit on —
+  // sending without it would rewrite the LATEST message instead, silently
+  // editing a turn they never selected.
+  const EDITED = 'First question, rephrased. E2E-NORMAL-QUESTION';
+  await page.getByTestId(`edit-message-${firstUser?.id}`).click();
+  const posted = page.waitForRequest(
+    (candidate) => candidate.url().includes('/edit-last') && candidate.method() === 'POST',
+  );
+  await composer.fill(EDITED);
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+  await composer.press('Enter');
+  // The composer clears in the same render as `busy`, so this is what makes the
+  // `settled()` below wait for the new turn instead of seeing the old Send.
+  await expect(composer).toHaveValue('');
+  expect(JSON.parse((await posted).postData() ?? '{}')).toMatchObject({
+    text: EDITED,
+    messageId: firstUser?.id,
+  });
+  await settled(page);
+
+  // The rewind: the old wording and every turn built on it are gone.
+  const chat = page.getByTestId('chat-view');
+  await expect(chat).toContainText('First question, rephrased');
+  await expect(chat).not.toContainText('First question about slow start');
+  await expect(chat).not.toContainText('Second question, built on the first');
+  const after = (await transcript()).messages;
+  expect(after.filter((message) => message.role === 'user')).toHaveLength(1);
+  expect(after.map((message) => message.id)).not.toContain(firstUser?.id);
+
+  // Copy says "Copied" only once the clipboard really holds the message.
+  const rewritten = after.find((message) => message.role === 'user');
+  const copyButton = page.getByTestId(`copy-message-${rewritten?.id}`);
+  await copyButton.click();
+  await expect(copyButton).toHaveText('Copied');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(EDITED);
+
+  // Phone width: the actions are not hidden behind a hover, so a tap still
+  // reaches them. The label going back to Copy first is what makes the second
+  // "Copied" evidence of this click rather than of the previous one.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(copyButton).toHaveText('Copy', { timeout: 5_000 });
+  await expect(copyButton).toBeVisible();
+  await copyButton.click();
+  await expect(copyButton).toHaveText('Copied');
+  await page.setViewportSize({ width: 1280, height: 800 });
+
+  // A refused or unavailable clipboard must be reported, not celebrated.
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: () => Promise.reject(new Error('clipboard blocked')) },
+    });
+  });
+  await expect(copyButton).toHaveText('Copy', { timeout: 5_000 });
+  await copyButton.click();
+  await expect(page.getByRole('alert')).toContainText('Could not copy');
+  await expect(copyButton).toHaveText('Copy');
+});
+
 test('FLOW A2 — the destructive confirmation says what goes and what stays', async ({
   page,
   app,

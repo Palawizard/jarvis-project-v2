@@ -522,10 +522,18 @@ export function createRoutes(jarvis: Jarvis): Hono {
   });
 
   app.post('/api/conversations/:id/edit-last', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { text?: unknown };
+    const body = (await c.req.json().catch(() => ({}))) as { text?: unknown; messageId?: unknown };
     if (typeof body.text !== 'string' || !body.text.trim()) return fail('text is required');
+    if (body.messageId !== undefined && typeof body.messageId !== 'string') {
+      return fail('messageId must be a string');
+    }
     try {
-      return c.json(await jarvis.chat.editLastUserMessage(c.req.param('id'), body.text));
+      // The service checks the message really belongs to this conversation: an
+      // id names a row in the whole database, so the path parameter is what
+      // says which transcript may be rewound.
+      return c.json(
+        await jarvis.chat.editLastUserMessage(c.req.param('id'), body.text, body.messageId),
+      );
     } catch (error) {
       return fail(error instanceof Error ? error.message : String(error), 409);
     }

@@ -1289,6 +1289,232 @@ describe('the deployed no-Job regression', () => {
     }
   });
 
+  describe('editing an earlier message rewinds the branch below it', () => {
+    it('resumes the conversation from the edited message', async () => {
+      // Editing message N is not "insert a correction at the end": the answer to
+      // the old wording, and every turn that was built on it, would still be
+      // sitting in the transcript below it. Everything from N onwards goes.
+      const h = await registered(routesTo({ kind: 'normal_chat' }, 'Here is an answer.'));
+      const conversation = h.sessions.create();
+      const first = await h.chat.send({ conversationId: conversation.id, text: 'first question' });
+      await h.chat.send({ conversationId: conversation.id, text: 'second question' });
+
+      await h.chat.editLastUserMessage(
+        conversation.id,
+        'first question, rephrased',
+        first.userMessage?.id,
+      );
+
+      const contents = h.sessions.messages(conversation.id, 50).map((message) => message.content);
+      expect(contents).not.toContain('first question');
+      expect(contents).not.toContain('second question');
+      const rewrites = contents.filter((content) => content === 'first question, rephrased');
+      expect(rewrites).toHaveLength(1);
+    });
+
+    it('refuses to edit a message that belongs to another conversation', async () => {
+      // A message id names a row in the whole database. Without the ownership
+      // check, this route rewinds an unrelated transcript from this one.
+      const h = await registered(routesTo({ kind: 'normal_chat' }, 'Here is an answer.'));
+      const mine = h.sessions.create();
+      const other = h.sessions.create();
+      const elsewhere = await h.chat.send({ conversationId: other.id, text: 'not your message' });
+
+      await expect(
+        h.chat.editLastUserMessage(mine.id, 'rewritten', elsewhere.userMessage?.id),
+      ).rejects.toThrow(/no user message to edit/);
+
+      const kept = h.sessions.messages(other.id, 50).map((message) => message.content);
+      expect(kept).toContain('not your message');
+    });
+
+    /**
+     * The invariant the whole rewind rests on.
+     *
+     * `conversation.create` is `safe_action`, so an agent may run it with no
+     * approval at all: it succeeds inside the turn and there is never a pending
+     * execution to notice. Only the assistant row's `executionId` records that
+     * anything happened, and without it the edit deletes the branch while the
+     * conversation it created is still in Jarvis with nothing explaining it.
+     */
+    it('links an automatically approved, state-changing action to its message', async () => {
+      const h = harness(withAction('Opened one.', { action: 'new_conversation', title: 'Side' }));
+      const conversation = h.sessions.create();
+
+      const turn = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'Open a separate conversation for this.',
+      });
+
+      const executionId = turn.assistantMessage?.metadata.executionId;
+      expect(typeof executionId).toBe('string');
+      const execution = h.tools.getExecution(executionId as string);
+      expect(execution?.toolName).toBe('conversation.create');
+      // Nobody confirmed anything, and the effect is already durable.
+      expect(execution?.status).toBe('succeeded');
+      expect(execution?.approvedBy).toBeNull();
+      expect(h.sessions.list().some((session) => session.title === 'Side')).toBe(true);
+    });
+
+    it('refuses to edit away an automatically approved action that changed state', async () => {
+      const h = harness(withAction('Opened one.', { action: 'new_conversation', title: 'Side' }));
+      const conversation = h.sessions.create();
+      const turn = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'Open a separate conversation for this.',
+      });
+
+      await expect(
+        h.chat.editLastUserMessage(conversation.id, 'Actually, do not open one.'),
+      ).rejects.toThrow(/changed state/);
+
+      // The side effect is still there, and so is the transcript that explains it.
+      expect(h.sessions.list().some((session) => session.title === 'Side')).toBe(true);
+      expect(h.sessions.getMessage(turn.userMessage?.id ?? '')).not.toBeNull();
+      expect(h.sessions.getMessage(turn.assistantMessage?.id ?? '')).not.toBeNull();
+    });
+
+    it('edits straight through an action that only read', async () => {
+      // An `observe` execution changed nothing, so deleting the messages around
+      // it leaves nothing in Jarvis the transcript now contradicts. Blocking
+      // here would make "what projects do I have?" permanently unrewindable.
+      const h = harness(withAction('Here they are.', { action: 'list_projects' }));
+      const conversation = h.sessions.create();
+      const turn = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'Which projects are registered?',
+      });
+      const executionId = turn.assistantMessage?.metadata.executionId;
+      expect(h.tools.getExecution(executionId as string)?.risk).toBe('observe');
+
+      await h.chat.editLastUserMessage(conversation.id, 'Which projects are archived?');
+
+      const contents = h.sessions.messages(conversation.id, 50).map((message) => message.content);
+      expect(contents).not.toContain('Which projects are registered?');
+      expect(contents).toContain('Which projects are archived?');
+    });
+
+    it('denies a pending Job request before editing and resending its branch', async () => {
+      let request = 'Fix the old wording';
+      const block = () => JSON.stringify({ action: 'create_job', project: 'jarvis', request });
+      const h = await registered((_prompt, role) =>
+        role === 'chat' ? `Starting.\n\n\`\`\`jarvis-action\n${block()}\n\`\`\`` : NORMAL_CHAT,
+      );
+      const conversation = h.sessions.create();
+      const original = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'Start the old request.',
+      });
+      const oldExecutionId = original.action?.executionId ?? 'missing';
+      expect(h.tools.getExecution(oldExecutionId)?.status).toBe('pending_approval');
+
+      request = 'Fix the rewritten wording';
+      const rewritten = await h.chat.editLastUserMessage(
+        conversation.id,
+        'Start the rewritten request.',
+        original.userMessage?.id,
+      );
+
+      // An approval dialog whose message is gone has no context left to answer.
+      expect(h.tools.getExecution(oldExecutionId)?.status).toBe('denied');
+      await expect(h.tools.approve(oldExecutionId)).rejects.toThrow(/not awaiting approval/);
+      expect(h.jobs.list({ archived: 'all' })).toHaveLength(0);
+
+      const approved = await h.tools.approve(rewritten.action?.executionId ?? 'missing');
+      expect(approved.status).toBe('succeeded');
+      const jobs = h.jobs.list({ archived: 'all' });
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.request).toContain('Fix the rewritten wording');
+      expect(jobs[0]?.originMessageId).toBe(rewritten.userMessage?.id);
+    });
+
+    it('refuses to edit a branch whose action is already running', async () => {
+      const h = await registered(
+        withAction('Starting.', {
+          action: 'create_job',
+          project: 'jarvis',
+          request: 'Fix the running request',
+        }),
+      );
+      const conversation = h.sessions.create();
+      const original = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'Start the running request.',
+      });
+      const executionId = original.action?.executionId ?? 'missing';
+      h.db.prepare("UPDATE tool_executions SET status='running' WHERE id=?").run(executionId);
+
+      await expect(
+        h.chat.editLastUserMessage(conversation.id, 'Replace the running request.'),
+      ).rejects.toThrow(/running action/);
+
+      expect(h.sessions.getMessage(original.userMessage?.id ?? '')).not.toBeNull();
+      expect(h.sessions.getMessage(original.assistantMessage?.id ?? '')).not.toBeNull();
+    });
+
+    it('refuses to edit a branch whose non-Job action already succeeded', async () => {
+      const h = harness(
+        withAction('Renamed.', { action: 'rename_conversation', title: 'Committed title' }),
+      );
+      const conversation = h.sessions.create();
+      const original = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'Rename this conversation.',
+      });
+      await h.tools.approve(original.action?.executionId ?? 'missing');
+
+      await expect(
+        h.chat.editLastUserMessage(conversation.id, 'Do not rename this conversation.'),
+      ).rejects.toThrow(/changed state/);
+
+      expect(h.sessions.get(conversation.id)?.title).toBe('Committed title');
+      expect(h.sessions.getMessage(original.userMessage?.id ?? '')).not.toBeNull();
+      expect(h.sessions.getMessage(original.assistantMessage?.id ?? '')).not.toBeNull();
+    });
+
+    it('refuses to edit away an earlier explicit memory mutation', async () => {
+      // Memory commands never reach the tool boundary, so there is no execution
+      // row to inspect: the guard has to recognise the message itself.
+      const h = harness(routesTo({ kind: 'normal_chat' }, 'Ordinary answer.'));
+      const conversation = h.sessions.create();
+      const remembered = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'Remember that I prefer pnpm.',
+      });
+      await h.chat.send({ conversationId: conversation.id, text: 'What should I build next?' });
+
+      await expect(
+        h.chat.editLastUserMessage(
+          conversation.id,
+          'Remember that I prefer npm.',
+          remembered.userMessage?.id,
+        ),
+      ).rejects.toThrow(/changed memory/);
+
+      const stored = h.memory.list({ scope: 'user' }).items.map((memory) => memory.content);
+      expect(stored).toContainEqual(expect.stringContaining('pnpm'));
+      expect(h.sessions.getMessage(remembered.userMessage?.id ?? '')).not.toBeNull();
+    });
+
+    it('still refuses to edit away a message that already started a Job', async () => {
+      const h = await registered(routesTo({ kind: 'code_change', project: 'jarvis' }));
+      const conversation = h.sessions.create();
+      const turn = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'fix the login bug in Jarvis',
+      });
+
+      // Named explicitly, so the guard is exercised through the message that is
+      // being rewound rather than only through the tail of the transcript.
+      await expect(
+        h.chat.editLastUserMessage(conversation.id, 'never mind', turn.userMessage?.id),
+      ).rejects.toThrow(/already started a Job/);
+
+      expect(h.jobs.list({ archived: 'all' })).toHaveLength(1);
+      expect(h.sessions.getMessage(turn.userMessage?.id ?? '')).not.toBeNull();
+    });
+  });
+
   describe('one Job per message, whatever happens to the turn', () => {
     /**
      * A turn that really created a Job, ready to be interfered with.

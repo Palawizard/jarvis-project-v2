@@ -37,7 +37,9 @@ export function ChatView({
     () => localStorage.getItem(`jarvis-draft:${conversationId}`) ?? '',
   );
   const [busy, setBusy] = useState(false);
-  const [editing, setEditing] = useState(false);
+  /** Id of the already-sent user message being rewritten, or null for a new one. */
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<{
     executionId: string;
@@ -80,7 +82,8 @@ export function ChatView({
   }, [lastEvent, conversationId]);
   useEffect(() => {
     setDraft(localStorage.getItem(`jarvis-draft:${conversationId}`) ?? '');
-    setEditing(false);
+    setEditingId(null);
+    setCopied(null);
     setError(null);
     textarea.current?.focus();
   }, [conversationId]);
@@ -126,9 +129,11 @@ export function ChatView({
     setError(null);
     setDraft('');
     try {
-      if (editing) await api.editLastMessage(conversationId, text);
+      // Editing an already-sent message resumes the conversation from it: the
+      // server drops that turn and everything after it before answering again.
+      if (editingId) await api.editLastMessage(conversationId, text, editingId);
       else await api.sendMessage(conversationId, text);
-      setEditing(false);
+      setEditingId(null);
       detail.reload();
     } catch (reason) {
       setDraft(text);
@@ -136,6 +141,27 @@ export function ChatView({
     } finally {
       setBusy(false);
       textarea.current?.focus();
+    }
+  };
+
+  /**
+   * Copy one message, and only say "Copied" once it really is.
+   *
+   * `navigator.clipboard` does not exist outside a secure context, and
+   * `writeText` rejects when the document is not focused or the permission is
+   * refused — so both failures have to reach the person, who otherwise walks
+   * away with an empty clipboard and a label saying it worked.
+   */
+  const copy = async (message: Message) => {
+    try {
+      await navigator.clipboard.writeText(message.content);
+      setError(null);
+      setCopied(message.id);
+      setTimeout(() => setCopied(null), 1500);
+    } catch (reason) {
+      setCopied(null);
+      const why = reason instanceof Error ? reason.message : String(reason);
+      setError(`Could not copy to the clipboard (${why}). Select the text and copy it yourself.`);
     }
   };
 
@@ -253,7 +279,9 @@ export function ChatView({
             return (
               <article
                 key={message.id}
-                className={`chat-message ${message.role} ${message.status}`}
+                className={`chat-message ${message.role} ${message.status}${
+                  editingId === message.id ? ' being-edited' : ''
+                }`}
               >
                 <div className="message-label">
                   {message.role === 'assistant' ? 'Jarvis' : message.role}
@@ -306,7 +334,14 @@ export function ChatView({
                       ))}
                     </div>
                   ) : null}
-                  {message.metadata.executionId &&
+                  {/* `tool` is written only by the paths that stopped at a human
+                      decision, and it is what this badge is about. Every
+                      tool-backed message now carries an `executionId` — that is
+                      how an edit knows what the branch already did — so gating
+                      on the id alone would put a "Completed" badge under every
+                      ordinary action reply. */}
+                  {message.metadata.tool &&
+                    message.metadata.executionId &&
                     (() => {
                       const execution = executions.get(message.metadata.executionId as string);
                       const state = confirmationState(execution?.status);
@@ -333,6 +368,32 @@ export function ChatView({
                         <Badge tone={state.tone}>{state.label}</Badge>
                       );
                     })()}
+                  {message.content && (
+                    <div className="message-actions">
+                      <button
+                        className="btn sm"
+                        data-testid={`copy-message-${message.id}`}
+                        onClick={() => void copy(message)}
+                      >
+                        {copied === message.id ? 'Copied' : 'Copy'}
+                      </button>
+                      {message.role === 'user' && (
+                        <button
+                          className="btn sm"
+                          data-testid={`edit-message-${message.id}`}
+                          disabled={busy}
+                          onClick={() => {
+                            setError(null);
+                            setEditingId(message.id);
+                            setDraft(message.content);
+                            textarea.current?.focus();
+                          }}
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </article>
             );
@@ -352,13 +413,15 @@ export function ChatView({
         </button>
       )}
       <footer className="chat-composer">
-        {editing && (
-          <div className="tiny dim">
-            Editing your latest message{' '}
+        {editingId && (
+          <div className="tiny dim" data-testid="editing-banner">
+            {editingId === lastUser?.id
+              ? 'Editing your latest message'
+              : 'Editing an earlier message — everything after it will be replaced'}{' '}
             <button
               className="link-button"
               onClick={() => {
-                setEditing(false);
+                setEditingId(null);
                 setDraft('');
               }}
             >
@@ -386,7 +449,7 @@ export function ChatView({
               <button
                 className="btn sm"
                 onClick={() => {
-                  setEditing(true);
+                  setEditingId(lastUser.id);
                   setDraft(lastUser.content);
                   textarea.current?.focus();
                 }}

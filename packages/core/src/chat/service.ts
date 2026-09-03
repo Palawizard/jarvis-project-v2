@@ -69,6 +69,16 @@ export interface ChatTurn {
 const CONTEXT_TURNS = 12;
 
 /**
+ * Execution statuses that mean the tool never ran.
+ *
+ * A branch carrying only these can be rewound: there is no effect in Jarvis for
+ * the deleted transcript to become inconsistent with. Every other status —
+ * including `failed`, `timed_out` and `interrupted`, where the effect is
+ * unknown — has to be assumed to have happened.
+ */
+const NEVER_EXECUTED: string[] = ['pending_approval', 'denied', 'expired'];
+
+/**
  * The conversational front door.
  *
  * Everything the user types arrives here, and exactly one of five things
@@ -305,8 +315,22 @@ export class ChatService {
     return this.handleTurn(conversationId, userMessage);
   }
 
-  /** Replace the most recent user message and answer the new one. */
-  async editLastUserMessage(conversationId: string, text: string): Promise<ChatTurn> {
+  /**
+   * Replace a user message and answer the new one, dropping everything after it.
+   *
+   * With no `messageId` this is "edit last". With one, the conversation resumes
+   * from that message: the edited turn and every message that followed it are
+   * removed, so the transcript never shows an answer to a question that is no
+   * longer there.
+   *
+   * Rewinding is only honest while the branch being deleted left nothing behind
+   * it. Every guard below is one way it could have.
+   */
+  async editLastUserMessage(
+    conversationId: string,
+    text: string,
+    messageId?: string,
+  ): Promise<ChatTurn> {
     const { sessions } = this.deps;
     // Refuse before deleting anything. This used to delete the tail and then
     // call send(), which throws while a response is streaming -- losing both the
@@ -314,25 +338,75 @@ export class ChatService {
     if (this.running.has(conversationId)) {
       throw new Error('this conversation is already producing a response');
     }
-    const lastUser = sessions.lastUserMessage(conversationId);
-    if (!lastUser) throw new Error('there is no user message to edit');
+    const target = messageId
+      ? sessions.getMessage(messageId)
+      : sessions.lastUserMessage(conversationId);
+    // The conversation check is the authority: a message id names a row in the
+    // whole database, so without it the route would rewind someone else's
+    // transcript from this one.
+    if (!target || target.role !== 'user' || target.sessionId !== conversationId) {
+      throw new Error('there is no user message to edit');
+    }
+    // Positional, not timestamp-based: two rows written in the same millisecond
+    // are ordered by rowid, and `createdAt >= target` would have taken an
+    // earlier sibling with it.
+    const recent = sessions.messages(conversationId, 500);
+    const from = recent.findIndex((message) => message.id === target.id);
+    if (from < 0) throw new Error('that message is too far back in the transcript to edit');
+    const doomed = recent.slice(from);
+    const executions = [
+      ...new Set(
+        doomed
+          .map((message) => message.metadata.executionId)
+          .filter((id): id is string => typeof id === 'string'),
+      ),
+    ]
+      .map((id) => this.deps.tools.getExecution(id))
+      .filter((execution) => execution !== null);
+
+    if (executions.some((execution) => execution.status === 'running')) {
+      throw new Error('that message has a running action; wait for it to finish before editing');
+    }
     // A turn that started work cannot be edited away. `committed` is cleared
     // when the turn ends, so by the time the Job is running this conversation
     // looks idle — and the edit deletes the assistant row carrying the Job's
     // card, leaving an agent writing in a worktree that the transcript no
     // longer mentions, while the re-sent message starts a second one. Rewriting
     // the request is not how you stop work: `job.cancel` is.
-    if (this.deps.jobs.byOriginMessage(lastUser.id)) {
+    if (doomed.some((message) => this.deps.jobs.byOriginMessage(message.id))) {
       throw new Error('that message already started a Job; cancel the Job instead of editing it');
     }
-    // Everything after the message being replaced, found from the real end of
-    // the transcript rather than from a window that may not contain it.
-    for (const message of sessions
-      .messages(conversationId, 500)
-      .filter((message) => message.createdAt >= lastUser.createdAt && message.role !== 'user')) {
-      sessions.deleteMessage(message.id);
+    // An execution that only READ can be edited through: deleting the messages
+    // around it leaves nothing in Jarvis that the transcript now contradicts.
+    // Anything above `observe` changed durable state this rewind cannot undo,
+    // and it does NOT have to have been confirmed to have done so — a
+    // `safe_action` like `conversation.create` is auto-approved and succeeds
+    // inside the turn. Deleting its branch would leave the effect in Jarvis
+    // with nothing left to explain where it came from.
+    if (
+      executions.some(
+        (execution) => execution.risk !== 'observe' && !NEVER_EXECUTED.includes(execution.status),
+      )
+    ) {
+      throw new Error('that branch may already have changed state; undo the action before editing');
     }
-    sessions.deleteMessage(lastUser.id);
+    // Memory commands never reach the tool boundary — they are handled
+    // deterministically in `send` — so they have no execution row to inspect.
+    if (
+      doomed.some(
+        (message) => message.role === 'user' && detectExplicitCommand(message.content) !== null,
+      )
+    ) {
+      throw new Error('that branch changed memory; undo the memory change before editing');
+    }
+    // Nothing here ran, so nothing may run later either: an approval dialog for
+    // a request whose message is about to disappear has no context left.
+    for (const execution of executions) {
+      if (execution.status === 'pending_approval') {
+        this.deps.tools.deny(execution.id, 'superseded by an edited message');
+      }
+    }
+    for (const message of doomed) sessions.deleteMessage(message.id);
     return this.send({ conversationId, text });
   }
 
@@ -882,8 +956,32 @@ export class ChatService {
       ...(resolved.jobId ? { jobId: resolved.jobId } : {}),
     });
 
+    /**
+     * Settle a turn that reached the tool boundary, linked to what it ran.
+     *
+     * Every assistant row produced by an execution carries that execution's id,
+     * whatever the outcome — not only the ones that stopped at a confirmation.
+     * That link is what lets an edit ask whether the branch it is about to
+     * delete already changed something: without it, an auto-approved
+     * state-changing action (`conversation.create` is `safe_action`, so it needs
+     * no approval and succeeds inside the turn) left an effect in Jarvis that
+     * nothing in the transcript pointed at, and the rewind looked safe.
+     *
+     * `ran` rather than `outcome`, because an agent request refused at the risk
+     * ceiling is re-issued as the user and it is the SECOND execution that
+     * carries the decision and any effect.
+     */
+    let ran = outcome;
+    const settleRan = (
+      reply: string,
+      kind: ChatTurnKind,
+      extra: Partial<ChatTurn> = {},
+      metadata: Record<string, unknown> = {},
+    ): ChatTurn => settle(reply, kind, extra, { executionId: ran.execution.id, ...metadata });
+
     if (outcome.status === 'denied' && outcome.execution.reasonCode === 'actor_risk_ceiling') {
       const asUser = await tools.escalateAgentRequest(outcome.execution.id, resolved.input);
+      ran = asUser;
       if (asUser.status === 'pending_approval') {
         const reply = [
           prose,
@@ -891,7 +989,7 @@ export class ChatService {
         ]
           .filter(Boolean)
           .join('\n\n');
-        return settle(
+        return settleRan(
           reply,
           'confirmation_required',
           {
@@ -902,20 +1000,19 @@ export class ChatService {
             },
           },
           {
-            executionId: asUser.execution.id,
             tool: toolName,
             ...(resolved.targetLabel ? { target: resolved.targetLabel } : {}),
           },
         );
       }
-      return this.settleToolOutcome(settle, prose, action.action, toolName, asUser);
+      return this.settleToolOutcome(settleRan, prose, action.action, toolName, asUser);
     }
 
     if (outcome.status === 'pending_approval') {
       const reply = [prose, `This needs your confirmation: **${toolName}**.`]
         .filter(Boolean)
         .join('\n\n');
-      return settle(
+      return settleRan(
         reply,
         'confirmation_required',
         {
@@ -926,7 +1023,6 @@ export class ChatService {
           },
         },
         {
-          executionId: outcome.execution.id,
           tool: toolName,
           ...(resolved.targetLabel ? { target: resolved.targetLabel } : {}),
         },
@@ -960,7 +1056,7 @@ export class ChatService {
         payload: { goal: job.goal, projectId: job.projectId },
       });
       const reply = prose || `Started **${job.goal}** on ${this.projectName(job.projectId)}.`;
-      return settle(
+      return settleRan(
         reply,
         'action',
         { job, action: { name: action.action, status: 'executed' } },
@@ -973,7 +1069,7 @@ export class ChatService {
       // model believed about it a moment ago.
       const summary = this.describeJob(resolved.jobId);
       const reply = [prose, summary].filter(Boolean).join('\n\n');
-      return settle(
+      return settleRan(
         reply,
         'action',
         {
@@ -984,7 +1080,7 @@ export class ChatService {
       );
     }
 
-    return this.settleToolOutcome(settle, prose, action.action, toolName, outcome);
+    return this.settleToolOutcome(settleRan, prose, action.action, toolName, outcome);
   }
 
   /** Deterministic, always-current one-paragraph status for a Job. */

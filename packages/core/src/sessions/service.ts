@@ -60,6 +60,14 @@ export interface MessageMetadata {
   activity?: string;
   /** Job ids this message refers to, for tombstone-safe card rendering. */
   jobIds?: string[];
+  /**
+   * The tool execution this message came out of, whatever its outcome.
+   *
+   * Written for every assistant row a tool produced — not only the ones that
+   * stopped at a confirmation — because it is how editing an earlier message
+   * discovers what the branch it is about to delete already did.
+   */
+  executionId?: string;
   [key: string]: unknown;
 }
 

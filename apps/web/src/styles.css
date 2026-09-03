@@ -977,6 +977,35 @@ kbd {
 .message-content {
   min-width: 0;
 }
+/* Revealed on hover, but kept reachable by keyboard: `visibility: hidden` would
+   take the buttons out of the tab order entirely. */
+.message-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.chat-message:hover .message-actions,
+.message-actions:focus-within {
+  opacity: 1;
+}
+/* A coarse pointer has no hover to reveal anything with, so on touch the
+   actions are simply always visible, with a real 44px target to tap. */
+@media (hover: none), (pointer: coarse) {
+  .message-actions {
+    opacity: 1;
+  }
+  .message-actions .btn {
+    min-height: 44px;
+    padding: 6px 16px;
+  }
+}
+.chat-message.being-edited .message-content {
+  border-left: 2px solid var(--accent);
+  padding-left: 10px;
+  margin-left: -12px;
+}
 .message-content > p:first-child,
 .markdown > p:first-child {
   margin-top: 0;

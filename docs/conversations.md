@@ -45,6 +45,36 @@ Every message you send takes exactly one of these paths.
    conversation, analyse or archive a project. Trusted code validates and
    dispatches it, and anything destructive stops at your confirmation.
 
+## Editing an earlier message
+
+Every message carries **Copy**, and every message you wrote carries **Edit**.
+Editing is not a correction appended at the end: the conversation resumes from
+that message, so the edited turn and everything below it are deleted before the
+new wording is answered. The reply to a question that no longer exists must not
+stay in the transcript.
+
+That is only honest while the deleted branch left nothing behind it, so a rewind
+is refused when the branch:
+
+- has a tool execution still `running`;
+- started a Job — cancel the Job instead, `job.cancel` is the capability for
+  stopping work, and rewriting the request is not;
+- ran anything above `observe` that did not stop before executing. Not just the
+  actions you confirmed: `conversation.create` is `safe_action`, so it is
+  auto-approved and succeeds inside the turn. Its effect is durable either way,
+  and a `failed`, `timed_out` or `interrupted` execution is assumed to have had
+  one too;
+- contains an explicit memory command, which is applied deterministically and
+  never reaches the tool boundary.
+
+An execution that only read (`observe`) is edited straight through: deleting the
+messages around it leaves nothing in Jarvis that the transcript now contradicts.
+A request still waiting for your confirmation is denied first — an approval
+dialog whose message is about to disappear has no context left to answer.
+
+This rests on every assistant message produced by a tool execution carrying that
+execution's id, not only the ones that stopped at a confirmation.
+
 ## How Jarvis decides what you asked for
 
 ### Why this is not left to the conversational assistant

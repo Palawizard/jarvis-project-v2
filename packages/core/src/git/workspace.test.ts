@@ -357,6 +357,10 @@ describe('immutable candidate materialization', () => {
     fs.writeFileSync(path.join(repo, 'added.txt'), 'added\n');
     fs.writeFileSync(path.join(repo, 'binary.bin'), Buffer.from([0, 255, 1, 2, 128, 13, 10]));
     fs.writeFileSync(path.join(repo, 'mode.sh'), '#!/bin/sh\necho source\n');
+    // Windows has no on-disk executable bit, so the index needs it set explicitly;
+    // on Linux core.filemode is live and the working tree must match, or the
+    // switch below sees a dirty mode change.
+    fs.chmodSync(path.join(repo, 'mode.sh'), 0o755);
     git(['add', '-A']);
     git(['update-index', '--chmod=+x', 'mode.sh']);
     git(['commit', '-qm', 'candidate source']);

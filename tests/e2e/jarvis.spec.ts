@@ -438,6 +438,10 @@ test('FLOW B3 — routing reaches exactly one of three outcomes', async ({ page,
  */
 test('FLOW B4 — affinity is a hint, not permission', async ({ page, app, request }) => {
   await app.open();
+  // newChat waits for the URL to CHANGE, so the opening conversation has to be
+  // in it already; without this it can read the opening one as if it were new
+  // and every later Job query asks about the wrong conversation.
+  await expect(page.getByTestId('chat-view')).toBeVisible();
   const control = await credential(page);
   const self = await selfProject(request, control);
 

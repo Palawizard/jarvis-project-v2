@@ -75,6 +75,12 @@ dialog whose message is about to disappear has no context left to answer.
 This rests on every assistant message produced by a tool execution carrying that
 execution's id, not only the ones that stopped at a confirmation.
 
+A conversation is named once, from its first user message, so rewinding past
+that message drops the derived name and lets the new wording name the
+conversation again — otherwise the sidebar keeps pointing at a turn that no
+longer exists. A name you chose, or one `conversation.rename` wrote, is not a
+default and survives the rewind untouched.
+
 ## How Jarvis decides what you asked for
 
 ### Why this is not left to the conversational assistant

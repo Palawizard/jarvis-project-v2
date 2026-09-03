@@ -406,6 +406,13 @@ export class ChatService {
         this.deps.tools.deny(execution.id, 'superseded by an edited message');
       }
     }
+    // A conversation is named once, from its first user message. Rewinding past
+    // that message leaves the sidebar and the header naming a turn that no
+    // longer exists, so the derived name goes with it and the re-sent message
+    // names the conversation again. A name the user chose is kept — it no
+    // longer matches the derivation, which is what `clearDerivedTitle` checks.
+    const named = from === 0 ? doomed[0] : undefined;
+    if (named) sessions.clearDerivedTitle(conversationId, named.content);
     for (const message of doomed) sessions.deleteMessage(message.id);
     return this.send({ conversationId, text });
   }

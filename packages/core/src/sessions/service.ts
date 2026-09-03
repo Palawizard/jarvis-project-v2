@@ -282,6 +282,26 @@ export class SessionService {
     return session;
   }
 
+  /**
+   * Drop the derived name when the message it was derived from is deleted.
+   *
+   * A conversation is named once, from its first user message, so rewinding
+   * past that message left the sidebar naming a turn that no longer exists.
+   * Clearing it lets `autoTitle` name the conversation again from whatever
+   * replaces it.
+   *
+   * Only when the stored title still *is* that derivation: a name the user
+   * chose, or `conversation.rename` wrote, is theirs and survives a rewind. The
+   * comparison lives in the UPDATE so a rename landing between a read and a
+   * write cannot be clobbered.
+   */
+  clearDerivedTitle(id: string, derivedFrom: string): boolean {
+    const result = this.db
+      .prepare('UPDATE sessions SET title = NULL WHERE id = ? AND title = ?')
+      .run(id, deriveConversationTitle(derivedFrom));
+    return Number(result.changes) > 0;
+  }
+
   setPinned(id: string, pinned: boolean): Session | null {
     this.db
       .prepare('UPDATE sessions SET pinned = ?, updated_at = ? WHERE id = ?')

@@ -257,11 +257,16 @@ test('FLOW A1 — an earlier message can be edited, cancelled, resent and copied
   });
   await settled(page);
 
-  // The rewind: the old wording and every turn built on it are gone.
-  const chat = page.getByTestId('chat-view');
-  await expect(chat).toContainText('First question, rephrased');
-  await expect(chat).not.toContainText('First question about slow start');
-  await expect(chat).not.toContainText('Second question, built on the first');
+  // The rewind, asserted on the transcript itself rather than on the whole
+  // workspace: the header carries the conversation's NAME, which is a separate
+  // thing and is checked on its own below.
+  const scroll = page.locator('.message-scroll');
+  await expect(scroll).toContainText('First question, rephrased');
+  await expect(scroll).not.toContainText('First question about slow start');
+  await expect(scroll).not.toContainText('Second question, built on the first');
+  // The conversation was named after the message that was just rewritten, so
+  // the name follows it instead of pointing at a turn that no longer exists.
+  await expect(page.locator('.chat-header h1')).toHaveText(EDITED);
   const after = (await transcript()).messages;
   expect(after.filter((message) => message.role === 'user')).toHaveLength(1);
   expect(after.map((message) => message.id)).not.toContain(firstUser?.id);

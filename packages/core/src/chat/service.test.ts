@@ -1312,6 +1312,52 @@ describe('the deployed no-Job regression', () => {
       expect(rewrites).toHaveLength(1);
     });
 
+    it('renames the conversation when the message that named it is rewritten', async () => {
+      // A conversation is named once, from its first user message. Deleting that
+      // message without dropping the name left the sidebar and the header
+      // pointing at a turn that no longer exists anywhere.
+      const h = await registered(routesTo({ kind: 'normal_chat' }, 'Here is an answer.'));
+      const conversation = h.sessions.create();
+      await h.chat.send({ conversationId: conversation.id, text: 'first question' });
+      expect(h.sessions.get(conversation.id)?.title).toBe('first question');
+
+      await h.chat.editLastUserMessage(conversation.id, 'first question, rephrased');
+
+      expect(h.sessions.get(conversation.id)?.title).toBe('first question, rephrased');
+    });
+
+    it('keeps a name the user chose when an edited message is rewound', async () => {
+      // Renaming is a decision; the derived name is only a default. A rewind
+      // may drop the default and must never overwrite the decision.
+      const h = await registered(routesTo({ kind: 'normal_chat' }, 'Here is an answer.'));
+      const conversation = h.sessions.create();
+      await h.chat.send({ conversationId: conversation.id, text: 'first question' });
+      h.sessions.rename(conversation.id, 'Networking notes');
+
+      await h.chat.editLastUserMessage(conversation.id, 'first question, rephrased');
+
+      expect(h.sessions.get(conversation.id)?.title).toBe('Networking notes');
+    });
+
+    it('leaves the name alone when an edit does not reach the first message', async () => {
+      const h = await registered(routesTo({ kind: 'normal_chat' }, 'Here is an answer.'));
+      const conversation = h.sessions.create();
+      await h.chat.send({ conversationId: conversation.id, text: 'first question' });
+      const second = await h.chat.send({
+        conversationId: conversation.id,
+        text: 'second question',
+      });
+
+      await h.chat.editLastUserMessage(
+        conversation.id,
+        'second, rephrased',
+        second.userMessage?.id,
+      );
+
+      // The message the name came from is still there, so the name still fits.
+      expect(h.sessions.get(conversation.id)?.title).toBe('first question');
+    });
+
     it('refuses to edit a message that belongs to another conversation', async () => {
       // A message id names a row in the whole database. Without the ownership
       // check, this route rewinds an unrelated transcript from this one.

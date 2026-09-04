@@ -69,7 +69,7 @@ describe('the decision reaches the Codex CLI', () => {
   });
 
   it('omits the override entirely when no effort was decided', () => {
-    expect(buildCodexArgs(options(), 'terra')).not.toContain('-c');
+    expect(buildCodexArgs(options(), 'gpt-5.6-terra')).not.toContain('-c');
   });
 
   it('always pins --model, so the user CLI config never picks the model', () => {
@@ -77,7 +77,7 @@ describe('the decision reaches the Codex CLI', () => {
     // let ~/.codex/config.toml choose any model it likes.
     for (const args of [buildCodexArgs(options()), buildCodexArgs(options('high'))]) {
       expect(args).toContain('--model');
-      expect(args[args.indexOf('--model') + 1]).toBe('terra');
+      expect(args[args.indexOf('--model') + 1]).toBe('gpt-5.6-terra');
     }
     for (const tier of ['normal', 'strong'] as const) {
       const args = buildCodexArgs(options('medium'), modelFor('codex', tier));
@@ -86,12 +86,14 @@ describe('the decision reaches the Codex CLI', () => {
   });
 
   it('omits the override rather than pretending when the CLI cannot take one', () => {
-    const args = buildCodexArgs(options('high'), 'terra', { effortControl: false });
+    const args = buildCodexArgs(options('high'), 'gpt-5.6-terra', { effortControl: false });
     expect(args).not.toContain('-c');
   });
 
   it('refuses a model outside the allowlist', () => {
-    for (const model of ['gpt-5', 'o3', 'opus', 'haiku']) {
+    // "terra"/"sol" are the shorthand names from the feature spec, not the real
+    // Codex CLI model IDs — they must never reach `--model` again.
+    for (const model of ['gpt-5', 'o3', 'opus', 'haiku', 'terra', 'sol', 'gpt-5.6-luna']) {
       const build = () => buildCodexArgs(options('low'), model);
       expect(build).toThrow(/not allowed/);
     }
@@ -100,7 +102,7 @@ describe('the decision reaches the Codex CLI', () => {
   it('refuses an effort outside low|medium|high', () => {
     for (const effort of ILLEGAL_EFFORTS) {
       const bad = { ...options(), effort: effort as EffortLevel };
-      const build = () => buildCodexArgs(bad, 'terra');
+      const build = () => buildCodexArgs(bad, 'gpt-5.6-terra');
       expect(build).toThrow(/low\|medium\|high/);
     }
   });

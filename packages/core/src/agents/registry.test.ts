@@ -26,7 +26,7 @@ class FakeProvider implements AgentProvider {
       authenticated: this.available,
       streaming: true,
       resumable: true,
-      models: this.id === 'claude' ? ['sonnet', 'opus'] : ['terra', 'sol'],
+      models: this.id === 'claude' ? ['sonnet', 'opus'] : ['gpt-5.6-terra', 'gpt-5.6-sol'],
       effortControl: this.effortControl,
       structuredOutput: true,
       toolFreeChat: this.toolFreeChat,

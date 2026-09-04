@@ -26,7 +26,9 @@ export const CAPABILITY_TIERS: readonly CapabilityTier[] = ['normal', 'strong'];
  */
 export const PROVIDER_MODELS: Record<ProviderId, Record<CapabilityTier, string>> = {
   claude: { normal: 'sonnet', strong: 'opus' },
-  codex: { normal: 'terra', strong: 'sol' },
+  // These are the real Codex CLI model IDs, not the "terra"/"sol" shorthand
+  // used in the feature spec — Codex rejects the shorthand outright.
+  codex: { normal: 'gpt-5.6-terra', strong: 'gpt-5.6-sol' },
 };
 
 export const ALLOWED_MODELS: Record<ProviderId, readonly string[]> = {

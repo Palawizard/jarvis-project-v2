@@ -73,7 +73,7 @@ const MATRIX: TaskSignals[] = [
 describe('model policy — anchored cases', () => {
   it('1. the router is always the cheap bounded model', () => {
     expect(run('claude', 'router')).toBe('claude/sonnet/low');
-    expect(run('codex', 'router')).toBe('codex/terra/low');
+    expect(run('codex', 'router')).toBe('codex/gpt-5.6-terra/low');
     // Even the most alarming signals cannot buy the router a stronger model.
     expect(run('claude', 'router', ALARMING)).toBe('claude/sonnet/low');
   });
@@ -133,7 +133,7 @@ describe('model policy — anchored cases', () => {
   it('8. a big cross-package feature with DB, UI and backend is strong high', () => {
     const feature = { ...BIG, dbMigration: true };
     expect(run('claude', 'implementer', feature)).toBe('claude/opus/high');
-    expect(run('codex', 'implementer', feature)).toBe('codex/sol/high');
+    expect(run('codex', 'implementer', feature)).toBe('codex/gpt-5.6-sol/high');
   });
 
   it('8b. complexity alone, with no risk signal at all, still reaches strong', () => {
@@ -203,7 +203,7 @@ describe('model policy — anchored cases', () => {
         expect(EFFORT_LEVELS).toContain(effort);
         expect(CAPABILITY_TIERS).toContain(capabilityTier);
         expect(['sonnet', 'opus']).toContain(modelFor('claude', capabilityTier));
-        expect(['terra', 'sol']).toContain(modelFor('codex', capabilityTier));
+        expect(['gpt-5.6-terra', 'gpt-5.6-sol']).toContain(modelFor('codex', capabilityTier));
       }
     }
   });

@@ -53,7 +53,7 @@ Planning is deterministic: inspect the committed base, create an isolated worktr
 
 One central, deterministic policy (`packages/core/src/agents/policy.ts`) chooses the model AND the effort for every agent run. No extra model call is made to make the choice.
 
-- The decision space is closed: Claude is `sonnet` (normal) or `opus` (strong), Codex is `terra` (normal) or `sol` (strong), and effort is `low`, `medium` or `high`. `haiku`, `xhigh` and `max` are unreachable, and the adapters reject anything outside the allowlists rather than forwarding it to a CLI.
+- The decision space is closed: Claude is `sonnet` (normal) or `opus` (strong), Codex is `gpt-5.6-terra` (normal) or `gpt-5.6-sol` (strong) — the real Codex CLI model IDs, not the `terra`/`sol` shorthand from the feature spec — and effort is `low`, `medium` or `high`. `haiku`, `xhigh` and `max` are unreachable, and the adapters reject anything outside the allowlists rather than forwarding it to a CLI.
 - Two independent dimensions: `capabilityTier` (is a more capable model justified?) and `effort` (how deeply should it think?). `sonnet/high` and `opus/medium` are both valid and mean different things.
 - Callers pass structured SIGNALS, never a model: role, `selfDevelopment`, `highRisk`, `mechanical`, brief counts, git numstat, workspace/frontend/backend/migration facts derived from PATHS, review findings, repair cycle, visual surface size. No prose — user text, README, project summary, memory, agent output — has any authority here. Only the *length* of a request is used, and only when no compiled brief exists.
 - A small scoring table bands the result (`<0` normal/low, `0-2` normal/medium, `3-4` normal/high, `5-6` strong/medium, `>=7` strong/high). Trusted sensitive path categories (auth, permissions, sandbox/isolation, supervisor/activation, database migration) floor a source-touching role at strong/high.
@@ -123,7 +123,7 @@ sandbox is read-only, not tool-free. A structured `jarvis-action` block is text,
 not a tool call, and is unaffected.
 
 Routing runs are pinned by the model policy to the cheap bounded model at low
-effort (`sonnet`/`terra`, `low`) and get a 90-second ceiling rather than
+effort (`sonnet`/`gpt-5.6-terra`, `low`) and get a 90-second ceiling rather than
 the 30-minute agent timeout: a one-sentence classification that has not answered
 in that long has failed, not thought harder. Every message in a workspace with a
 registered project spends one such run, and a message that routes to a code

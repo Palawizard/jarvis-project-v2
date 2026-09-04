@@ -690,6 +690,47 @@ export class JobPipeline {
         );
         return;
       }
+      // The closing gate. Every repair loop above has converged, the evidence
+      // identity assertion just proved the candidate is still exactly
+      // `changes.head`, and nothing below mutates source -- so this is the one
+      // point where an expensive check can be run against the HEAD that will
+      // actually be offered for approval and, for a self-upgrade, activated.
+      // Any source change after this point re-enters verification through the
+      // loop above, which clears the evidence heads and runs the gate again;
+      // the result can therefore never outlive the commit it was produced from.
+      const finalSteps = (input.project.config.verification?.steps ?? []).filter(
+        (step) => step.kind === 'final',
+      );
+      if (finalSteps.length > 0) {
+        const finalReport = await verification.run({
+          jobId,
+          cwd: input.cwd,
+          commands: input.project.commands,
+          steps: input.project.config.verification?.steps,
+          cycle: verificationCycle++,
+          signal: input.signal,
+          phase: 'final',
+        });
+        if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
+        const headAfterFinalGate = await this.git.resolveCommit(input.cwd, 'HEAD');
+        if (headAfterFinalGate !== changes.head) {
+          this.pause(
+            jobId,
+            'verifying',
+            `Final gate changed candidate source (${changes.head} -> ${headAfterFinalGate}); its result does not describe the reviewed HEAD.`,
+          );
+          return;
+        }
+        if (!finalReport.passed) {
+          this.pause(
+            jobId,
+            'verifying',
+            finalReport.failureSummary || 'final gate failed on the reviewed HEAD',
+          );
+          return;
+        }
+      }
+
       const episodeId = await this.consolidate({
         job,
         project: input.project,

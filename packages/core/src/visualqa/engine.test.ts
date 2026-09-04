@@ -670,7 +670,16 @@ describe('candidate-runtime authenticated visual QA', () => {
         projectId: 'project-candidate',
         baseUrl: app.baseUrl,
         routes: ['/'],
-        scenarios: CANDIDATE_SCENARIOS(),
+        // Every declared selector lives BEHIND the pairing screen, so on a
+        // locked candidate none of them can ever appear: this test asserts
+        // exactly that absence. Waiting the 15s default proves nothing the
+        // first 500ms has not already proved. The wait is shortened, not
+        // removed -- a selector that did appear would still fail the
+        // assertions below.
+        scenarios: CANDIDATE_SCENARIOS().map((scenario) => ({
+          ...scenario,
+          expectedSelectorTimeoutMs: 500,
+        })),
         headRef: 'c'.repeat(40),
       });
       expect(app.seen.every((entry) => entry.control === undefined)).toBe(true);

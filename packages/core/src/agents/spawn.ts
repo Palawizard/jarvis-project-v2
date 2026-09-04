@@ -1,13 +1,16 @@
-import { spawn, type ChildProcess, type StdioOptions } from 'node:child_process';
+import { execFile, spawn, type ChildProcess, type StdioOptions } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import { promisify } from 'node:util';
 import { createLogger } from '../logger.js';
 import type { ResolvedCli } from './resolve.js';
 
 const log = createLogger('agent-spawn');
+
+const execFileAsync = promisify(execFile);
 
 const WINDOWS_JOB_RUNNER =
   process.platform === 'win32'
@@ -405,4 +408,25 @@ export function runJsonlProcess(spec: JsonlRunSpec): Promise<JsonlRunOutcome> {
       });
     });
   });
+}
+
+/**
+ * Run a short, non-interactive capability probe (`--version`, `--help`,
+ * `auth status`) and return its output.
+ *
+ * stdin is closed immediately and on purpose. `execFile` always opens a stdin
+ * pipe and never ends it, so a probed CLI that reads stdin before deciding what
+ * to do waits for an EOF that never arrives and is only released by the probe
+ * timeout -- turning a sub-second capability check into a full timeout that the
+ * caller's `catch` then silently reports as "capability absent". A probe passes
+ * no input, so EOF is the truthful thing to send.
+ */
+export async function probeCli(
+  command: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<{ stdout: string; stderr: string }> {
+  const running = execFileAsync(command, args, { timeout: timeoutMs });
+  running.child.stdin?.end();
+  return await running;
 }

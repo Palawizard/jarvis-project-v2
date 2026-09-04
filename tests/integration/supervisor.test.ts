@@ -203,7 +203,14 @@ async function runActivation(
       // activates and an unhealthy one rolls back — not how many milliseconds a
       // fake server needs to bind a port. A tight budget here makes the
       // supervisor give up on a loaded machine and fail for the wrong reason.
-      healthTimeoutMs: 10_000,
+      //
+      // The unhealthy fixture is the exception: its candidate NEVER becomes
+      // healthy, so the whole budget is spent waiting for a verdict the test
+      // already knows. Shortening it only makes the expected rollback arrive
+      // sooner; it cannot turn a failure into a pass. 3s still leaves roughly
+      // a 10x margin for the health check of the OLD revision the supervisor
+      // restarts after rolling back, which is the one that must succeed.
+      healthTimeoutMs: healthyCandidate ? 10_000 : 3_000,
       commandTimeoutMs: 30_000,
       once: true,
     }),

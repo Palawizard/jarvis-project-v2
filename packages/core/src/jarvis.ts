@@ -244,6 +244,18 @@ export class Jarvis {
           { name: 'integration', command: 'pnpm test:integration', kind: 'integration' },
           { name: 'build', command: 'pnpm build' },
           { name: 'e2e', command: 'pnpm test:e2e', kind: 'e2e', timeoutMs: 20 * 60_000 },
+          // The self Visual QA catalog smoke: does every catalogued screenshot
+          // state still exist in the real UI? It boots a candidate Jarvis and
+          // photographs all of them, which is why it is `final` -- run once, on
+          // the HEAD about to be approved, rather than on every repair cycle.
+          // A self-upgrade that could be activated never skips it: the gate is
+          // the last thing between verification and `awaiting_user`.
+          {
+            name: 'visual-catalog',
+            command: 'pnpm test:visual-catalog',
+            kind: 'final',
+            timeoutMs: 20 * 60_000,
+          },
         ],
       },
     };

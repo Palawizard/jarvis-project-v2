@@ -63,6 +63,12 @@ export class VerificationEngine {
     steps?: VerificationStep[];
     cycle?: number;
     signal?: AbortSignal;
+    /**
+     * Which half of the configured steps to run. The repair loop runs
+     * `'repairable'` (everything but `kind: 'final'`); the closing gate runs
+     * `'final'` alone, on the HEAD that is about to be approved.
+     */
+    phase?: 'repairable' | 'final';
   }): Promise<VerificationReport> {
     const cycle = opts.cycle ?? 0;
     const results: VerificationResult[] = [];
@@ -80,7 +86,8 @@ export class VerificationEngine {
       kind: NonNullable<VerificationStep['kind']>;
       required: boolean;
     }> = [];
-    if (opts.commands.install) {
+    const phase = opts.phase ?? 'repairable';
+    if (opts.commands.install && phase !== 'final') {
       steps.push({
         name: 'install',
         command: opts.commands.install,
@@ -93,6 +100,7 @@ export class VerificationEngine {
       const configured: typeof steps = [];
       for (const step of opts.steps) {
         if (!step.name.trim() || !step.command.trim()) continue;
+        if (((step.kind ?? 'check') === 'final') !== (phase === 'final')) continue;
         configured.push({
           name: step.name,
           command: step.command,
@@ -105,7 +113,7 @@ export class VerificationEngine {
         ...configured.filter((step) => step.kind === 'setup'),
         ...configured.filter((step) => step.kind !== 'setup'),
       );
-    } else {
+    } else if (phase !== 'final') {
       for (const name of STEP_ORDER) {
         const command = opts.commands[name];
         if (command)

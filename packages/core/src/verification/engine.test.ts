@@ -369,3 +369,44 @@ async function until(condition: () => boolean | Promise<boolean>): Promise<void>
   }
   expect(await condition()).toBe(true);
 }
+
+describe('the final gate phase', () => {
+  const STEPS = [
+    { name: 'unit', command: OK },
+    { name: 'catalog', command: OK, kind: 'final' as const },
+  ];
+
+  it('keeps the final step out of the repair loop', async () => {
+    // A fixer must never be handed the closing gate's failure to react to, and
+    // the gate must not be paid for on every repair cycle.
+    const report = await engine.run({ jobId: JOB_ID, cwd: home, commands: {}, steps: STEPS });
+    expect(report.results.map((r) => r.name)).toEqual(['unit']);
+    expect(report.passed).toBe(true);
+  });
+
+  it('runs the final step, and only it, in the final phase', async () => {
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: {},
+      steps: STEPS,
+      cycle: 1,
+      phase: 'final',
+    });
+    expect(report.results.map((r) => r.name)).toEqual(['catalog']);
+    expect(report.passed).toBe(true);
+  });
+
+  it('fails the final phase when the gate fails, so the candidate cannot be approved', async () => {
+    const report = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: {},
+      steps: [STEPS[0], { name: 'catalog', command: FAIL, kind: 'final' as const }],
+      cycle: 1,
+      phase: 'final',
+    });
+    expect(report.passed).toBe(false);
+    expect(report.failureKind).toBe('product');
+  });
+});

@@ -45,7 +45,7 @@ pnpm build
 pnpm test:e2e
 ```
 
-`pnpm verify` (and its alias `pnpm verify:full`) is the complete deterministic gate: format, lint, typecheck, every non-live Vitest project including integration, build, and Playwright E2E. `pnpm test` means unit tests only; `pnpm test:all` means all non-live Vitest projects.
+`pnpm verify` is the deterministic gate run on every repair cycle: format, lint, typecheck, unit and integration Vitest, build, and Playwright E2E. `pnpm verify:full` is `pnpm verify` plus `pnpm test:visual-catalog`, the self Visual QA catalog smoke — it boots a candidate Jarvis and photographs every catalogued screenshot state, so it runs once at the end rather than on every cycle. A self-upgrade that could be approved or activated always passes `verify:full` on its final HEAD. `pnpm test` means unit tests only; `pnpm test:all` means unit plus integration.
 
 The Playwright suite gives **every test its own orchestrator**: a private `JARVIS_HOME` under `.jarvis/e2e/runtimes/`, its own database and its own port, booted by `tests/e2e/start-server.mjs` through the fixtures in `tests/e2e/fixtures.ts`. That is what makes `--repeat-each`, retries, test order and parallel workers safe, and it means the product carries no test-only reset or data-deletion surface: isolation is process-level, and the launcher refuses any home outside `.jarvis/e2e`. Each test checks the API is really answering `/health` with its own runtime nonce before it opens the UI, and a runtime that dies mid-test is reported as an orchestrator lifecycle failure rather than as a missing element.
 

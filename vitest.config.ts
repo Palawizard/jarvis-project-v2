@@ -27,6 +27,18 @@ export default defineConfig({
         test: {
           name: 'integration',
           include: ['tests/integration/**/*.test.ts'],
+          // The self Visual QA catalog smoke boots a whole candidate Jarvis and
+          // photographs every declared surface. It is real work, not waste, but
+          // at ~135s it is longer than the rest of the suite put together and
+          // it answers a question -- "is every catalogued screenshot state
+          // still reachable in the real UI?" -- that only has to be answered
+          // before a self-upgrade is approved, not on every inner-loop run.
+          // It runs as its own project, gated by `pnpm verify:full`.
+          exclude: [
+            '**/node_modules/**',
+            '**/dist/**',
+            'tests/integration/visualqa-catalog.test.ts',
+          ],
           environment: 'node',
           // Candidate/browser integration must not compete with the process-heavy unit project.
           sequence: { groupOrder: 1 },
@@ -34,6 +46,19 @@ export default defineConfig({
           // and process trees, and they share the machine with the parallel
           // unit project. The budget is a guard against a genuine hang, not a
           // performance assertion about a loaded developer machine.
+          testTimeout: 420_000,
+          hookTimeout: 420_000,
+          fileParallelism: false,
+        },
+      },
+      {
+        test: {
+          name: 'visual-catalog',
+          include: ['tests/integration/visualqa-catalog.test.ts'],
+          environment: 'node',
+          // Last, and never alongside anything else: it runs a full candidate
+          // runtime and a browser.
+          sequence: { groupOrder: 2 },
           testTimeout: 420_000,
           hookTimeout: 420_000,
           fileParallelism: false,

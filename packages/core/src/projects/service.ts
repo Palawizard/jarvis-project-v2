@@ -80,7 +80,15 @@ export interface VerificationStep {
   command: string;
   timeoutMs?: number;
   required?: boolean;
-  kind?: 'setup' | 'check' | 'integration' | 'e2e';
+  /**
+   * `final` steps are the closing gate, not part of the repair loop: they run
+   * once, on the exact HEAD that is about to be offered for approval, after
+   * every fixer/review/visual cycle has converged. Anything that changes source
+   * after them re-enters verification, so their result can never outlive the
+   * commit it was produced from. Use it for a check that is expensive and only
+   * has to be true at the end -- not for one a fixer is expected to react to.
+   */
+  kind?: 'setup' | 'check' | 'integration' | 'e2e' | 'final';
 }
 
 export interface CandidateRuntimeConfig {

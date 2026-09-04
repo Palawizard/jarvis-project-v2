@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
+import { jsonlProtocolError, probeCli, runJsonlProcess } from './spawn.js';
 import type { ResolvedCli } from './resolve.js';
 
 const fixtures = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-spawn-'));
@@ -119,4 +119,40 @@ describe('runJsonlProcess stdin protocol', () => {
       'Claude Code exited without a terminal structured event',
     );
   });
+});
+
+describe('capability probes', () => {
+  // Every provider fake in this repo -- and the real Claude/Codex CLIs -- reads
+  // stdin before deciding what to print. A probe passes no input, so if it does
+  // not send EOF the child waits forever and the probe only returns when its
+  // timeout fires. That failure is invisible: the caller's `catch` reports it
+  // as "capability absent" and the test still passes, just 30s slower.
+  const stdinGatedCli = fakeCli(
+    'stdin-gated-probe',
+    `const chunks = [];
+process.stdin.on('data', (c) => chunks.push(c));
+process.stdin.on('end', () => {
+  if (process.argv[2] === '--help') console.log('--effort <level>');
+  else if (process.argv[2] === '--version') console.log('fake 0.0.0');
+  else console.log(JSON.stringify({ loggedIn: true, authMethod: 'subscription' }));
+  process.exit(0);
+});
+`,
+  );
+
+  for (const args of [['--version'], ['--help'], ['auth', 'status']]) {
+    it(`closes stdin so \`${args.join(' ')}\` returns instead of waiting for the timeout`, async () => {
+      const started = Date.now();
+      const { stdout } = await probeCli(
+        stdinGatedCli.command,
+        [...stdinGatedCli.prefixArgs, ...args],
+        30_000,
+      );
+
+      expect(stdout.trim()).not.toBe('');
+      // The assertion that matters: it answered, and nowhere near the 30s
+      // budget. A regression here re-adds 30s per probe to the unit suite.
+      expect(Date.now() - started).toBeLessThan(5_000);
+    }, 60_000);
+  }
 });

@@ -1,12 +1,10 @@
-import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
 import { ALLOWED_MODELS, isAllowedEffort, isAllowedModel, PROVIDER_MODELS } from './policy.js';
 import { resolveCli, type ResolvedCli } from './resolve.js';
-import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
+import { jsonlProtocolError, probeCli, runJsonlProcess } from './spawn.js';
 import { guardToolFreeEvents, isToolFreeRole, toolFreeViolation } from './toolfree.js';
 import type {
   AgentEvent,
@@ -15,8 +13,6 @@ import type {
   AgentStartOptions,
   ProviderCapabilities,
 } from './types.js';
-
-const exec = promisify(execFile);
 
 /**
  * Claude Code adapter.
@@ -71,9 +67,7 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     try {
-      const { stdout } = await exec(cli.command, [...cli.prefixArgs, '--version'], {
-        timeout: 30_000,
-      });
+      const { stdout } = await probeCli(cli.command, [...cli.prefixArgs, '--version'], 30_000);
       base.version = stdout.trim();
     } catch (error) {
       return this.cache({
@@ -86,18 +80,14 @@ export class ClaudeProvider implements AgentProvider {
     // it must make the routing decision say the effort was not applied rather
     // than fail the run or silently claim it was.
     try {
-      const { stdout } = await exec(cli.command, [...cli.prefixArgs, '--help'], {
-        timeout: 30_000,
-      });
+      const { stdout } = await probeCli(cli.command, [...cli.prefixArgs, '--help'], 30_000);
       base.effortControl = /--effort\b/.test(stdout);
     } catch {
       base.effortControl = false;
     }
 
     try {
-      const { stdout } = await exec(cli.command, [...cli.prefixArgs, 'auth', 'status'], {
-        timeout: 45_000,
-      });
+      const { stdout } = await probeCli(cli.command, [...cli.prefixArgs, 'auth', 'status'], 45_000);
       const status = JSON.parse(stdout) as {
         loggedIn?: boolean;
         authMethod?: string;

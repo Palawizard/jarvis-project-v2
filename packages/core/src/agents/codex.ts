@@ -1,11 +1,9 @@
-import { execFile } from 'node:child_process';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
 import { ALLOWED_MODELS, isAllowedEffort, isAllowedModel, PROVIDER_MODELS } from './policy.js';
 import { resolveCli, type ResolvedCli } from './resolve.js';
-import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
+import { jsonlProtocolError, probeCli, runJsonlProcess } from './spawn.js';
 import { guardToolFreeEvents, toolFreeViolation } from './toolfree.js';
 import type {
   AgentEvent,
@@ -14,8 +12,6 @@ import type {
   AgentStartOptions,
   ProviderCapabilities,
 } from './types.js';
-
-const exec = promisify(execFile);
 
 /**
  * Codex CLI adapter.
@@ -70,9 +66,7 @@ export class CodexProvider implements AgentProvider {
       });
     }
     try {
-      const { stdout } = await exec(cli.command, [...cli.prefixArgs, '--version'], {
-        timeout: 30_000,
-      });
+      const { stdout } = await probeCli(cli.command, [...cli.prefixArgs, '--version'], 30_000);
       base.version = stdout.trim();
     } catch (error) {
       return this.cache({
@@ -84,17 +78,17 @@ export class CodexProvider implements AgentProvider {
     // invocation with `-c`. Probed rather than assumed, so a CLI without the
     // override makes the routing decision say the effort was not applied.
     try {
-      const { stdout } = await exec(cli.command, [...cli.prefixArgs, 'exec', '--help'], {
-        timeout: 30_000,
-      });
+      const { stdout } = await probeCli(cli.command, [...cli.prefixArgs, 'exec', '--help'], 30_000);
       base.effortControl = /(^|\s)(-c|--config)[\s,]/.test(stdout);
     } catch {
       base.effortControl = false;
     }
     try {
-      const { stdout, stderr } = await exec(cli.command, [...cli.prefixArgs, 'login', 'status'], {
-        timeout: 45_000,
-      });
+      const { stdout, stderr } = await probeCli(
+        cli.command,
+        [...cli.prefixArgs, 'login', 'status'],
+        45_000,
+      );
       // 0.147 prints a human-readable line and sends it to stderr, not stdout.
       // There is no JSON form, so both streams are inspected.
       const text = `${stdout}\n${stderr}`.trim();

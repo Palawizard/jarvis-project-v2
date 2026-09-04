@@ -103,6 +103,11 @@ export interface Job {
     relevantProjectContext: string[];
     constraints: string[];
     assumptions: string[];
+    executionRecommendation?: {
+      capabilityTier: 'normal' | 'strong';
+      effort: 'low' | 'medium' | 'high';
+      reasons: string[];
+    };
     originalRequest: string;
     provider: string | null;
     model: string | null;

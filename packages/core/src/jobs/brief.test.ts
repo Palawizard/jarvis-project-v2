@@ -99,6 +99,11 @@ const ANSWER = {
   relevantProjectContext: ['The app is a Vite React front end with a Hono API'],
   constraints: ['Do not add a new dependency'],
   assumptions: ['Google is the only provider wanted; the request did not name another'],
+  executionRecommendation: {
+    capabilityTier: 'strong',
+    effort: 'high',
+    reasons: ['Credential-sensitive provider integration', 'Cross-layer session persistence'],
+  },
   originalRequest: 'Add OAuth login. No new dependencies.',
 };
 
@@ -220,6 +225,45 @@ describe('the brief schema refuses everything it does not recognise', () => {
       expect(parseStoredBrief(junk)).toBeNull();
     }
   });
+
+  it('keeps a valid legacy brief and ignores malformed optional advice', () => {
+    const stored = {
+      ...ANSWER,
+      schemaVersion: JOB_BRIEF_SCHEMA_VERSION,
+      compiledAt: '',
+      provider: null,
+      model: null,
+    };
+    for (const executionRecommendation of [
+      { capabilityTier: 'opus', effort: 'high', reasons: ['model name'] },
+      { capabilityTier: 'normal', effort: 'urgent', reasons: ['bad effort'] },
+      { capabilityTier: 'strong', effort: 'high', reasons: Array(5).fill('too many') },
+      { capabilityTier: 'strong', effort: 'high', reasons: ['x'.repeat(241)] },
+    ]) {
+      const brief = parseStoredBrief(JSON.stringify({ ...stored, executionRecommendation }));
+      expect(brief?.title).toBe(ANSWER.title);
+      expect(brief?.executionRecommendation).toBeUndefined();
+    }
+  });
+
+  it.each([
+    ['normal', 'low'],
+    ['normal', 'high'],
+    ['strong', 'medium'],
+    ['strong', 'high'],
+  ] as const)('persists valid %s/%s advice', (capabilityTier, effort) => {
+    const stored = {
+      ...ANSWER,
+      schemaVersion: JOB_BRIEF_SCHEMA_VERSION,
+      compiledAt: '',
+      provider: null,
+      model: null,
+      executionRecommendation: { capabilityTier, effort, reasons: ['semantic fixture'] },
+    };
+    expect(parseStoredBrief(JSON.stringify(stored))?.executionRecommendation).toEqual(
+      stored.executionRecommendation,
+    );
+  });
 });
 
 describe('the compiler prompt keeps its provenance regions apart', () => {
@@ -322,6 +366,7 @@ describe('compiling a brief', () => {
       'acceptanceCriteria',
       'assumptions',
       'constraints',
+      'executionRecommendation',
       'goal',
       'originalRequest',
       'relevantProjectContext',
@@ -334,10 +379,17 @@ describe('compiling a brief', () => {
     // built from nothing but the model's schema has to satisfy Zod, and an extra
     // field has to be refused.
     const sample = Object.fromEntries(
-      written.required.map((key) => [
-        key,
-        (written.properties[key] as { type: string }).type === 'array' ? ['x'] : 'x',
-      ]),
+      written.required.map((key) => {
+        const property = written.properties[key] as { type: string };
+        return [
+          key,
+          property.type === 'array'
+            ? ['x']
+            : key === 'executionRecommendation'
+              ? { capabilityTier: 'normal', effort: 'low', reasons: ['mechanical edit'] }
+              : 'x',
+        ];
+      }),
     );
     expect(CompiledJobBriefSchema.safeParse(sample).success).toBe(true);
     expect(CompiledJobBriefSchema.safeParse({ ...sample, projectId: 'prj_other' }).success).toBe(
@@ -490,7 +542,12 @@ describe('the brief compiler over the real provider adapters', () => {
   const ANSWER_FROM_SCHEMA = `function answer(schema) {
   const out = {};
   for (const key of schema.required) {
-    out[key] = schema.properties[key].type === 'array' ? ['from ' + key] : 'from ' + key;
+    out[key] =
+      schema.properties[key].type === 'array'
+        ? ['from ' + key]
+        : key === 'executionRecommendation'
+          ? { capabilityTier: 'normal', effort: 'low', reasons: ['mechanical edit'] }
+          : 'from ' + key;
   }
   return out;
 }
@@ -627,14 +684,18 @@ function run(args) {
 
 describe('rendering a brief for the implementer', () => {
   it('labels assumptions as unverified and omits empty sections', () => {
-    const brief = StoredJobBriefSchema.parse({
-      ...ANSWER,
-      schemaVersion: JOB_BRIEF_SCHEMA_VERSION,
-      constraints: [],
-      compiledAt: '',
-      provider: null,
-      model: null,
-    });
+    const brief = parseStoredBrief(
+      JSON.stringify({
+        ...ANSWER,
+        schemaVersion: JOB_BRIEF_SCHEMA_VERSION,
+        constraints: [],
+        compiledAt: '',
+        provider: null,
+        model: null,
+      }),
+    );
+    expect(brief).not.toBeNull();
+    if (!brief) throw new Error('fixture brief did not parse');
     const rendered = renderBrief(brief);
     expect(rendered).toContain('Assumptions (unverified');
     expect(rendered).toContain('- Add a Google OAuth provider');

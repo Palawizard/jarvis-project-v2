@@ -209,6 +209,59 @@ describe('model policy — anchored cases', () => {
   });
 });
 
+describe('model policy — brief recommendations', () => {
+  const recommendation = (capabilityTier: CapabilityTier, effort: EffortLevel): TaskSignals => ({
+    executionRecommendation: {
+      capabilityTier,
+      effort,
+      reasons: ['semantic fixture'],
+    },
+  });
+
+  it('uses semantic tier and effort independently, then applies the implementer floor', () => {
+    expect(tier('implementer', recommendation('normal', 'low'))).toBe('normal/medium');
+    expect(tier('implementer', recommendation('normal', 'high'))).toBe('normal/high');
+    expect(tier('implementer', recommendation('strong', 'medium'))).toBe('strong/medium');
+    expect(tier('implementer', recommendation('strong', 'high'))).toBe('strong/high');
+  });
+
+  it('lets a trusted sensitive-path floor override semantic advice', () => {
+    expect(
+      tier('implementer', { ...recommendation('normal', 'medium'), sensitive: ['permissions'] }),
+    ).toBe('strong/high');
+  });
+
+  it('does not let brief counts or request length override semantic advice', () => {
+    const profile = decide('implementer', {
+      ...recommendation('normal', 'low'),
+      requestChars: 50_000,
+      requirements: 14,
+      acceptanceCriteria: 14,
+    });
+    expect(`${profile.capabilityTier}/${profile.effort}`).toBe('normal/medium');
+    expect(profile.factors).toContain('brief recommendation: normal/low');
+  });
+
+  it('ignores malformed advice and keeps deterministic fallback', () => {
+    const profile = decide('implementer', {
+      executionRecommendation: {
+        capabilityTier: 'normal',
+        effort: 'high',
+        reasons: [],
+      } as unknown as TaskSignals['executionRecommendation'],
+      requestChars: 12_000,
+    });
+    expect(`${profile.capabilityTier}/${profile.effort}`).toBe('normal/medium');
+  });
+
+  it('does not let the brief compiler, reviewer, or fixer select from its advice', () => {
+    const signals = recommendation('strong', 'high');
+    expect(tier('brief_compiler', signals)).toBe('normal/low');
+    expect(tier('reviewer', signals)).toBe('normal/high');
+    expect(tier('fixer', signals)).toBe('normal/medium');
+  });
+});
+
 describe('model policy — role floors and ceilings', () => {
   it('never returns strong for a role whose ceiling is normal', () => {
     const capped = ROLES.filter((role) => ROLE_POLICY[role].maxTier === 'normal');

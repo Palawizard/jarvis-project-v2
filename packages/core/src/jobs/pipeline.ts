@@ -1611,7 +1611,8 @@ export function candidateRejectionReason(
 /**
  * Model-policy signals from what is known BEFORE any diff exists: the compiled
  * brief when there is one, the user's own request length when there is not.
- * Counts only — no brief prose ever reaches the policy.
+ * The semantic recommendation is carried unchanged; policy.ts accepts it for
+ * the initial implementer only and ignores it for reviewers and fixers.
  */
 function briefSignals(job: Job | null | undefined): TaskSignals {
   if (!job) return {};
@@ -1621,6 +1622,9 @@ function briefSignals(job: Job | null | undefined): TaskSignals {
     hasCompiledBrief: true,
     requirements: brief.requirements.length,
     acceptanceCriteria: brief.acceptanceCriteria.length,
+    ...(brief.executionRecommendation
+      ? { executionRecommendation: brief.executionRecommendation }
+      : {}),
   };
 }
 

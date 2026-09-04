@@ -1079,6 +1079,19 @@ function CompiledBrief({ brief }: { brief: NonNullable<Job['compiledBrief']> }) 
       {list('Relevant project context', brief.relevantProjectContext)}
       {list('Constraints', brief.constraints)}
       {list('Assumptions (unverified)', brief.assumptions)}
+      {brief.executionRecommendation && (
+        <div style={{ marginTop: 10 }}>
+          <div className="small dim">
+            Brief recommendation — {brief.executionRecommendation.capabilityTier} /{' '}
+            {brief.executionRecommendation.effort}
+          </div>
+          <ul className="small" style={{ marginBottom: 0 }}>
+            {brief.executionRecommendation.reasons.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      )}
     </Card>
   );
 }

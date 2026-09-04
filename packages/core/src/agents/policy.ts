@@ -48,6 +48,53 @@ export function isAllowedEffort(value: unknown): value is EffortLevel {
   return typeof value === 'string' && (EFFORT_LEVELS as readonly string[]).includes(value);
 }
 
+export function isAllowedCapabilityTier(value: unknown): value is CapabilityTier {
+  return typeof value === 'string' && (CAPABILITY_TIERS as readonly string[]).includes(value);
+}
+
+/**
+ * The Job Brief Compiler's semantic read on ONE question: how much model does
+ * the initial implementer need? Two independent dimensions — never a model
+ * name, never a score — so trusted code stays the only thing that ever maps a
+ * tier to a provider's model string.
+ *
+ * Advice, not a decision: `selectExecutionProfile` is the only reader, applies
+ * it to the `implementer` role only, and still runs it through the same role
+ * floors/ceilings and risk floor as every other decision.
+ */
+export interface ExecutionRecommendation {
+  capabilityTier: CapabilityTier;
+  effort: EffortLevel;
+  /** Short, bounded — a handful of concrete reasons, never free-form prose. */
+  reasons: string[];
+}
+
+/**
+ * The recommendation is model-authored persisted data. Keep parsing it at this
+ * boundary so an old or malformed optional field loses only its advice, never
+ * the otherwise usable compiled brief.
+ */
+export function parseExecutionRecommendation(value: unknown): ExecutionRecommendation | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).length !== 3 ||
+    !isAllowedCapabilityTier(record.capabilityTier) ||
+    !isAllowedEffort(record.effort) ||
+    !Array.isArray(record.reasons) ||
+    record.reasons.length < 1 ||
+    record.reasons.length > 4
+  ) {
+    return undefined;
+  }
+  const reasons = record.reasons.map((reason) =>
+    typeof reason === 'string' ? reason.trim().replace(/\s+/g, ' ') : '',
+  );
+  return reasons.every((reason) => reason.length > 0 && reason.length <= 240)
+    ? { capabilityTier: record.capabilityTier, effort: record.effort, reasons }
+    : undefined;
+}
+
 /**
  * Trusted, path-derived categories where a mistake is a security or integrity
  * event rather than a bug. Derived from git paths only — never from a model's
@@ -137,6 +184,12 @@ export interface TaskSignals {
   hasCompiledBrief?: boolean;
   requirements?: number;
   acceptanceCriteria?: number;
+  /**
+   * The Brief Compiler's semantic advice for the INITIAL implementer only.
+   * `selectExecutionProfile` ignores this for every other role, including the
+   * compiler itself — see the docstring on `ExecutionRecommendation`.
+   */
+  executionRecommendation?: ExecutionRecommendation;
 
   // ---- after implementation: the candidate diff ----
   filesChanged?: number;
@@ -166,7 +219,8 @@ export interface TaskSignals {
 export interface ExecutionProfile {
   capabilityTier: CapabilityTier;
   effort: EffortLevel;
-  score: number;
+  /** Null when semantic brief advice, rather than the old score, selected it. */
+  score: number | null;
   /** Bounded, human-readable audit of what actually moved the decision. */
   factors: string[];
 }
@@ -353,6 +407,22 @@ function riskFloor(
   return null;
 }
 
+function profileForTrustedGuardrails(signals: TaskSignals): {
+  capabilityTier: CapabilityTier;
+  effort: EffortLevel;
+  factors: string[];
+} {
+  // Semantic brief advice deliberately replaces the request/brief-count score.
+  // These are the remaining trusted pre-implementation facts that can impose a
+  // floor regardless of what the compiler recommended.
+  const { score, factors } = scoreSignals({
+    selfDevelopment: signals.selfDevelopment,
+    highRisk: signals.highRisk,
+  });
+  const band = BANDS.find((entry) => score >= entry.atLeast) as (typeof BANDS)[number];
+  return { capabilityTier: band.tier, effort: band.effort, factors };
+}
+
 /**
  * Choose capability tier and effort for one agent run. Pure and total: the same
  * inputs always produce exactly the same decision.
@@ -382,12 +452,43 @@ export function selectExecutionProfile(input: {
     factors.unshift(`${policy.note} (${policy.bias > 0 ? '+' : ''}${policy.bias})`);
   }
 
+  const recommendation =
+    input.role === 'implementer'
+      ? parseExecutionRecommendation(signals.executionRecommendation)
+      : undefined;
   const band = BANDS.find((entry) => score >= entry.atLeast) as (typeof BANDS)[number];
-  let tier = band.tier;
-  let effort = band.effort;
+  let tier = recommendation?.capabilityTier ?? band.tier;
+  let effort = recommendation?.effort ?? band.effort;
+  if (recommendation) {
+    // Do not let prompt length or compiled-brief item counts re-classify a
+    // semantic recommendation. They remain in `score` only for old audit rows.
+    factors.length = 0;
+    factors.push(`brief recommendation: ${recommendation.capabilityTier}/${recommendation.effort}`);
+    factors.push(...recommendation.reasons.map((reason) => `brief: ${reason}`));
+    const guardrail = profileForTrustedGuardrails(signals);
+    if (CAPABILITY_TIERS.indexOf(guardrail.capabilityTier) > CAPABILITY_TIERS.indexOf(tier)) {
+      tier = guardrail.capabilityTier;
+      factors.push(`trusted capability floor: ${guardrail.capabilityTier}`);
+    }
+    if (EFFORT_LEVELS.indexOf(guardrail.effort) > EFFORT_LEVELS.indexOf(effort)) {
+      effort = guardrail.effort;
+      factors.push(`trusted effort floor: ${guardrail.effort}`);
+    }
+    factors.push(...guardrail.factors.map((factor) => `trusted: ${factor}`));
+  }
 
   const floor = riskFloor(input.role, signals);
-  if (floor && rank(floor.tier, floor.effort) > rank(tier, effort)) {
+  if (floor && recommendation) {
+    const tierRaised = CAPABILITY_TIERS.indexOf(floor.tier) > CAPABILITY_TIERS.indexOf(tier);
+    const effortRaised = EFFORT_LEVELS.indexOf(floor.effort) > EFFORT_LEVELS.indexOf(effort);
+    if (tierRaised) tier = floor.tier;
+    if (effortRaised) effort = floor.effort;
+    if (tierRaised || effortRaised) {
+      factors.push(floor.reason);
+    }
+  } else if (floor && rank(floor.tier, floor.effort) > rank(tier, effort)) {
+    // Keep the long-standing combined floor for every other role. Only the
+    // semantic initial-implementer merge needs independent dimension clamping.
     tier = floor.tier;
     effort = floor.effort;
     factors.push(floor.reason);
@@ -415,7 +516,7 @@ export function selectExecutionProfile(input: {
   return {
     capabilityTier: tier,
     effort,
-    score,
+    score: recommendation ? null : score,
     factors: (factors.length ? factors : [`${input.role}: no escalating signal`]).slice(
       0,
       MAX_FACTORS,

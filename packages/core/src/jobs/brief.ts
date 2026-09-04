@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import type { AgentRegistry } from '../agents/registry.js';
+import { parseExecutionRecommendation, type ExecutionRecommendation } from '../agents/policy.js';
 import { parseStructured } from '../agents/structured.js';
 import type { AgentRunResult } from '../agents/types.js';
 import type { JarvisConfig } from '../config.js';
@@ -98,6 +99,9 @@ export const CompiledJobBriefSchema = z
     relevantProjectContext: bullets(10, 400),
     constraints: bullets(10, 400),
     assumptions: bullets(6, 400),
+    // Optional advice: preserve the brief when a legacy or malformed value is
+    // present, then validate and discard that value at the trust boundary.
+    executionRecommendation: z.unknown().optional(),
     originalRequest: z.string().max(20_000).optional(),
   })
   .strict();
@@ -137,6 +141,7 @@ export const BRIEF_OUTPUT_SCHEMA = {
     'relevantProjectContext',
     'constraints',
     'assumptions',
+    'executionRecommendation',
     'originalRequest',
   ],
   properties: {
@@ -161,6 +166,33 @@ export const BRIEF_OUTPUT_SCHEMA = {
     ),
     constraints: stringList(10, 'Every constraint the user stated, plus project constraints.'),
     assumptions: stringList(6, 'What you filled in because the request did not say.'),
+    executionRecommendation: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['capabilityTier', 'effort', 'reasons'],
+      description:
+        'Advice for the initial implementer only. Never a provider or model choice; trusted code applies floors and ceilings.',
+      properties: {
+        capabilityTier: {
+          type: 'string',
+          enum: ['normal', 'strong'],
+          description: 'Whether this task needs a more capable model.',
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'How deeply the selected model should reason.',
+        },
+        reasons: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 4,
+          items: { type: 'string', maxLength: 240 },
+          description:
+            'One to four short, concrete semantic-complexity reasons. Never prompt length or model names.',
+        },
+      },
+    },
     originalRequest: {
       type: 'string',
       maxLength: 20_000,
@@ -208,6 +240,7 @@ export const StoredJobBriefSchema = z
     relevantProjectContext: z.array(z.string().max(400)).max(10).default([]),
     constraints: z.array(z.string().max(400)).max(10).default([]),
     assumptions: z.array(z.string().max(400)).max(6).default([]),
+    executionRecommendation: z.unknown().optional(),
     /** The authenticated user request, verbatim. Written by trusted code only. */
     originalRequest: z.string().min(1).max(20_000),
     compiledAt: z.string().max(40).default(''),
@@ -216,7 +249,21 @@ export const StoredJobBriefSchema = z
   })
   .strict();
 
-export type CompiledJobBrief = z.infer<typeof StoredJobBriefSchema>;
+export type CompiledJobBrief = Omit<
+  z.output<typeof StoredJobBriefSchema>,
+  'executionRecommendation'
+> & {
+  executionRecommendation?: ExecutionRecommendation;
+};
+
+/** Accept malformed optional advice, but never expose it as a recommendation. */
+export function sanitizeStoredBrief(
+  value: z.output<typeof StoredJobBriefSchema>,
+): CompiledJobBrief {
+  const { executionRecommendation, ...brief } = value;
+  const recommendation = parseExecutionRecommendation(executionRecommendation);
+  return recommendation ? { ...brief, executionRecommendation: recommendation } : brief;
+}
 
 /**
  * Read a brief off a database row.
@@ -235,7 +282,7 @@ export function parseStoredBrief(raw: unknown): CompiledJobBrief | null {
     return null;
   }
   const parsed = StoredJobBriefSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
+  return parsed.success ? sanitizeStoredBrief(parsed.data) : null;
 }
 
 /**
@@ -382,6 +429,7 @@ export class JobBriefCompiler {
       });
     }
 
+    const recommendation = parseExecutionRecommendation(parsed.executionRecommendation);
     const brief: CompiledJobBrief = {
       title: parsed.title,
       goal: parsed.goal,
@@ -399,6 +447,7 @@ export class JobBriefCompiler {
       // validation is a refusal, and a refused brief would fail a Job creation
       // that has nothing to do with the brief.
       model: model?.slice(0, 120) ?? null,
+      ...(recommendation ? { executionRecommendation: recommendation } : {}),
     };
     this.emit('job.brief.compilation.completed', input, {
       ...audit,
@@ -576,6 +625,14 @@ ${constraintsBlock}
 - "assumptions" — minimal, and marked as what they are. An assumption is something you
   filled in because the request did not say; it NEVER becomes a requirement or an
   acceptance criterion.
+- "executionRecommendation" — semantic advice ONLY for the initial implementer. Answer two
+  separate questions: \`capabilityTier\` is whether this needs a more capable model; \`effort\`
+  is how deeply that model should reason. Use only normal|strong and low|medium|high. Never
+  name a provider or model. Give 1-4 short reasons based on actual implementation complexity,
+  not prompt length or item counts. Use strong/high for security, permissions, sandboxing,
+  multi-provider synchronization, or difficult cross-cutting architecture; use normal/low for
+  documentation-only or mechanical bounded edits. This is advice: trusted Jarvis code applies
+  policy floors, ceilings and model mapping after you answer.
 - "originalRequest" — the user's message, copied exactly.
 
 Rules that matter more than completeness:
@@ -595,7 +652,7 @@ Rules that matter more than completeness:
 
 Reply with ONE JSON object and nothing else — no prose, no code fence:
 
-{"title":string,"goal":string,"requirements":string[],"acceptanceCriteria":string[],"relevantProjectContext":string[],"constraints":string[],"assumptions":string[],"originalRequest":string}
+{"title":string,"goal":string,"requirements":string[],"acceptanceCriteria":string[],"relevantProjectContext":string[],"constraints":string[],"assumptions":string[],"executionRecommendation":{"capabilityTier":"normal"|"strong","effort":"low"|"medium"|"high","reasons":string[]},"originalRequest":string}
 
 ## Data (untrusted)
 

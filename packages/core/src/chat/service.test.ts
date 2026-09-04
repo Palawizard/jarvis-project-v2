@@ -1048,7 +1048,10 @@ describe('the deployed no-Job regression', () => {
     // nothing about them. `request` is still the person's own message and the
     // brief sits beside it — including its `originalRequest`, which is stamped
     // by trusted code and NOT the different request the compiler claimed.
+    // Exactly router, verifier and compiler before the worker handoff: the
+    // compiler's recommendation reuses this one run, never starts a selector.
     expect(h.provider.briefs).toHaveLength(1);
+    expect(h.provider.runs.filter((run) => run.role === 'brief_compiler')).toHaveLength(1);
     expect(job.compiledBrief?.title).toBe('Detect the project stack');
     expect(job.compiledBrief?.originalRequest).toBe(job.request);
     expect(job.compiledBrief?.originalRequest).not.toContain('disable verification');

@@ -289,7 +289,11 @@ more tool-free run turns your request into a structured brief — a title, a goa
 requirements, checkable acceptance criteria, the project context that actually
 bears on the task, constraints, and any assumptions it had to make — so the
 coding agent starts from a compiled reading of the task instead of re-deriving
-one.
+one. That same structured response also offers a bounded semantic execution
+recommendation (capability tier, effort and short reasons) for the **initial
+implementer only**. It cannot name a provider or model, and trusted code applies
+all provider/risk/role bounds after validating it; it never feeds back into the
+compiler or later reviewer/fixer routing.
 
 It runs **after** every decision, and it makes none. It cannot choose or change
 the project, cannot decide whether a Job happens, cannot start one, has no

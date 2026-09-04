@@ -846,17 +846,15 @@ export function JobDetailView({
 
           <Card title={`Events (${olderEvents.length + events.length})`}>
             <div className="events">
-              {[...olderEvents, ...events]
-                .reverse()
-                .map((e) => (
-                  <div key={e.id} className="event">
-                    <span className="event-time">
-                      {e.createdAt ? new Date(e.createdAt).toLocaleTimeString() : ''}
-                    </span>
-                    <span className="event-type">{e.type}</span>
-                    <span className="event-body">{summarise(e)}</span>
-                  </div>
-                ))}
+              {[...olderEvents, ...events].reverse().map((e) => (
+                <div key={e.id} className="event">
+                  <span className="event-time">
+                    {e.createdAt ? new Date(e.createdAt).toLocaleTimeString() : ''}
+                  </span>
+                  <span className="event-type">{e.type}</span>
+                  <span className="event-body">{summarise(e)}</span>
+                </div>
+              ))}
             </div>
             {hasOlderEvents && (olderEvents.length > 0 || events.length >= 400) && (
               <button

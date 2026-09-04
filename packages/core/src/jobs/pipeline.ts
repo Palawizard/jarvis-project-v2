@@ -266,10 +266,7 @@ export class JobPipeline {
         // The failing candidate's own paths decide how much model the repair
         // gets. Without them a fixer rewriting auth, permissions, the sandbox or
         // a migration would route below the policy's sensitive-path floor.
-        const failingCandidate = await this.git.collectChanges(
-          input.cwd,
-          job.baseRef as string,
-        );
+        const failingCandidate = await this.git.collectChanges(input.cwd, job.baseRef as string);
         const fixed = await this.runAgentStage({
           jobId,
           role: 'fixer',

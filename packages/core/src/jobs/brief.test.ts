@@ -515,6 +515,18 @@ function run(args) {
     emit({ type: 'result', subtype: 'success', session_id: 'sess-brief', result: 'no schema' });
     process.exit(0);
   }
+  // The real CLI 2.1.259 delivers --json-schema output through a
+  // provider-internal StructuredOutput pseudo-tool before the terminal result.
+  emit({
+    type: 'assistant',
+    session_id: 'sess-brief',
+    message: { content: [{ type: 'tool_use', id: 'toolu_brief_1', name: 'StructuredOutput', input: {} }] },
+  });
+  emit({
+    type: 'user',
+    session_id: 'sess-brief',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_brief_1', content: 'ok' }] },
+  });
   emit({
     type: 'result',
     subtype: 'success',

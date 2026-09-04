@@ -133,10 +133,13 @@ export class ClaudeProvider implements AgentProvider {
     // run instead of surfacing the tool as conversation. See toolfree.ts.
     const violationAbort = new AbortController();
     let violation: string | undefined;
-    const emit = guardToolFreeEvents(options.role, onEvent, (tool) => {
-      violation = tool;
-      violationAbort.abort();
-    });
+    const emit = filterStructuredOutputFraming(
+      Boolean(options.outputSchemaPath),
+      guardToolFreeEvents(options.role, onEvent, (tool) => {
+        violation = tool;
+        violationAbort.abort();
+      }),
+    );
 
     let sessionId: string | undefined;
     let finalResult = '';
@@ -257,6 +260,45 @@ export class ClaudeProvider implements AgentProvider {
       ...(structuredOutput !== undefined ? { structuredOutput } : {}),
     };
   }
+}
+
+/**
+ * Claude's own name for the pseudo-tool it uses to deliver `--json-schema` output.
+ */
+const STRUCTURED_OUTPUT_TOOL = 'StructuredOutput';
+
+/**
+ * Drop the framing Claude emits to deliver a schema-constrained answer.
+ *
+ * With `--json-schema`, the validated object does not arrive only on the
+ * terminal `result`: the CLI first emits an assistant `tool_use` named
+ * `StructuredOutput` and then its synthetic `tool_result`. That is the
+ * provider's transport for a flag Jarvis itself passed, not the model reaching
+ * for a capability, so it is filtered out before `guardToolFreeEvents` sees it
+ * and before anything downstream renders it as a tool the agent used.
+ *
+ * The exemption is deliberately narrow, because it is an exemption from the
+ * tool-free control. It applies only when Jarvis asked for a schema on THIS
+ * run, only to that exact tool name, and only to the one `tool_result` whose
+ * id matches the `tool_use` that was suppressed. A `StructuredOutput` call in a
+ * run with no schema, a call with no id to correlate, any other tool, and any
+ * `tool_result` for an id Jarvis did not suppress all pass straight through to
+ * the guard and abort a tool-free run exactly as before.
+ */
+export function filterStructuredOutputFraming(
+  requestedSchema: boolean,
+  onEvent: (event: AgentEvent) => void,
+): (event: AgentEvent) => void {
+  if (!requestedSchema) return onEvent;
+  const framingIds = new Set<string>();
+  return (event: AgentEvent) => {
+    if (event.kind === 'tool_started' && event.tool === STRUCTURED_OUTPUT_TOOL && event.id) {
+      framingIds.add(event.id);
+      return;
+    }
+    if (event.kind === 'tool_completed' && event.id && framingIds.delete(event.id)) return;
+    onEvent(event);
+  };
 }
 
 export function buildClaudePrompt(options: AgentStartOptions): string {

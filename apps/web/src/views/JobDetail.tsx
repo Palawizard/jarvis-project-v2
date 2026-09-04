@@ -47,6 +47,16 @@ export function JobDetailView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent, jobId]);
 
+  // Older events paged in on demand, kept separate from the live tail so a
+  // reload (triggered by any event on this job) can't lose pagination progress.
+  const [olderEvents, setOlderEvents] = useState<JarvisEvent[]>([]);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [hasOlderEvents, setHasOlderEvents] = useState(true);
+  useEffect(() => {
+    setOlderEvents([]);
+    setHasOlderEvents(true);
+  }, [jobId]);
+
   if (detail.error)
     return (
       <div className="page">
@@ -834,10 +844,9 @@ export function JobDetailView({
             )}
           </Card>
 
-          <Card title={`Events (${events.length})`}>
+          <Card title={`Events (${olderEvents.length + events.length})`}>
             <div className="events">
-              {events
-                .slice(-200)
+              {[...olderEvents, ...events]
                 .reverse()
                 .map((e) => (
                   <div key={e.id} className="event">
@@ -849,6 +858,26 @@ export function JobDetailView({
                   </div>
                 ))}
             </div>
+            {hasOlderEvents && (olderEvents.length > 0 || events.length >= 400) && (
+              <button
+                className="btn sm"
+                disabled={loadingOlder}
+                onClick={() => {
+                  const oldest = olderEvents[0] ?? events[0];
+                  if (!oldest?.id) return;
+                  setLoadingOlder(true);
+                  void api
+                    .olderJobEvents(jobId, oldest.id)
+                    .then((older) => {
+                      setOlderEvents((prev) => [...older, ...prev]);
+                      if (older.length < 400) setHasOlderEvents(false);
+                    })
+                    .finally(() => setLoadingOlder(false));
+                }}
+              >
+                {loadingOlder ? 'Loading…' : 'Load older events'}
+              </button>
+            )}
           </Card>
         </div>
       </div>

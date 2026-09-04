@@ -159,9 +159,23 @@ export class EventBus {
     return () => this.emitter.off(type, listener);
   }
 
-  /** Replay persisted events, optionally after a cursor id. Used by SSE reconnects. */
+  /**
+   * Replay persisted events.
+   *
+   * `afterId` walks forward from a cursor (SSE reconnect: catch up on what was
+   * missed). `beforeId` walks backward from a cursor (UI: page in older
+   * history). With neither, this returns the most recent `limit` events --
+   * the tail, not the head -- since that's what every caller without a cursor
+   * actually wants to see first.
+   */
   list(
-    opts: { jobId?: string; sessionId?: string; afterId?: number; limit?: number } = {},
+    opts: {
+      jobId?: string;
+      sessionId?: string;
+      afterId?: number;
+      beforeId?: number;
+      limit?: number;
+    } = {},
   ): JarvisEvent[] {
     const where: string[] = [];
     const params: (string | number)[] = [];
@@ -177,11 +191,21 @@ export class EventBus {
       where.push('id > ?');
       params.push(opts.afterId);
     }
+    if (opts.beforeId !== undefined) {
+      where.push('id < ?');
+      params.push(opts.beforeId);
+    }
+    const limit = opts.limit ?? 500;
+    // Forward replay reads oldest-first; a tail read (default, or paging
+    // backward with beforeId) reads newest-first and is flipped back to
+    // ascending order below so consumers always see chronological order.
+    const order = opts.afterId !== undefined ? 'ASC' : 'DESC';
     const sql = `SELECT id, type, job_id, session_id, run_id, payload, created_at FROM events
                  ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-                 ORDER BY id ASC LIMIT ?`;
-    params.push(opts.limit ?? 500);
-    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+                 ORDER BY id ${order} LIMIT ?`;
+    params.push(limit);
+    let rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    if (order === 'DESC') rows = rows.reverse();
     return rows.map((r) => ({
       id: Number(r.id),
       type: r.type as JarvisEventType,

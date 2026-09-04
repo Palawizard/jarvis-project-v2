@@ -827,6 +827,15 @@ export function createRoutes(jarvis: Jarvis): Hono {
     });
   });
 
+  /** Pages in older events than the tail already shown on the job detail view. */
+  app.get('/api/jobs/:id/events', (c) => {
+    const job = jarvis.jobs.get(c.req.param('id'));
+    if (!job) return fail('job not found', 404);
+    const beforeId = Number(c.req.query('beforeId'));
+    if (!Number.isFinite(beforeId)) return fail('beforeId is required', 400);
+    return c.json(jarvis.bus.list({ jobId: job.id, beforeId, limit: 400 }));
+  });
+
   app.post('/api/jobs/:id/start', (c) => {
     const job = jarvis.jobs.get(c.req.param('id'));
     if (!job) return fail('job not found', 404);

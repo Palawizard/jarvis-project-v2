@@ -1,15 +1,7 @@
 import type { MemoryInput, MemoryKind, MemoryScope } from '../memory/types.js';
+import type { CapabilityTier, EffortLevel, TaskSignals } from './policy.js';
 
 export type ProviderId = 'claude' | 'codex';
-
-export type ModelProfile = 'economy' | 'balanced' | 'quality';
-
-export interface TaskProfile {
-  modelProfile?: ModelProfile;
-  selfDevelopment?: boolean;
-  highRisk?: boolean;
-  mechanical?: boolean;
-}
 
 export interface RoutingDecision {
   id: string;
@@ -17,6 +9,13 @@ export interface RoutingDecision {
   role: AgentRole;
   provider: ProviderId | null;
   model: string | null;
+  /** Chosen by the central model policy. Never supplied by a caller. */
+  capabilityTier: CapabilityTier | null;
+  effort: EffortLevel | null;
+  /** Policy score behind the decision; null when no provider was selected. */
+  score: number | null;
+  /** Structured, bounded audit of what moved the decision. */
+  factors: string[];
   reason: string;
   avoid: ProviderId | null;
   explicitPreference: ProviderId | null;
@@ -26,7 +25,7 @@ export interface RoutingDecision {
     reason?: string;
     cooldownUntil?: string;
   }>;
-  taskProfile: TaskProfile;
+  signals: TaskSignals;
   createdAt: string;
 }
 
@@ -60,6 +59,12 @@ export interface ProviderCapabilities {
   streaming: boolean;
   resumable: boolean;
   models: string[];
+  /**
+   * Provider CLI can be told how hard to think. Probed from the installed CLI,
+   * never assumed: when this is false the requested effort is NOT applied and
+   * the routing decision says so instead of pretending.
+   */
+  effortControl?: boolean;
   structuredOutput: boolean;
   /** Provider can answer normal chat with no filesystem or execution tools. */
   toolFreeChat?: boolean;
@@ -94,7 +99,10 @@ export interface AgentStartOptions {
   cwd: string;
   prompt: string;
   role: AgentRole;
+  /** Must be in the provider's allowlist; adapters refuse anything else. */
   model?: string;
+  /** `low | medium | high`, from the central policy. Adapters refuse anything else. */
+  effort?: EffortLevel;
   /** Resume a previous provider session/thread instead of starting fresh. */
   resumeSessionId?: string;
   /** Extra system instruction appended to the provider default. */

@@ -42,6 +42,7 @@ import {
 import type { MemoryInput } from '../memory/types.js';
 import { redactSecrets } from '../memory/secrets.js';
 import type { AgentRole } from '../agents/types.js';
+import { classifyChangedPaths, type EffortLevel, type TaskSignals } from '../agents/policy.js';
 import type { InteractiveVisualQaResult, VisualQaBrief, VisualQaCheck } from '../visualqa/agent.js';
 
 const log = createLogger('pipeline');
@@ -268,6 +269,10 @@ export class JobPipeline {
           cwd: input.cwd,
           contextPackId: input.contextPackId,
           prompt: buildFixerPrompt({ job, failures: report.failureSummary }),
+          signals: {
+            repairCycle: cycle,
+            failedChecks: report.results.filter((result) => result.status === 'failed').length,
+          },
           signal: input.signal,
           preferredProvider: provider,
           resumeSessionId: job.resumeSessionId ?? undefined,
@@ -351,7 +356,10 @@ export class JobPipeline {
         ...(provider ? { implementerProvider: provider } : {}),
         implementerSummary: input.implementerSummary,
         headRef: changes.head,
-        taskProfile: { selfDevelopment: input.project.isSelf },
+        signals: {
+          ...briefSignals(job),
+          ...(input.project.isSelf ? { selfDevelopment: true } : {}),
+        },
         signal: input.signal,
       });
       if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
@@ -395,6 +403,14 @@ export class JobPipeline {
           cwd: input.cwd,
           contextPackId: input.contextPackId,
           prompt: buildReviewFixerPrompt({ job, blockers, verification: report }),
+          signals: {
+            ...diffSignals(changes.files),
+            repairCycle: cycle,
+            blockers: blockers.length,
+            highSeverityBlocker: blockers.some(
+              (finding) => finding.severity === 'high' || finding.severity === 'critical',
+            ),
+          },
           signal: input.signal,
           preferredProvider: provider,
           resumeSessionId: job.resumeSessionId ?? undefined,
@@ -531,8 +547,9 @@ export class JobPipeline {
             },
             headRef: changes.head,
             cycle: job.visualFixCycles,
-            // The one permitted quality-model escalation: a balanced agent that
-            // could not judge the surface gets exactly one better look.
+            // The one permitted model escalation: an agent that could not judge
+            // the surface gets exactly one better look. The policy turns this
+            // signal into a strong/medium floor.
             escalateModel: true,
           });
           if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
@@ -590,6 +607,12 @@ export class JobPipeline {
             cwd: input.cwd,
             contextPackId: input.contextPackId,
             prompt: buildVisualFixerPrompt({ job, visual, diff: changes.diff, changedFiles }),
+            signals: {
+              ...diffSignals(changes.files),
+              repairCycle: cycle,
+              productDefect: true,
+              uiFilesChanged: changedFiles.length,
+            },
             imagePaths: visual.evidence.flatMap((shot) =>
               shot.screenshotPath ? [shot.screenshotPath] : [],
             ),
@@ -886,6 +909,11 @@ export class JobPipeline {
           cwd: job.worktreePath,
           contextPackId: pack.id,
           prompt,
+          // A resumed repair is by definition not the first attempt.
+          signals: {
+            repairCycle: job.fixCycles + job.reviewFixCycles + job.visualFixCycles,
+            ...(role === 'visual_fixer' ? { productDefect: true } : {}),
+          },
           signal,
           preferredProvider: provider,
           resumeSessionId: job.resumeSessionId ?? undefined,
@@ -1124,6 +1152,8 @@ export class JobPipeline {
     preferredProvider?: ProviderId;
     resumeSessionId?: string;
     imagePaths?: string[];
+    /** Structured signals for the central model policy. Never a model choice. */
+    signals?: TaskSignals;
   }): Promise<AgentStageOutcome> {
     let preferred = opts.preferredProvider;
     // A provider session has authority only as the pair (provider, id). A legacy
@@ -1145,9 +1175,12 @@ export class JobPipeline {
       const routed = await this.deps.agents.route(opts.role, {
         ...(preferred ? { prefer: preferred } : {}),
         jobId: opts.jobId,
-        taskProfile: {
-          selfDevelopment: this.deps.projects.get(this.deps.jobs.get(opts.jobId)?.projectId ?? '')
-            ?.isSelf,
+        signals: {
+          ...briefSignals(this.deps.jobs.get(opts.jobId)),
+          ...opts.signals,
+          ...(this.deps.projects.get(this.deps.jobs.get(opts.jobId)?.projectId ?? '')?.isSelf
+            ? { selfDevelopment: true }
+            : {}),
         },
       });
       if (!routed.provider) {
@@ -1167,6 +1200,7 @@ export class JobPipeline {
           ...opts,
           provider,
           model: routed.decision.model ?? undefined,
+          effort: routed.decision.effort ?? undefined,
           resumeSessionId: resumeSessionId && provider === preferred ? resumeSessionId : undefined,
         });
         last = { ...result, provider };
@@ -1197,6 +1231,7 @@ export class JobPipeline {
             ...opts,
             provider,
             model: routed.decision.model ?? undefined,
+            effort: routed.decision.effort ?? undefined,
             resumeSessionId: undefined,
           });
           last = { ...fresh, provider };
@@ -1231,6 +1266,7 @@ export class JobPipeline {
     prompt: string;
     contextPackId: string;
     model?: string;
+    effort?: EffortLevel;
     signal: AbortSignal;
     resumeSessionId?: string | undefined;
     imagePaths?: string[];
@@ -1310,6 +1346,7 @@ export class JobPipeline {
           prompt: opts.prompt,
           role: opts.role,
           ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.effort ? { effort: opts.effort } : {}),
           signal: opts.signal,
           ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
           ...(opts.imagePaths?.length ? { imagePaths: opts.imagePaths } : {}),
@@ -1511,6 +1548,30 @@ export function candidateRejectionReason(
   return reviewVerdict === 'approve'
     ? null
     : `Independent review did not approve the candidate (${reviewVerdict}).`;
+}
+
+/**
+ * Model-policy signals from what is known BEFORE any diff exists: the compiled
+ * brief when there is one, the user's own request length when there is not.
+ * Counts only — no brief prose ever reaches the policy.
+ */
+function briefSignals(job: Job | null | undefined): TaskSignals {
+  if (!job) return {};
+  const brief = job.compiledBrief;
+  if (!brief) return { hasCompiledBrief: false, requestChars: job.request.length };
+  return {
+    hasCompiledBrief: true,
+    requirements: brief.requirements.length,
+    acceptanceCriteria: brief.acceptanceCriteria.length,
+  };
+}
+
+/** Model-policy signals read off the candidate diff: paths and numstat only. */
+function diffSignals(files: { path: string; added: number; removed: number }[]): TaskSignals {
+  return {
+    ...classifyChangedPaths(files.map((file) => file.path)),
+    linesChanged: files.reduce((total, file) => total + file.added + file.removed, 0),
+  };
 }
 
 function firstSentences(text: string, count: number): string {

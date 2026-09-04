@@ -51,7 +51,7 @@ afterAll(() => {
 
 describe.skipIf(!enabled)('subscription-backed provider smoke tests', () => {
   it.skipIf(!claudeCaps?.available)('Claude edits and verifies a tiny repository', async () => {
-    await smoke(claude, claudeCaps as ProviderCapabilities, 'haiku');
+    await smoke(claude, claudeCaps as ProviderCapabilities, 'sonnet');
   });
 
   it.skipIf(!codexCaps?.available)('Codex edits and verifies a tiny repository', async () => {

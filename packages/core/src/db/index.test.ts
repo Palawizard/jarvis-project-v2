@@ -292,6 +292,45 @@ describe('database migrations', () => {
     migrated.close();
   });
 
+  it('adds model-policy columns to a v12 database without losing its routing decisions', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-migration-'));
+    homes.push(home);
+    const config = loadConfig({ home });
+    const v12 = new DatabaseSync(config.dbPath);
+    v12.exec(fs.readFileSync(path.join(import.meta.dirname, 'schema.sql'), 'utf8'));
+    v12.prepare('INSERT INTO schema_meta(key,value) VALUES (?,?)').run('schema_version', '1');
+    for (const version of [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) {
+      v12.exec(MIGRATIONS.get(version) as string);
+    }
+    v12.prepare("UPDATE schema_meta SET value='12' WHERE key='schema_version'").run();
+    v12
+      .prepare(
+        `INSERT INTO routing_decisions (id, role, provider, model, reason, provider_availability,
+        created_at) VALUES (?,?,?,?,?,?,?)`,
+      )
+      .run('route_old', 'implementer', 'claude', 'sonnet', 'legacy', '[]', 'now');
+    v12.close();
+
+    const migrated = openDb(config);
+    expect(
+      migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
+    ).toEqual({ value: String(SCHEMA_VERSION) });
+    // The decision survives and reads back with no policy verdict — which is
+    // what it has: it was recorded before the policy existed.
+    expect(
+      migrated
+        .prepare('SELECT model, capability_tier, effort, score, factors FROM routing_decisions')
+        .get(),
+    ).toEqual({
+      model: 'sonnet',
+      capability_tier: null,
+      effort: null,
+      score: null,
+      factors: '[]',
+    });
+    migrated.close();
+  });
+
   it('keeps every Job when a v9 database already holds a duplicate origin link', () => {
     // Migration 10 adds a unique index over `origin_message_id`. A database
     // written before it could hold two Jobs for one chat message — that is the

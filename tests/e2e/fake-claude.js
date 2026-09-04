@@ -18,6 +18,15 @@ if (process.argv.includes('--version')) {
   console.log('claude 0.0.0-e2e-fake');
   process.exit(0);
 }
+if (process.argv.includes('--help')) {
+  console.log(`
+Usage: claude [options]
+
+Options:
+  --effort <level>  Set effort level
+`);
+  process.exit(0);
+}
 if (process.argv.includes('auth') && process.argv.includes('status')) {
   console.log(
     JSON.stringify({ loggedIn: true, authMethod: 'subscription', subscriptionType: 'pro' }),

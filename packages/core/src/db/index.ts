@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /**
  * A LIKE pattern for a term a human typed.
@@ -286,6 +286,17 @@ export const MIGRATIONS = new Map<number, string>([
     // it — and every existing Job reads back with no brief, which is what it
     // has: it was created before the compiler existed.
     `ALTER TABLE jobs ADD COLUMN compiled_brief TEXT;`,
+  ],
+  [
+    13,
+    // What the central model policy decided, per run.
+    //
+    // Additive and nullable: decisions recorded before the policy existed read
+    // back with no tier/effort/score, which is exactly what they had.
+    `ALTER TABLE routing_decisions ADD COLUMN capability_tier TEXT;
+    ALTER TABLE routing_decisions ADD COLUMN effort TEXT;
+    ALTER TABLE routing_decisions ADD COLUMN score INTEGER;
+    ALTER TABLE routing_decisions ADD COLUMN factors TEXT NOT NULL DEFAULT '[]';`,
   ],
 ]);
 

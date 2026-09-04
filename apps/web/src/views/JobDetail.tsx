@@ -631,8 +631,19 @@ export function JobDetailView({
                       <span className="small">
                         {decision.provider ?? 'none'}
                         {decision.model ? ` / ${decision.model}` : ''}
+                        {decision.effort ? ` / ${decision.effort}` : ''}
                       </span>
+                      {decision.score !== null && (
+                        <span className="tiny dim">score {decision.score}</span>
+                      )}
                     </div>
+                    {decision.factors.length > 0 && (
+                      <ul className="tiny dim" style={{ margin: '4px 0 0', paddingLeft: 16 }}>
+                        {decision.factors.map((factor) => (
+                          <li key={factor}>{factor}</li>
+                        ))}
+                      </ul>
+                    )}
                     <div className="tiny dim">{decision.reason}</div>
                   </div>
                 ))}

@@ -37,7 +37,7 @@ describe('provider process protocol', () => {
         role: 'fixer',
         resumeSessionId: 'thread-1',
       },
-      'gpt-5',
+      'terra',
     );
     expect(args.indexOf('--sandbox')).toBeLessThan(args.indexOf('resume'));
     expect(args.indexOf('-C')).toBeLessThan(args.indexOf('resume'));
@@ -85,7 +85,7 @@ describe('provider process protocol', () => {
       expect(claude[claude.indexOf('--json-schema') + 1]).toBe('{"type":"object"}');
       expect(buildClaudePrompt(options)).toContain(image);
 
-      const codex = buildCodexArgs(options, 'gpt-test');
+      const codex = buildCodexArgs(options, 'terra');
       expect(codex).toEqual(
         expect.arrayContaining([
           '--ignore-user-config',

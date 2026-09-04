@@ -16,6 +16,7 @@ class FakeProvider implements AgentProvider {
     private readonly available = true,
     private readonly toolFreeChat = true,
     private readonly enforcesToolAllowlist = true,
+    private readonly effortControl = true,
   ) {}
 
   async capabilities(): Promise<ProviderCapabilities> {
@@ -25,7 +26,8 @@ class FakeProvider implements AgentProvider {
       authenticated: this.available,
       streaming: true,
       resumable: true,
-      models: this.id === 'claude' ? ['opus', 'sonnet', 'haiku'] : [],
+      models: this.id === 'claude' ? ['sonnet', 'opus'] : ['terra', 'sol'],
+      effortControl: this.effortControl,
       structuredOutput: true,
       toolFreeChat: this.toolFreeChat,
       enforcesToolAllowlist: this.enforcesToolAllowlist,
@@ -50,9 +52,7 @@ function registry(
     agents: {
       implementerProvider: undefined,
       reviewerProvider: undefined,
-      claudeModel: 'sonnet',
       claudePermissionMode: 'acceptEdits',
-      codexModel: undefined,
       runTimeoutMs: 1000,
       cooldownMs: opts.cooldownMs ?? 60_000,
     },
@@ -140,15 +140,32 @@ describe('AgentRegistry v2', () => {
     expect(result.provider?.id).toBe('codex');
   });
 
-  it('selects inspectable model profiles without an LLM classifier', async () => {
+  it('selects model and effort from the central policy, without an LLM classifier', async () => {
     const router = registry([new FakeProvider('claude')]);
-    expect(
-      (await router.route('implementer', { taskProfile: { mechanical: true } })).decision.model,
-    ).toBe('haiku');
-    expect(
-      (await router.route('implementer', { taskProfile: { selfDevelopment: true } })).decision
-        .model,
-    ).toBe('opus');
+    const cheap = await router.route('implementer', { signals: { mechanical: true } });
+    expect(cheap.decision.model).toBe('sonnet');
+    expect(cheap.decision.effort).toBe('medium');
+    expect(cheap.decision.factors.join(' ')).toContain('mechanical');
+
+    const heavy = await router.route('implementer', {
+      signals: {
+        selfDevelopment: true,
+        highRisk: true,
+        requirements: 11,
+        hasCompiledBrief: true,
+        packagesTouched: 3,
+      },
+    });
+    expect(heavy.decision.model).toBe('opus');
+    expect(heavy.decision.effort).toBe('high');
+    expect(heavy.decision.capabilityTier).toBe('strong');
+  });
+
+  it('records that effort was not applied when the CLI cannot take one', async () => {
+    const noEffort = new FakeProvider('claude', true, true, true, false);
+    const routed = await registry([noEffort]).route('implementer');
+    expect(routed.decision.effort).toBe('medium');
+    expect(routed.decision.factors.join(' ')).toContain('effort not applied');
   });
 
   it('puts a rate-limited provider on a temporary cooldown', async () => {

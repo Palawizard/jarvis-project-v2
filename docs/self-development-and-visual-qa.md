@@ -124,9 +124,10 @@ message, open Edit, cancel it, switch viewport) spent all four exploring and had
 with, so a run that reached every state it needed still ended inconclusive. The final turn is now
 announced as final, and the turn before it warns that the next one must carry the verdict.
 
-**Model policy.** Visual QA routes the *balanced* profile even when the coding worker used
-`quality`, so a self-development job does not spend Opus on browsing. The single permitted
-escalation is the one fresh retry after an inconclusive or infrastructure outcome. No second
+**Model policy.** Visual QA starts at `normal/medium` and reaches `normal/high` when the diff
+touched a real amount of UI, whatever the coding worker used, so a self-development job does not
+spend Opus on browsing. The single permitted escalation is the one fresh retry after an
+inconclusive or infrastructure outcome, which the policy turns into a `strong/medium` floor. No second
 provider is spent duplicating the same visual work; provider independence is a code-review
 property.
 

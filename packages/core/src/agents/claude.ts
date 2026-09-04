@@ -4,6 +4,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
+import { ALLOWED_MODELS, isAllowedEffort, isAllowedModel, PROVIDER_MODELS } from './policy.js';
 import { resolveCli, type ResolvedCli } from './resolve.js';
 import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
 import { guardToolFreeEvents, isToolFreeRole, toolFreeViolation } from './toolfree.js';
@@ -57,7 +58,8 @@ export class ClaudeProvider implements AgentProvider {
       structuredOutput: true,
       toolFreeChat: true,
       enforcesToolAllowlist: true,
-      models: ['opus', 'sonnet', 'haiku'],
+      effortControl: false,
+      models: [...ALLOWED_MODELS.claude],
     };
 
     const cli = this.resolve();
@@ -78,6 +80,18 @@ export class ClaudeProvider implements AgentProvider {
         ...base,
         reason: `Claude Code CLI could not be executed: ${(error as Error).message}`,
       });
+    }
+
+    // The effort flag is PROBED, never assumed: an older CLI that does not have
+    // it must make the routing decision say the effort was not applied rather
+    // than fail the run or silently claim it was.
+    try {
+      const { stdout } = await exec(cli.command, [...cli.prefixArgs, '--help'], {
+        timeout: 30_000,
+      });
+      base.effortControl = /--effort\b/.test(stdout);
+    } catch {
+      base.effortControl = false;
     }
 
     try {
@@ -119,10 +133,16 @@ export class ClaudeProvider implements AgentProvider {
       return { status: 'failed', result: '', error, memoryProposals: [] };
     }
 
-    const model = options.model ?? this.config.agents.claudeModel;
+    const model = options.model ?? PROVIDER_MODELS.claude.normal;
     let args: string[];
     try {
-      args = buildClaudeArgs(options, model, this.config.agents.claudePermissionMode);
+      // The registry probes capabilities before it routes, so the cache is warm
+      // on every real run. An unprobed adapter assumes the flag works rather
+      // than spawning the CLI again here; the routing decision's honesty comes
+      // from the registry's own capability read.
+      args = buildClaudeArgs(options, model, this.config.agents.claudePermissionMode, {
+        effortControl: this.cached?.effortControl !== false,
+      });
     } catch (error) {
       const message = `invalid Claude input: ${error instanceof Error ? error.message : String(error)}`;
       onEvent({ kind: 'failed', error: message });
@@ -336,7 +356,18 @@ export function buildClaudeArgs(
   options: AgentStartOptions,
   model: string,
   configuredPermissionMode: JarvisConfig['agents']['claudePermissionMode'],
+  provider: { effortControl: boolean } = { effortControl: true },
 ): string[] {
+  // The model/effort space is closed. Anything outside it is a Jarvis bug or a
+  // bypass attempt, and either way it never reaches the CLI.
+  if (!isAllowedModel('claude', model)) {
+    throw new Error(
+      `model "${model}" is not allowed for claude (${ALLOWED_MODELS.claude.join('|')})`,
+    );
+  }
+  if (options.effort !== undefined && !isAllowedEffort(options.effort)) {
+    throw new Error(`effort "${String(options.effort)}" is not one of low|medium|high`);
+  }
   // The conversational agent has no business editing source: it answers, and it
   // may only *request* structured Jarvis actions that trusted code then decides.
   // The analyst reads a disposable worktree and reports; it never writes either.
@@ -357,6 +388,9 @@ export function buildClaudeArgs(
     readOnly ? 'plan' : configuredPermissionMode,
     '--no-chrome',
   ];
+  // `--effort` takes low|medium|high|xhigh|max; Jarvis only ever passes the
+  // first three, so the policy's ceiling is also the CLI's.
+  if (options.effort && provider.effortControl) args.push('--effort', options.effort);
   if (options.safeMode) args.push('--safe-mode');
   if (options.ephemeral) args.push('--no-session-persistence');
   if (options.role === 'visual_reviewer') args.push('--tools', 'Read');

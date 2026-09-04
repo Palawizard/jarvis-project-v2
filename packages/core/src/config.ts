@@ -21,10 +21,17 @@ export interface JarvisConfig {
   agents: {
     implementerProvider: 'claude' | 'codex' | undefined;
     reviewerProvider: 'claude' | 'codex' | undefined;
-    claudeModel: string;
+    /**
+     * There is no model override here, on purpose.
+     *
+     * The two per-provider model environment variables were removed with the
+     * central model policy: a per-machine override was a way to put an arbitrary
+     * model (including `haiku`) behind every role and bypass the role floors and
+     * ceilings. Model and effort come from `agents/policy.ts` alone.
+     * PROVIDER overrides are unaffected — see `implementerProvider` above.
+     */
     /** Permission mode handed to `claude -p`. acceptEdits keeps the worker inside file edits. */
     claudePermissionMode: 'acceptEdits' | 'bypassPermissions' | 'default' | 'plan';
-    codexModel: string | undefined;
     /** Hard ceiling on a single agent run. */
     runTimeoutMs: number;
     /** Temporary backoff after a provider reports a rate limit. */
@@ -157,12 +164,10 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
     agents: {
       implementerProvider: envProvider('JARVIS_IMPLEMENTER_PROVIDER'),
       reviewerProvider: envProvider('JARVIS_REVIEWER_PROVIDER'),
-      claudeModel: process.env.JARVIS_CLAUDE_MODEL || 'sonnet',
       claudePermissionMode:
         (process.env
           .JARVIS_CLAUDE_PERMISSION_MODE as JarvisConfig['agents']['claudePermissionMode']) ||
         'acceptEdits',
-      codexModel: process.env.JARVIS_CODEX_MODEL || undefined,
       runTimeoutMs: envInt('JARVIS_AGENT_TIMEOUT_MS', 30 * 60_000),
       cooldownMs: envInt('JARVIS_PROVIDER_COOLDOWN_MS', 10 * 60_000),
     },

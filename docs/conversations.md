@@ -332,8 +332,8 @@ and a message that has already produced a Job is never compiled a second time.
 Every message in a workspace with at least one registered project spends one
 tool-free classification run; a message that routes to a code change spends a
 second for the independent check, and a third to compile the brief. Messages in a workspace with no registered
-projects, and explicit memory commands, spend none. Routing uses the balanced
-model profile and gives up after 90 seconds — a one-sentence classification that
+projects, and explicit memory commands, spend none. The model policy pins routing to the
+cheap bounded model at low effort, and it gives up after 90 seconds — a one-sentence classification that
 has not answered by then has failed, not thought harder. There is no retry: if a
 provider is unreachable, the turn becomes an ordinary answer and no Job is
 created.

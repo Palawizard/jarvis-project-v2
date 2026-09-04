@@ -780,7 +780,10 @@ export class ChatService {
       });
 
       const routed = await agents.route('chat', {
-        taskProfile: { modelProfile: 'balanced' },
+        signals: {
+          requestChars: userMessage.content.length,
+          ...(project?.isSelf ? { selfDevelopment: true } : {}),
+        },
       });
       if (!routed.provider) {
         const reason = `No conversational provider is available right now: ${routed.reason}`;
@@ -832,6 +835,7 @@ export class ChatService {
             prompt: this.buildChatPrompt(userMessage.content, pack.rendered, conversationId),
             role: 'chat',
             ...(routed.decision.model ? { model: routed.decision.model } : {}),
+            ...(routed.decision.effort ? { effort: routed.decision.effort } : {}),
             // Jarvis owns the context, so there is no provider thread to break.
             ephemeral: true,
             safeMode: true,

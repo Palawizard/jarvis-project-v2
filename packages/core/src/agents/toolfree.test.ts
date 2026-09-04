@@ -105,9 +105,7 @@ function config() {
     agents: {
       implementerProvider: undefined,
       reviewerProvider: undefined,
-      claudeModel: 'sonnet',
       claudePermissionMode: 'acceptEdits',
-      codexModel: undefined,
       runTimeoutMs: 90_000,
       cooldownMs: 1000,
     },
@@ -157,12 +155,12 @@ describe('chat CLI configuration', () => {
 
   it('keeps Codex out of write mode for every non-implementing role', () => {
     for (const role of [...TOOL_FREE, 'project_analyst', 'reviewer'] as const) {
-      const args = buildCodexArgs({ cwd: fixtures, prompt: 'x', role }, 'gpt-test');
+      const args = buildCodexArgs({ cwd: fixtures, prompt: 'x', role }, 'terra');
       expect(args[args.indexOf('--sandbox') + 1]).toBe('read-only');
     }
     const implementer = buildCodexArgs(
       { cwd: fixtures, prompt: 'x', role: 'implementer' },
-      'gpt-test',
+      'terra',
     );
     expect(implementer[implementer.indexOf('--sandbox') + 1]).toBe('workspace-write');
   });

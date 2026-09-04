@@ -179,7 +179,7 @@ export class ProjectAnalysisService {
       });
 
       const routed = await this.deps.agents.route('project_analyst', {
-        taskProfile: { modelProfile: 'balanced' },
+        signals: { selfDevelopment: project.isSelf },
       });
       if (!routed.provider) {
         return this.fail(
@@ -206,6 +206,7 @@ export class ProjectAnalysisService {
           prompt: buildAnalystPrompt(project),
           role: 'project_analyst',
           ...(routed.decision.model ? { model: routed.decision.model } : {}),
+          ...(routed.decision.effort ? { effort: routed.decision.effort } : {}),
           ephemeral: true,
           safeMode: true,
           timeoutMs: this.deps.config.agents.runTimeoutMs,

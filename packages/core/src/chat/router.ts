@@ -392,9 +392,7 @@ export class SemanticRouter {
     input: RoutingInput,
   ): Promise<{ status: 'ok'; text: string } | { status: 'no'; rejected: RoutingRejection }> {
     if (input.signal.aborted) return { status: 'no', rejected: 'cancelled' };
-    const routed = await this.deps.agents.route(role, {
-      taskProfile: { modelProfile: 'balanced' },
-    });
+    const routed = await this.deps.agents.route(role);
     if (!routed.provider) {
       log.warn('no routing provider is available', { role, reason: routed.reason });
       return { status: 'no', rejected: 'provider_unavailable' };
@@ -409,6 +407,7 @@ export class SemanticRouter {
           prompt,
           role,
           ...(routed.decision.model ? { model: routed.decision.model } : {}),
+          ...(routed.decision.effort ? { effort: routed.decision.effort } : {}),
           // No provider session survives a routing decision, and no user or
           // project customisation reaches one.
           ephemeral: true,

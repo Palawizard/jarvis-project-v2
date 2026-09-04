@@ -3,6 +3,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
+import { ALLOWED_MODELS, isAllowedEffort, isAllowedModel } from './policy.js';
 import { resolveCli, type ResolvedCli } from './resolve.js';
 import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
 import { guardToolFreeEvents, toolFreeViolation } from './toolfree.js';
@@ -57,7 +58,8 @@ export class CodexProvider implements AgentProvider {
       streaming: true,
       resumable: true,
       structuredOutput: true,
-      models: [],
+      effortControl: false,
+      models: [...ALLOWED_MODELS.codex],
     };
 
     const cli = this.resolve();
@@ -77,6 +79,17 @@ export class CodexProvider implements AgentProvider {
         ...base,
         reason: `Codex CLI could not be executed: ${(error as Error).message}`,
       });
+    }
+    // Codex has no `--effort` flag: reasoning effort is a config key, set per
+    // invocation with `-c`. Probed rather than assumed, so a CLI without the
+    // override makes the routing decision say the effort was not applied.
+    try {
+      const { stdout } = await exec(cli.command, [...cli.prefixArgs, 'exec', '--help'], {
+        timeout: 30_000,
+      });
+      base.effortControl = /(^|\s)(-c|--config)[\s,]/.test(stdout);
+    } catch {
+      base.effortControl = false;
     }
     try {
       const { stdout, stderr } = await exec(cli.command, [...cli.prefixArgs, 'login', 'status'], {
@@ -116,8 +129,17 @@ export class CodexProvider implements AgentProvider {
       return { status: 'failed', result: '', error, memoryProposals: [] };
     }
 
-    const model = options.model ?? this.config.agents.codexModel;
-    const args = buildCodexArgs(options, model);
+    // No local default: with no decision from the policy, Codex keeps using its
+    // own configured model rather than being pinned to one Jarvis guessed.
+    const model = options.model;
+    let args: string[];
+    try {
+      args = buildCodexArgs(options, model, { effortControl: caps.effortControl === true });
+    } catch (error) {
+      const message = `invalid Codex input: ${error instanceof Error ? error.message : String(error)}`;
+      onEvent({ kind: 'failed', error: message });
+      return { status: 'failed', result: '', error: message, memoryProposals: [] };
+    }
 
     // Same defence in depth as the Claude adapter: Codex is not currently
     // routed to `chat` (it never declares `toolFreeChat`), and if that ever
@@ -297,7 +319,19 @@ export class CodexProvider implements AgentProvider {
   }
 }
 
-export function buildCodexArgs(options: AgentStartOptions, model?: string): string[] {
+export function buildCodexArgs(
+  options: AgentStartOptions,
+  model?: string,
+  provider: { effortControl: boolean } = { effortControl: true },
+): string[] {
+  if (model !== undefined && !isAllowedModel('codex', model)) {
+    throw new Error(
+      `model "${model}" is not allowed for codex (${ALLOWED_MODELS.codex.join('|')})`,
+    );
+  }
+  if (options.effort !== undefined && !isAllowedEffort(options.effort)) {
+    throw new Error(`effort "${String(options.effort)}" is not one of low|medium|high`);
+  }
   // Everything else — reviewer, visual reviewer, chat and the project analyst —
   // gets Codex's read-only sandbox. Read-only is not tool-free: for `chat` the
   // real guarantee is that Codex never declares `toolFreeChat`, so the registry
@@ -317,6 +351,12 @@ export function buildCodexArgs(options: AgentStartOptions, model?: string): stri
     options.cwd,
   ];
   if (model) args.push('--model', model);
+  // `model_reasoning_effort` is Codex's own config key for how hard to think.
+  // A per-invocation `-c` override beats whatever is in the user's config.toml,
+  // and `--ignore-user-config` (safe mode) does not remove it.
+  if (options.effort && provider.effortControl) {
+    args.push('-c', `model_reasoning_effort="${options.effort}"`);
+  }
   if (options.safeMode) args.push('--ignore-user-config', '--ignore-rules');
   if (options.ephemeral) args.push('--ephemeral');
   for (const imagePath of options.imagePaths ?? []) {

@@ -3,7 +3,8 @@ import { parseJson } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
 import type { EventBus } from '../events/bus.js';
 import type { AgentRegistry } from '../agents/registry.js';
-import type { AgentRunResult, ProviderId, TaskProfile } from '../agents/types.js';
+import type { AgentRunResult, ProviderId } from '../agents/types.js';
+import { classifyChangedPaths, type TaskSignals } from '../agents/policy.js';
 import type { VerificationReport } from '../verification/engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { redactSecrets, redactSecretValues } from '../memory/secrets.js';
@@ -45,7 +46,8 @@ export interface ReviewOptions {
   implementerProvider?: ProviderId;
   implementerSummary: string;
   headRef: string;
-  taskProfile?: TaskProfile;
+  /** Structured signals for the central model policy. Never a model choice. */
+  signals?: TaskSignals;
   signal?: AbortSignal;
 }
 
@@ -113,7 +115,7 @@ export class ReviewEngine {
       avoid: avoidProvider,
       prefer: this.config.agents.reviewerProvider,
       jobId: opts.jobId,
-      taskProfile: opts.taskProfile,
+      signals: reviewSignals(opts),
     });
     if (!routed.provider) {
       const review = this.persist({
@@ -162,6 +164,7 @@ export class ReviewEngine {
           prompt,
           role: 'reviewer',
           ...(routed.decision?.model ? { model: routed.decision.model } : {}),
+          ...(routed.decision?.effort ? { effort: routed.decision.effort } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
         },
         (event) => {
@@ -304,6 +307,21 @@ export class ReviewEngine {
       createdAt: row.created_at as string,
     }));
   }
+}
+
+/**
+ * Deterministic model-policy signals for a review: what the caller declared,
+ * plus facts read off the candidate diff itself (paths and numstat, never the
+ * implementer's description of what it did).
+ */
+function reviewSignals(opts: ReviewOptions): TaskSignals {
+  const facts = classifyChangedPaths(opts.files.map((file) => file.path));
+  return {
+    ...opts.signals,
+    ...facts,
+    linesChanged: opts.files.reduce((total, file) => total + file.added + file.removed, 0),
+    failedChecks: opts.verification.results.filter((result) => result.status === 'failed').length,
+  };
 }
 
 function buildReviewPrompt(opts: ReviewOptions): string {

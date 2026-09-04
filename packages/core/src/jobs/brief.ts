@@ -286,7 +286,7 @@ export class JobBriefCompiler {
     this.emit('job.brief.compilation.started', input, {});
 
     const routed = await this.deps.agents.route('brief_compiler', {
-      taskProfile: { modelProfile: 'balanced' },
+      signals: { requestChars: input.request.length },
     });
     if (!routed.provider) {
       return this.failed(input, startedAt, 'provider_unavailable', {
@@ -313,6 +313,7 @@ export class JobBriefCompiler {
           prompt: buildBriefPrompt(input),
           role: 'brief_compiler',
           ...(model ? { model } : {}),
+          ...(routed.decision.effort ? { effort: routed.decision.effort } : {}),
           ...(schemaPath ? { outputSchemaPath: schemaPath } : {}),
           ephemeral: true,
           safeMode: true,

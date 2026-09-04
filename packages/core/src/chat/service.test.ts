@@ -52,7 +52,7 @@ class ScriptedProvider implements AgentProvider {
       resumable: true,
       structuredOutput: true,
       toolFreeChat: true,
-      models: ['opus', 'sonnet', 'haiku'],
+      models: ['sonnet', 'opus'],
     };
   }
 

@@ -6,6 +6,7 @@ import type { EventBus } from '../events/bus.js';
 import type { JobService } from '../jobs/service.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import type { AgentEvent, AgentRunResult, ProviderId } from '../agents/types.js';
+import type { EffortLevel } from '../agents/policy.js';
 import { redactSecrets, redactSecretValues } from '../memory/secrets.js';
 import { newId, nowIso } from '../ids.js';
 import { createLogger } from '../logger.js';
@@ -324,11 +325,13 @@ export class InteractiveVisualQaAgent {
     };
     const routed = await this.agents.route('visual_reviewer', {
       jobId: opts.jobId,
-      taskProfile: {
-        selfDevelopment: opts.selfDevelopment,
-        // Visual QA is a balanced-profile job. A quality model is spent only on
-        // the one escalated retry, never merely because the coder used one.
-        modelProfile: opts.escalateModel ? 'quality' : 'balanced',
+      signals: {
+        ...(opts.selfDevelopment ? { selfDevelopment: true } : {}),
+        // A stronger model is spent only on the one escalated re-look, never
+        // merely because the coder used one. The policy turns this into a
+        // strong/medium floor.
+        ...(opts.escalateModel ? { escalated: true } : {}),
+        uiFilesChanged: opts.brief.changedFiles.length,
       },
     });
     if (!routed.provider) {
@@ -343,6 +346,7 @@ export class InteractiveVisualQaAgent {
     }
     const provider = routed.provider;
     const model = routed.decision.model;
+    const effort = routed.decision.effort;
 
     const outDir = path.resolve(this.artifactsDir, opts.jobId, 'visual-qa');
     const root = path.resolve(this.artifactsDir);
@@ -410,6 +414,7 @@ export class InteractiveVisualQaAgent {
         const decision = await this.decide({
           provider,
           model,
+          effort,
           opts,
           schemaPath,
           brief: opts.brief,
@@ -559,6 +564,7 @@ export class InteractiveVisualQaAgent {
   private async decide(input: {
     provider: NonNullable<Awaited<ReturnType<AgentRegistry['route']>>['provider']>;
     model: string | null;
+    effort: EffortLevel | null;
     opts: InteractiveVisualQaOptions;
     schemaPath: string;
     brief: VisualQaBrief;
@@ -582,6 +588,7 @@ export class InteractiveVisualQaAgent {
           cwd: input.opts.cwd,
           role: 'visual_reviewer',
           ...(input.model ? { model: input.model } : {}),
+          ...(input.effort ? { effort: input.effort } : {}),
           prompt: buildTurnPrompt(input.brief, input.observation, input.history, input.turn),
           ...(images.length ? { imagePaths: images } : {}),
           outputSchemaPath: input.schemaPath,

@@ -341,6 +341,10 @@ export interface RoutingDecision {
   role: string;
   provider: string | null;
   model: string | null;
+  capabilityTier: 'normal' | 'strong' | null;
+  effort: 'low' | 'medium' | 'high' | null;
+  score: number | null;
+  factors: string[];
   reason: string;
   createdAt: string;
 }

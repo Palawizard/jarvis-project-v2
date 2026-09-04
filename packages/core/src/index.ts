@@ -160,6 +160,7 @@ export { ClaudeProvider } from './agents/claude.js';
 export { CodexProvider } from './agents/codex.js';
 export { extractMemoryProposals, MEMORY_PROPOSAL_INSTRUCTIONS } from './agents/proposals.js';
 export * from './agents/types.js';
+export * from './agents/policy.js';
 
 export {
   GitWorkspace,

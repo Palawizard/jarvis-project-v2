@@ -118,9 +118,7 @@ function config() {
     agents: {
       implementerProvider: undefined,
       reviewerProvider: undefined,
-      claudeModel: 'sonnet',
       claudePermissionMode: 'acceptEdits',
-      codexModel: undefined,
       runTimeoutMs: 90_000,
       cooldownMs: 1000,
     },

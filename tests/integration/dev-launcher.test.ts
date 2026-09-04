@@ -249,7 +249,7 @@ describe('pnpm dev supervisor bootstrap', () => {
       JARVIS_IMPLEMENTER_PROVIDER: 'claude',
       JARVIS_REVIEWER_PROVIDER: 'claude',
       JARVIS_CODEX_BIN: 'C:\\__jarvis_codex_disabled__\\codex.exe',
-      JARVIS_CLAUDE_MODEL: 'sonnet',
+      JARVIS_CLAUDE_PERMISSION_MODE: 'acceptEdits',
       JARVIS_LOG_LEVEL: 'debug',
       JARVIS_PROVIDER_COOLDOWN_MS: '1000',
       JARVIS_WEB_PORT: '',
@@ -259,7 +259,7 @@ describe('pnpm dev supervisor bootstrap', () => {
       JARVIS_IMPLEMENTER_PROVIDER: 'claude',
       JARVIS_REVIEWER_PROVIDER: 'claude',
       JARVIS_CODEX_BIN: 'C:\\__jarvis_codex_disabled__\\codex.exe',
-      JARVIS_CLAUDE_MODEL: 'sonnet',
+      JARVIS_CLAUDE_PERMISSION_MODE: 'acceptEdits',
       JARVIS_LOG_LEVEL: 'debug',
       JARVIS_PROVIDER_COOLDOWN_MS: '1000',
     });

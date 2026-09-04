@@ -5,15 +5,19 @@ import { getConfig, type JarvisConfig } from '../config.js';
 import { ClaudeProvider } from './claude.js';
 import { CodexProvider } from './codex.js';
 import { isToolFreeRole } from './toolfree.js';
+import {
+  modelFor,
+  selectExecutionProfile,
+  type ExecutionProfile,
+  type TaskSignals,
+} from './policy.js';
 import type {
   AgentProvider,
   AgentRole,
   AgentRunResult,
-  ModelProfile,
   ProviderCapabilities,
   ProviderId,
   RoutingDecision,
-  TaskProfile,
 } from './types.js';
 
 interface HealthState {
@@ -197,14 +201,19 @@ export class AgentRegistry {
       avoid?: ProviderId;
       prefer?: ProviderId;
       jobId?: string;
-      taskProfile?: TaskProfile;
+      signals?: TaskSignals;
     } = {},
   ): Promise<RoutingResult> {
     const caps = await this.capabilities();
     const usable = caps.filter(
       (capability) => capability.available && roleAllowed(role, capability),
     );
-    const profile = resolveModelProfile(opts.taskProfile);
+    // Provider selection below is unchanged and comes first; the policy only
+    // decides how much model to spend once a legitimate provider is chosen.
+    const profile = selectExecutionProfile({
+      role,
+      ...(opts.signals ? { signals: opts.signals } : {}),
+    });
     const order: ProviderId[] = [];
     if ((role === 'reviewer' || role === 'visual_reviewer') && opts.avoid) {
       if (opts.prefer && opts.prefer !== opts.avoid) order.push(opts.prefer);
@@ -234,12 +243,22 @@ export class AgentRegistry {
               }`,
           )
           .join('; ');
+    // An honest audit trail: the effort is only claimed as applied when the
+    // installed CLI actually accepts one.
+    const factors = [...profile.factors];
+    if (capability && !capability.effortControl) {
+      factors.push(`effort not applied: ${capability.id} CLI has no effort control`);
+    }
     const decision: RoutingDecision = {
       id: newId('route'),
       jobId: opts.jobId ?? null,
       role,
       provider: selectedId ?? null,
-      model: selectedId ? selectModel(selectedId, profile, this.config) : null,
+      model: selectedId ? modelFor(selectedId, profile.capabilityTier) : null,
+      capabilityTier: selectedId ? profile.capabilityTier : null,
+      effort: selectedId ? profile.effort : null,
+      score: selectedId ? profile.score : null,
+      factors,
       reason: reason || 'no usable provider',
       avoid: opts.avoid ?? null,
       explicitPreference: opts.prefer ?? null,
@@ -249,7 +268,7 @@ export class AgentRegistry {
         ...(cap.reason ? { reason: cap.reason } : {}),
         ...(cap.cooldownUntil ? { cooldownUntil: cap.cooldownUntil } : {}),
       })),
-      taskProfile: { ...opts.taskProfile, modelProfile: profile },
+      signals: { ...opts.signals },
       createdAt: nowIso(),
     };
     this.persistDecision(decision);
@@ -300,13 +319,17 @@ export class AgentRegistry {
       role: row.role as AgentRole,
       provider: (row.provider as ProviderId) ?? null,
       model: (row.model as string) ?? null,
+      capabilityTier: (row.capability_tier as RoutingDecision['capabilityTier']) ?? null,
+      effort: (row.effort as RoutingDecision['effort']) ?? null,
+      score: row.score === null || row.score === undefined ? null : Number(row.score),
+      factors: JSON.parse((row.factors as string) || '[]') as string[],
       reason: row.reason as string,
       avoid: (row.avoid_provider as ProviderId) ?? null,
       explicitPreference: (row.explicit_preference as ProviderId) ?? null,
       availability: JSON.parse(
         (row.provider_availability as string) || '[]',
       ) as RoutingDecision['availability'],
-      taskProfile: JSON.parse((row.task_profile as string) || '{}') as TaskProfile,
+      signals: JSON.parse((row.task_profile as string) || '{}') as TaskSignals,
       createdAt: row.created_at as string,
     }));
   }
@@ -314,9 +337,10 @@ export class AgentRegistry {
   private persistDecision(decision: RoutingDecision): void {
     this.deps.db
       ?.prepare(
-        `INSERT INTO routing_decisions (id, job_id, role, provider, model, reason, avoid_provider,
-          explicit_preference, provider_availability, task_profile, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO routing_decisions (id, job_id, role, provider, model, capability_tier, effort,
+          score, factors, reason, avoid_provider, explicit_preference, provider_availability,
+          task_profile, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         decision.id,
@@ -324,11 +348,15 @@ export class AgentRegistry {
         decision.role,
         decision.provider,
         decision.model,
+        decision.capabilityTier,
+        decision.effort,
+        decision.score,
+        JSON.stringify(decision.factors),
         decision.reason,
         decision.avoid,
         decision.explicitPreference,
         JSON.stringify(decision.availability),
-        JSON.stringify(decision.taskProfile),
+        JSON.stringify(decision.signals),
         decision.createdAt,
       );
     this.deps.bus?.emit({
@@ -338,26 +366,13 @@ export class AgentRegistry {
         role: decision.role,
         provider: decision.provider,
         model: decision.model,
+        effort: decision.effort,
+        score: decision.score,
+        factors: decision.factors,
         reason: decision.reason,
       },
     });
   }
-}
-
-function resolveModelProfile(task: TaskProfile | undefined): ModelProfile {
-  if (task?.modelProfile) return task.modelProfile;
-  if (task?.selfDevelopment || task?.highRisk) return 'quality';
-  if (task?.mechanical) return 'economy';
-  return 'balanced';
-}
-
-function selectModel(id: ProviderId, profile: ModelProfile, config: JarvisConfig): string | null {
-  if (id === 'claude') {
-    if (profile === 'economy') return 'haiku';
-    if (profile === 'quality') return 'opus';
-    return config.agents.claudeModel;
-  }
-  return config.agents.codexModel ?? null;
 }
 
 function routingReason(
@@ -365,24 +380,24 @@ function routingReason(
   role: AgentRole,
   opts: { avoid?: ProviderId; prefer?: ProviderId },
   caps: ProviderCapabilities[],
-  profile: ModelProfile,
+  profile: ExecutionProfile,
 ): string {
-  if (opts.prefer === selected)
-    return `explicit ${role} provider override; ${profile} model profile`;
+  const model = `${profile.capabilityTier}/${profile.effort}`;
+  if (opts.prefer === selected) return `explicit ${role} provider override; ${model}`;
   if (opts.prefer && !caps.find((cap) => cap.id === opts.prefer)?.available) {
-    return `preferred ${opts.prefer} unavailable; fell back to ${selected}; ${profile} model profile`;
+    return `preferred ${opts.prefer} unavailable; fell back to ${selected}; ${model}`;
   }
   if (
     (role === 'reviewer' || role === 'visual_reviewer') &&
     opts.avoid &&
     selected !== opts.avoid
   ) {
-    return `independent cross-provider ${role}; ${profile} model profile`;
+    return `independent cross-provider ${role}; ${model}`;
   }
   if ((role === 'reviewer' || role === 'visual_reviewer') && opts.avoid === selected) {
-    return `no healthy alternative; fresh ${selected} context; ${profile} model profile`;
+    return `no healthy alternative; fresh ${selected} context; ${model}`;
   }
-  return `healthy provider fallback order; ${profile} model profile`;
+  return `healthy provider fallback order; ${model}`;
 }
 
 /**

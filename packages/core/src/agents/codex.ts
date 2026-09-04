@@ -3,7 +3,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { extractMemoryProposals } from './proposals.js';
-import { ALLOWED_MODELS, isAllowedEffort, isAllowedModel } from './policy.js';
+import { ALLOWED_MODELS, isAllowedEffort, isAllowedModel, PROVIDER_MODELS } from './policy.js';
 import { resolveCli, type ResolvedCli } from './resolve.js';
 import { jsonlProtocolError, runJsonlProcess } from './spawn.js';
 import { guardToolFreeEvents, toolFreeViolation } from './toolfree.js';
@@ -129,8 +129,6 @@ export class CodexProvider implements AgentProvider {
       return { status: 'failed', result: '', error, memoryProposals: [] };
     }
 
-    // No local default: with no decision from the policy, Codex keeps using its
-    // own configured model rather than being pinned to one Jarvis guessed.
     const model = options.model;
     let args: string[];
     try {
@@ -324,9 +322,13 @@ export function buildCodexArgs(
   model?: string,
   provider: { effortControl: boolean } = { effortControl: true },
 ): string[] {
-  if (model !== undefined && !isAllowedModel('codex', model)) {
+  // Every Codex invocation is pinned to a model Jarvis chose. Omitting --model
+  // would hand the choice to the user's own CLI configuration, which is exactly
+  // the arbitrary override the central policy exists to remove.
+  const selected = model ?? PROVIDER_MODELS.codex.normal;
+  if (!isAllowedModel('codex', selected)) {
     throw new Error(
-      `model "${model}" is not allowed for codex (${ALLOWED_MODELS.codex.join('|')})`,
+      `model "${selected}" is not allowed for codex (${ALLOWED_MODELS.codex.join('|')})`,
     );
   }
   if (options.effort !== undefined && !isAllowedEffort(options.effort)) {
@@ -350,7 +352,7 @@ export function buildCodexArgs(
     '-C',
     options.cwd,
   ];
-  if (model) args.push('--model', model);
+  args.push('--model', selected);
   // `model_reasoning_effort` is Codex's own config key for how hard to think.
   // A per-invocation `-c` override beats whatever is in the user's config.toml,
   // and `--ignore-user-config` (safe mode) does not remove it.

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildClaudeArgs } from './claude.js';
 import { buildCodexArgs } from './codex.js';
-import { modelFor, type CapabilityTier, type EffortLevel } from './policy.js';
+import { ALLOWED_MODELS, modelFor, type CapabilityTier, type EffortLevel } from './policy.js';
 import type { AgentStartOptions } from './types.js';
 
 const options = (effort?: EffortLevel): AgentStartOptions => ({
@@ -70,6 +70,19 @@ describe('the decision reaches the Codex CLI', () => {
 
   it('omits the override entirely when no effort was decided', () => {
     expect(buildCodexArgs(options(), 'terra')).not.toContain('-c');
+  });
+
+  it('always pins --model, so the user CLI config never picks the model', () => {
+    // Including the case the policy cannot supply one: an unpinned run would
+    // let ~/.codex/config.toml choose any model it likes.
+    for (const args of [buildCodexArgs(options()), buildCodexArgs(options('high'))]) {
+      expect(args).toContain('--model');
+      expect(args[args.indexOf('--model') + 1]).toBe('terra');
+    }
+    for (const tier of ['normal', 'strong'] as const) {
+      const args = buildCodexArgs(options('medium'), modelFor('codex', tier));
+      expect(ALLOWED_MODELS.codex).toContain(args[args.indexOf('--model') + 1]);
+    }
   });
 
   it('omits the override rather than pretending when the CLI cannot take one', () => {

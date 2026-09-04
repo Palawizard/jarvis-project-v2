@@ -1473,6 +1473,99 @@ describe('job repair pipeline', () => {
     },
   );
 
+  // A repair rewrites the same source the implementer wrote. If it routes on
+  // repair counters alone, a candidate that touched auth, permissions, the
+  // sandbox or a migration gets a weaker model for the harder, riskier half of
+  // the job — so both repair entry points read the candidate's own paths.
+  const SENSITIVE = path.join('packages', 'core', 'src', 'auth', 'control.ts');
+
+  const writeSensitive = (cwd: string): void => {
+    fs.mkdirSync(path.join(cwd, path.dirname(SENSITIVE)), { recursive: true });
+    fs.writeFileSync(path.join(cwd, SENSITIVE), 'export const control = 1;\n');
+  };
+
+  it('routes a verification fixer for a sensitive candidate at the strong/high floor', async () => {
+    const provider = new FakeProvider('claude', (call) => {
+      if (call.role === 'implementer') writeSensitive(call.cwd);
+      return success();
+    });
+    const h = await harness({
+      provider,
+      verification: [failedVerification('product'), passedVerification()],
+      review: APPROVES.review,
+    });
+    await runToRest(h);
+    const fixer = provider.calls.find((call) => call.role === 'fixer');
+    expect(fixer).toBeDefined();
+    expect(fixer?.model).toBe('opus');
+    expect(fixer?.effort).toBe('high');
+    h.db.close();
+  });
+
+  it('routes a resumed repair of a sensitive candidate at the strong/high floor', async () => {
+    const provider = new FakeProvider('claude', () => success());
+    const h = await harness({ provider, review: APPROVES.review });
+    const job = h.jobs.create({ projectId: h.project.id, request: 'Resume a sensitive repair.' });
+    h.jobs.transition(job.id, 'planning');
+    h.jobs.transition(job.id, 'implementing');
+    const workspace = new GitWorkspace(h.config.worktreesDir);
+    const worktree = await workspace.createWorktree({ repoRoot: h.repo, jobId: job.id });
+    writeSensitive(worktree.path);
+    const head = (await workspace.commitPending(worktree.path, 'sensitive checkpoint')) as string;
+    h.jobs.patch(job.id, {
+      worktreePath: worktree.path,
+      branch: worktree.branch,
+      baseRef: worktree.baseRef,
+      headRef: head,
+    });
+    h.jobs.transition(job.id, 'verifying');
+    h.db
+      .prepare(
+        `INSERT INTO verifications
+          (id,job_id,cycle,name,command,cwd,exit_code,status,output,duration_ms,kind,required,
+           failure_kind,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        'ver-sensitive',
+        job.id,
+        0,
+        'test',
+        'test',
+        worktree.path,
+        1,
+        'failed',
+        'persisted sensitive failure',
+        1,
+        'check',
+        1,
+        'product',
+        nowIso(),
+      );
+    h.jobs.transition(job.id, 'fixing', {
+      repairKind: 'verification',
+      repairCheckpoint: {
+        kind: 'verification',
+        verification: {
+          resultIds: ['ver-sensitive'],
+          cycle: 0,
+          failureSummary: 'persisted sensitive failure',
+        },
+      },
+    });
+    expect(h.jobs.recoverInterrupted().jobs).toBe(1);
+    h.pipeline.resume(job.id);
+    const deadline = Date.now() + 20_000;
+    while (h.pipeline.isRunning(job.id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const resumed = provider.calls.find((call) => call.role === 'fixer');
+    expect(resumed).toBeDefined();
+    expect(resumed?.model).toBe('opus');
+    expect(resumed?.effort).toBe('high');
+    h.db.close();
+  });
+
   it.each([
     ['verifying', undefined],
     ['reviewing', undefined],

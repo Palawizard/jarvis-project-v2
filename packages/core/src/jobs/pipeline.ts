@@ -263,6 +263,13 @@ export class JobPipeline {
             },
           },
         });
+        // The failing candidate's own paths decide how much model the repair
+        // gets. Without them a fixer rewriting auth, permissions, the sandbox or
+        // a migration would route below the policy's sensitive-path floor.
+        const failingCandidate = await this.git.collectChanges(
+          input.cwd,
+          job.baseRef as string,
+        );
         const fixed = await this.runAgentStage({
           jobId,
           role: 'fixer',
@@ -270,6 +277,7 @@ export class JobPipeline {
           contextPackId: input.contextPackId,
           prompt: buildFixerPrompt({ job, failures: report.failureSummary }),
           signals: {
+            ...diffSignals(failingCandidate.files),
             repairCycle: cycle,
             failedChecks: report.results.filter((result) => result.status === 'failed').length,
           },
@@ -831,6 +839,11 @@ export class JobPipeline {
         let role: 'implementer' | 'fixer' | 'visual_fixer' = 'implementer';
         let prompt = buildResumePrompt(job, resumeStage);
         let imagePaths: string[] | undefined;
+        // Read once, for every checkpoint kind: a resumed repair routes on the
+        // same path facts as the repair it is continuing, so it cannot land
+        // under the sensitive-path floor just because it was interrupted.
+        const resumeChanges = await this.git.collectChanges(job.worktreePath, job.baseRef);
+        let repairSignals: TaskSignals = {};
         if (resumeStage === 'fixing') {
           const checkpoint = job.repairCheckpoint;
           if (!checkpoint || checkpoint.kind !== job.repairKind) {
@@ -852,6 +865,12 @@ export class JobPipeline {
             checkpoint.verification
           ) {
             role = 'fixer';
+            repairSignals = {
+              blockers: checkpoint.review.findings.length,
+              highSeverityBlocker: checkpoint.review.findings.some(
+                (finding) => finding.severity === 'high' || finding.severity === 'critical',
+              ),
+            };
             prompt = buildReviewFixerPrompt({
               job,
               blockers: checkpoint.review.findings,
@@ -863,7 +882,6 @@ export class JobPipeline {
             });
           } else if (checkpoint.kind === 'visual' && checkpoint.visual) {
             role = 'visual_fixer';
-            const changes = await this.git.collectChanges(job.worktreePath, job.baseRef);
             const shots = this.visualQa
               .list(jobId)
               .filter((shot) => checkpoint.visual?.shotIds.includes(shot.id));
@@ -888,7 +906,7 @@ export class JobPipeline {
                 evidenceIds: [],
                 note: '',
               })),
-              diff: changes.diff,
+              diff: resumeChanges.diff,
             });
           } else {
             jobs.patch(jobId, {
@@ -911,6 +929,8 @@ export class JobPipeline {
           prompt,
           // A resumed repair is by definition not the first attempt.
           signals: {
+            ...diffSignals(resumeChanges.files),
+            ...repairSignals,
             repairCycle: job.fixCycles + job.reviewFixCycles + job.visualFixCycles,
             ...(role === 'visual_fixer' ? { productDefect: true } : {}),
           },

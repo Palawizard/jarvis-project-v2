@@ -727,6 +727,8 @@ export const api = {
   job: (id: string) => request<JobDetail>(`/api/jobs/${id}`),
   olderJobEvents: (id: string, beforeId: number) =>
     request<JarvisEvent[]>(`/api/jobs/${id}/events?beforeId=${beforeId}`),
+  newerJobEvents: (id: string, afterId: number) =>
+    request<JarvisEvent[]>(`/api/jobs/${id}/events?afterId=${afterId}`),
   createJob: (
     projectId: string,
     req: string,

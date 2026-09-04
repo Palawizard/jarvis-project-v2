@@ -2,7 +2,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { Markdown, PlainText } from './components.tsx';
 import { confirmationState, describePendingTarget } from './views/Chat.tsx';
-import type { Job } from './api.ts';
+import { mergeEvents } from './views/JobDetail.tsx';
+import type { JarvisEvent, Job } from './api.ts';
 
 describe('web reviewer advisories', () => {
   it('requires a genuine Markdown table delimiter row', () => {
@@ -77,5 +78,17 @@ describe('web reviewer advisories', () => {
     expect(describePendingTarget(undefined, [], new Map())).toEqual([
       'the exact target described in the pending request',
     ]);
+  });
+
+  it('unions overlapping event pages by id, oldest first', () => {
+    const at = (...ids: number[]): JarvisEvent[] => ids.map((id) => ({ id, type: 't' }));
+
+    // A shifted live tail overlaps what is already held; nothing is duplicated
+    // and nothing already loaded is dropped.
+    expect(mergeEvents(at(1, 2, 3), at(3, 4, 5)).map((e) => e.id)).toEqual([1, 2, 3, 4, 5]);
+    // A backfilled page arriving out of order is still placed by id.
+    expect(mergeEvents(at(10, 11), at(4, 5)).map((e) => e.id)).toEqual([4, 5, 10, 11]);
+    // Later pages win for the same id rather than being silently discarded.
+    expect(mergeEvents(at(1), [{ id: 1, type: 'newer' }])).toEqual([{ id: 1, type: 'newer' }]);
   });
 });

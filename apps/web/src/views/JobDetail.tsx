@@ -13,6 +13,13 @@ import {
 } from '../components.tsx';
 import { approvePending } from './Chat.tsx';
 
+/** Union of two event pages by id, oldest first. Pages overlap whenever a fetch straddles them. */
+export function mergeEvents(a: JarvisEvent[], b: JarvisEvent[]): JarvisEvent[] {
+  const byId = new Map<number | JarvisEvent, JarvisEvent>();
+  for (const e of [...a, ...b]) byId.set(e.id ?? e, e);
+  return [...byId.values()].sort((x, y) => (x.id ?? 0) - (y.id ?? 0));
+}
+
 /**
  * Full job result view.
  *
@@ -47,15 +54,53 @@ export function JobDetailView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent, jobId]);
 
-  // Older events paged in on demand, kept separate from the live tail so a
-  // reload (triggered by any event on this job) can't lose pagination progress.
-  const [olderEvents, setOlderEvents] = useState<JarvisEvent[]>([]);
+  // One cumulative event list. `detail.data.events` is only ever the newest 400,
+  // so on a running job its oldest id walks forward; accumulating instead of
+  // replacing is what keeps paged-in history from being orphaned.
+  const [events, setEvents] = useState<JarvisEvent[]>([]);
+  // Highest id up to which `events` is known complete. A reload whose window has
+  // moved entirely past this leaves a hole that has to be fetched explicitly.
+  const [coveredTo, setCoveredTo] = useState<number | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasOlderEvents, setHasOlderEvents] = useState(true);
   useEffect(() => {
-    setOlderEvents([]);
+    setEvents([]);
+    setCoveredTo(null);
     setHasOlderEvents(true);
   }, [jobId]);
+
+  const tail = detail.data?.job.id === jobId ? detail.data.events : undefined;
+  useEffect(() => {
+    if (!tail?.length) return;
+    const oldest = tail[0]?.id;
+    const newest = tail.at(-1)?.id;
+    setEvents((prev) => mergeEvents(prev, tail));
+    // The tail is contiguous with what we already have unless it starts above
+    // the covered frontier; only then does the gap effect below have work to do.
+    setCoveredTo((prev) =>
+      prev === null || oldest === undefined || oldest <= prev ? (newest ?? prev) : prev,
+    );
+  }, [tail]);
+
+  // Close the hole, oldest-first. Each page strictly advances the frontier, so
+  // this converges even if the tail jumped by more than one page.
+  useEffect(() => {
+    const oldestTail = tail?.[0]?.id;
+    if (coveredTo === null || oldestTail === undefined || oldestTail <= coveredTo) return;
+    let cancelled = false;
+    void api
+      .newerJobEvents(jobId, coveredTo)
+      .then((page) => {
+        if (cancelled) return;
+        setEvents((prev) => mergeEvents(prev, page));
+        setCoveredTo(page.at(-1)?.id ?? oldestTail);
+      })
+      // A failed repair is not worth an error banner: the next reload retries it.
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, tail, coveredTo]);
 
   if (detail.error)
     return (
@@ -77,7 +122,6 @@ export function JobDetailView({
     verifications,
     reviews,
     visualQa,
-    events,
     episode,
     contextPacks,
     running,
@@ -844,9 +888,9 @@ export function JobDetailView({
             )}
           </Card>
 
-          <Card title={`Events (${olderEvents.length + events.length})`}>
+          <Card title={`Events (${events.length})`}>
             <div className="events">
-              {[...olderEvents, ...events].reverse().map((e) => (
+              {[...events].reverse().map((e) => (
                 <div key={e.id} className="event">
                   <span className="event-time">
                     {e.createdAt ? new Date(e.createdAt).toLocaleTimeString() : ''}
@@ -856,18 +900,18 @@ export function JobDetailView({
                 </div>
               ))}
             </div>
-            {hasOlderEvents && (olderEvents.length > 0 || events.length >= 400) && (
+            {hasOlderEvents && events.length >= 400 && (
               <button
                 className="btn sm"
                 disabled={loadingOlder}
                 onClick={() => {
-                  const oldest = olderEvents[0] ?? events[0];
-                  if (!oldest?.id) return;
+                  const oldest = events[0]?.id;
+                  if (oldest === undefined) return;
                   setLoadingOlder(true);
                   void api
-                    .olderJobEvents(jobId, oldest.id)
+                    .olderJobEvents(jobId, oldest)
                     .then((older) => {
-                      setOlderEvents((prev) => [...older, ...prev]);
+                      setEvents((prev) => mergeEvents(older, prev));
                       if (older.length < 400) setHasOlderEvents(false);
                     })
                     .finally(() => setLoadingOlder(false));

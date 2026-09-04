@@ -827,13 +827,19 @@ export function createRoutes(jarvis: Jarvis): Hono {
     });
   });
 
-  /** Pages in older events than the tail already shown on the job detail view. */
+  /**
+   * Pages the job detail view's event list: `beforeId` walks back into history,
+   * `afterId` walks forward to close the hole a shifting live tail leaves behind.
+   */
   app.get('/api/jobs/:id/events', (c) => {
     const job = jarvis.jobs.get(c.req.param('id'));
     if (!job) return fail('job not found', 404);
-    const beforeId = Number(c.req.query('beforeId'));
-    if (!Number.isFinite(beforeId)) return fail('beforeId is required', 400);
-    return c.json(jarvis.bus.list({ jobId: job.id, beforeId, limit: 400 }));
+    const before = c.req.query('beforeId');
+    const after = c.req.query('afterId');
+    const cursor = Number(before ?? after);
+    if (!Number.isFinite(cursor)) return fail('beforeId or afterId is required', 400);
+    const direction = before !== undefined ? { beforeId: cursor } : { afterId: cursor };
+    return c.json(jarvis.bus.list({ jobId: job.id, limit: 400, ...direction }));
   });
 
   app.post('/api/jobs/:id/start', (c) => {

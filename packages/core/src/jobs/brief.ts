@@ -629,10 +629,20 @@ ${constraintsBlock}
   separate questions: \`capabilityTier\` is whether this needs a more capable model; \`effort\`
   is how deeply that model should reason. Use only normal|strong and low|medium|high. Never
   name a provider or model. Give 1-4 short reasons based on actual implementation complexity,
-  not prompt length or item counts. Use strong/high for security, permissions, sandboxing,
-  multi-provider synchronization, or difficult cross-cutting architecture; use normal/low for
-  documentation-only or mechanical bounded edits. This is advice: trusted Jarvis code applies
-  policy floors, ceilings and model mapping after you answer.
+  not prompt length or item counts. Apply this rubric:
+  - normal/low: documentation-only, mechanical test edits, tiny bounded refactors, no behavior change.
+  - normal/medium: ordinary bug fixes, local features, straightforward implementation.
+  - normal/high: substantial reasoning across multiple surfaces, state/API consistency, pagination,
+    concurrency or lifecycle work, while the architecture remains clear and bounded. Showing the
+    newest 400 Events while paginating older ones without duplicates and preserving live SSE is
+    normal/high.
+  - strong/medium: broad architectural work across many components with difficult design decisions,
+    but relatively well-defined requirements.
+  - strong/high: security, permissions/auth, sandbox/process isolation, synchronization architecture,
+    complex multi-provider integration, consequential self-development, or difficult cross-cutting
+    architecture. A synchronized Google Calendar + iCloud/CalDAV system with credentials, background
+    bidirectional sync, conflict semantics, persistence, assistant tools and UI is strong/high.
+  This is advice: trusted Jarvis code applies policy floors, ceilings and model mapping afterwards.
 - "originalRequest" — the user's message, copied exactly.
 
 Rules that matter more than completeness:

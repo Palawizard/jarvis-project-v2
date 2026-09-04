@@ -5,6 +5,7 @@ import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { ClaudeProvider } from '../agents/claude.js';
 import { CodexProvider } from '../agents/codex.js';
 import { AgentRegistry } from '../agents/registry.js';
+import { modelFor, selectExecutionProfile } from '../agents/policy.js';
 import { isToolFreeRole } from '../agents/toolfree.js';
 import type {
   AgentEvent,
@@ -317,6 +318,23 @@ describe('the compiler prompt keeps its provenance regions apart', () => {
     expect(prompt).toContain('The work happens in an isolated git worktree');
   });
 
+  it('teaches every useful profile and the motivating semantic anchors', () => {
+    const prompt = buildBriefPrompt(input());
+    for (const profile of [
+      'normal/low',
+      'normal/medium',
+      'normal/high',
+      'strong/medium',
+      'strong/high',
+    ]) {
+      expect(prompt).toContain(profile);
+    }
+    expect(prompt).toContain('newest 400 Events');
+    expect(prompt).toContain('Google Calendar + iCloud/CalDAV');
+    expect(prompt).toContain('permissions/auth');
+    expect(prompt).toContain('sandbox/process isolation');
+  });
+
   it('holds the compiler to the tool-free confinement the classifiers run under', () => {
     expect(isToolFreeRole('brief_compiler')).toBe(true);
   });
@@ -480,6 +498,80 @@ describe('compiling a brief', () => {
     expect(payload.requirements).toBe(ANSWER.requirements.length);
     expect(JSON.stringify(payload)).not.toContain('OAuth');
   });
+
+  it.each([
+    {
+      request:
+        'Add a short documentation comment to an existing Jarvis test without changing behavior.',
+      recommendation: {
+        capabilityTier: 'normal' as const,
+        effort: 'low' as const,
+        reasons: ['Documentation-only change with no behavior change'],
+      },
+      final: 'normal/medium',
+      claude: 'sonnet',
+      codex: 'gpt-5.6-terra',
+    },
+    {
+      request:
+        'Show the newest 400 job events, paginate older events without duplicates, preserve live SSE updates.',
+      recommendation: {
+        capabilityTier: 'normal' as const,
+        effort: 'high' as const,
+        reasons: ['Pagination state must remain consistent with live SSE updates'],
+      },
+      final: 'normal/high',
+      claude: 'sonnet',
+      codex: 'gpt-5.6-terra',
+    },
+    {
+      request:
+        'Add an automatically synchronized Google Calendar + iCloud calendar system, visible in Jarvis UI, readable naturally by Jarvis, with complete event modification.',
+      recommendation: {
+        capabilityTier: 'strong' as const,
+        effort: 'high' as const,
+        reasons: [
+          'Multi-provider bidirectional synchronization',
+          'Credential-sensitive integrations and conflict semantics',
+          'Cross-layer persistence, assistant tool, and UI architecture',
+        ],
+      },
+      final: 'strong/high',
+      claude: 'opus',
+      codex: 'gpt-5.6-sol',
+    },
+    {
+      request: 'Redesign Jarvis permissions, authentication, and process sandbox architecture.',
+      recommendation: {
+        capabilityTier: 'strong' as const,
+        effort: 'high' as const,
+        reasons: ['Security-sensitive permissions, authentication, and sandbox architecture'],
+      },
+      final: 'strong/high',
+      claude: 'opus',
+      codex: 'gpt-5.6-sol',
+    },
+  ])(
+    'persists and routes the semantic example: $final — $request',
+    async ({ request, recommendation, final, claude, codex }) => {
+      const h = compiler(() =>
+        JSON.stringify({ ...ANSWER, executionRecommendation: recommendation }),
+      );
+      const brief = await h.compiler.compile({ ...input(), request });
+
+      expect(brief?.originalRequest).toBe(request);
+      expect(parseStoredBrief(JSON.stringify(brief))?.executionRecommendation).toEqual(
+        recommendation,
+      );
+      const profile = selectExecutionProfile({
+        role: 'implementer',
+        signals: { executionRecommendation: recommendation },
+      });
+      expect(`${profile.capabilityTier}/${profile.effort}`).toBe(final);
+      expect(modelFor('claude', profile.capabilityTier)).toBe(claude);
+      expect(modelFor('codex', profile.capabilityTier)).toBe(codex);
+    },
+  );
 
   it('does not compile when no provider can be routed to the role', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-brief-none-'));

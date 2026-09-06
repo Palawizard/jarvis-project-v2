@@ -98,6 +98,36 @@ export interface CalendarEventDraft {
   location: string | null;
 }
 
+const hasOwn = (value: object, key: keyof CalendarEventDraft): boolean =>
+  Object.prototype.hasOwnProperty.call(value, key);
+
+/** Apply an occurrence edit to the series master's own recurrence anchor. */
+export function rebaseSeriesPatch(
+  master: Pick<CalendarEventDraft, 'startsAt'>,
+  occurrence: Pick<CalendarEventDraft, 'startsAt' | 'endsAt' | 'allDay'>,
+  updated: CalendarEventDraft,
+  patch: Partial<CalendarEventDraft>,
+): Partial<CalendarEventDraft> {
+  const result: Partial<CalendarEventDraft> = {};
+  if (hasOwn(patch, 'title')) result.title = updated.title;
+  if (hasOwn(patch, 'description')) result.description = updated.description;
+  if (hasOwn(patch, 'location')) result.location = updated.location;
+
+  if (
+    ['startsAt', 'endsAt', 'allDay'].some((key) => hasOwn(patch, key as keyof CalendarEventDraft))
+  ) {
+    const masterStart = new Date(master.startsAt).getTime();
+    const occurrenceStart = new Date(occurrence.startsAt).getTime();
+    const updatedStart = new Date(updated.startsAt).getTime();
+    const updatedEnd = new Date(updated.endsAt).getTime();
+    const rebasedStart = masterStart + updatedStart - occurrenceStart;
+    result.startsAt = new Date(rebasedStart).toISOString();
+    result.endsAt = new Date(rebasedStart + updatedEnd - updatedStart).toISOString();
+    result.allDay = updated.allDay;
+  }
+  return result;
+}
+
 /** One event exactly as the provider holds it. */
 export interface RemoteEvent extends CalendarEventDraft {
   remoteId: string;
@@ -120,6 +150,9 @@ export interface RemoteEventRef {
   raw: string | null;
   recurring: boolean;
   seriesId: string | null;
+  startsAt: string;
+  endsAt: string;
+  allDay: boolean;
 }
 
 export interface RemoteCalendar {
@@ -141,6 +174,7 @@ export interface CalendarClient {
     ref: RemoteEventRef,
     draft: CalendarEventDraft,
     scope?: RecurrenceScope,
+    patch?: Partial<CalendarEventDraft>,
   ): Promise<RemoteEvent>;
   remove(ref: RemoteEventRef, scope?: RecurrenceScope): Promise<void>;
 }

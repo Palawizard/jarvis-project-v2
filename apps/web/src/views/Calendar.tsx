@@ -228,10 +228,15 @@ export function CalendarView({ lastEvent }: { lastEvent: JarvisEvent | null }) {
           onSave={(value, scope) =>
             void act(async () => {
               const draft = toDraft(value);
+              const patch = value.id ? eventPatch(editing, value) : null;
+              if (patch && !Object.keys(patch).length) {
+                setEditing(null);
+                return;
+              }
               const outcome = value.id
                 ? await api.updateCalendarEvent(
                     value.id,
-                    draft,
+                    patch ?? {},
                     value.recurring ? scope : undefined,
                   )
                 : await api.createCalendarEvent(value.accountId, draft);
@@ -700,7 +705,7 @@ function newEvent(accountId: string, day = new Date()): EventForm {
   };
 }
 
-function eventForm(event: CalendarEvent): EventForm {
+export function eventForm(event: CalendarEvent): EventForm {
   return {
     ...event,
     startsAt: event.allDay ? event.startsAt.slice(0, 10) : localInput(new Date(event.startsAt)),
@@ -708,7 +713,7 @@ function eventForm(event: CalendarEvent): EventForm {
   };
 }
 
-function toDraft(form: EventForm): CalendarEventDraft {
+function toDraft(form: CalendarEventDraft): CalendarEventDraft {
   const iso = (value: string) =>
     form.allDay ? `${value.slice(0, 10)}T00:00:00.000Z` : new Date(value).toISOString();
   return {
@@ -719,6 +724,19 @@ function toDraft(form: EventForm): CalendarEventDraft {
     description: form.description?.trim() || null,
     location: form.location?.trim() || null,
   };
+}
+
+export function eventPatch(
+  before: CalendarEventDraft,
+  after: CalendarEventDraft,
+): Partial<CalendarEventDraft> {
+  const old = toDraft(before);
+  const next = toDraft(after);
+  return Object.fromEntries(
+    (Object.keys(next) as (keyof CalendarEventDraft)[])
+      .filter((key) => next[key] !== old[key])
+      .map((key) => [key, next[key]]),
+  ) as Partial<CalendarEventDraft>;
 }
 
 function monthStart(date: Date): Date {

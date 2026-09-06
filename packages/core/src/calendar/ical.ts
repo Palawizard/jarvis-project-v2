@@ -272,6 +272,17 @@ function icsStamp(iso: string, allDay: boolean): string {
   return `${day}T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`;
 }
 
+/** Render an instant as the wall clock a named TZID expects -- the inverse of `zonedToUtc`. */
+function zonedStamp(iso: string, zone: string): string {
+  const instant = new Date(iso).getTime();
+  try {
+    const wall = new Date(instant + zoneOffsetMs(instant, zone)).toISOString();
+    return icsStamp(wall, false).slice(0, -1);
+  } catch {
+    return icsStamp(iso, false).slice(0, -1);
+  }
+}
+
 export interface IcsDraft {
   title: string;
   startsAt: string;
@@ -282,9 +293,8 @@ export interface IcsDraft {
 }
 
 /** The property lines Jarvis owns, in the form a server expects them. */
-function draftLines(draft: IcsDraft): string[] {
-  const lines = [
-    `SUMMARY:${escapeText(draft.title)}`,
+function timeLines(draft: Pick<IcsDraft, 'startsAt' | 'endsAt' | 'allDay'>): string[] {
+  return [
     draft.allDay
       ? `DTSTART;VALUE=DATE:${icsStamp(draft.startsAt, true)}`
       : `DTSTART:${icsStamp(draft.startsAt, false)}`,
@@ -292,6 +302,32 @@ function draftLines(draft: IcsDraft): string[] {
       ? `DTEND;VALUE=DATE:${icsStamp(draft.endsAt, true)}`
       : `DTEND:${icsStamp(draft.endsAt, false)}`,
   ];
+}
+
+function eventTimeLines(
+  lines: string[],
+  draft: Pick<IcsDraft, 'startsAt' | 'endsAt' | 'allDay'>,
+): string[] {
+  const original = (name: string) =>
+    lines.find((line) => parseProperty(line)?.name === name) ?? null;
+  const render = (name: 'DTSTART' | 'DTEND', template: string | null, iso: string) => {
+    if (draft.allDay) return `${name};VALUE=DATE:${icsStamp(iso, true)}`;
+    const property = template ? parseProperty(template) : null;
+    const prefix = property?.params.VALUE === 'DATE' ? name : (template?.split(':', 1)[0] ?? name);
+    const value = property?.params.TZID
+      ? zonedStamp(iso, property.params.TZID)
+      : property?.value.trim().endsWith('Z') === false
+        ? icsStamp(iso, false).slice(0, -1)
+        : icsStamp(iso, false);
+    return `${prefix}:${value}`;
+  };
+  const start = original('DTSTART');
+  const end = original('DTEND') ?? start?.replace(/^DTSTART/i, 'DTEND') ?? null;
+  return [render('DTSTART', start, draft.startsAt), render('DTEND', end, draft.endsAt)];
+}
+
+function draftLines(draft: IcsDraft): string[] {
+  const lines = [`SUMMARY:${escapeText(draft.title)}`, ...timeLines(draft)];
   if (draft.description) lines.push(`DESCRIPTION:${escapeText(draft.description)}`);
   if (draft.location) lines.push(`LOCATION:${escapeText(draft.location)}`);
   return lines;
@@ -416,6 +452,56 @@ function rewriteEventLines(lines: string[], draft: IcsDraft): string[] {
   return output;
 }
 
+/** Rewrite only fields named by a series patch; every other master line stays byte-for-byte. */
+function rewriteEventPatch(lines: string[], patch: Partial<IcsDraft>): string[] {
+  const replacements = new Map<string, string[]>();
+  if (Object.prototype.hasOwnProperty.call(patch, 'title')) {
+    replacements.set('summary', [`SUMMARY:${escapeText(patch.title as string)}`]);
+  }
+  if (patch.startsAt && patch.endsAt && patch.allDay !== undefined) {
+    replacements.set(
+      'time',
+      eventTimeLines(lines, patch as Required<Pick<IcsDraft, 'startsAt' | 'endsAt' | 'allDay'>>),
+    );
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'description')) {
+    replacements.set(
+      'description',
+      patch.description ? [`DESCRIPTION:${escapeText(patch.description)}`] : [],
+    );
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'location')) {
+    replacements.set('location', patch.location ? [`LOCATION:${escapeText(patch.location)}`] : []);
+  }
+
+  const group = (name: string): string | null => {
+    if (name === 'SUMMARY') return 'summary';
+    if (name === 'DTSTART' || name === 'DTEND' || name === 'DURATION') return 'time';
+    if (name === 'DESCRIPTION') return 'description';
+    if (name === 'LOCATION') return 'location';
+    return null;
+  };
+  const written = new Set<string>();
+  const output: string[] = [];
+  for (const line of lines) {
+    if (line.toUpperCase().startsWith('END:VEVENT')) {
+      for (const [name, replacement] of replacements) {
+        if (!written.has(name)) output.push(...replacement);
+      }
+      output.push(line);
+      continue;
+    }
+    const name = group(parseProperty(line)?.name ?? '');
+    if (name && replacements.has(name)) {
+      if (!written.has(name)) output.push(...(replacements.get(name) ?? []));
+      written.add(name);
+      continue;
+    }
+    output.push(line);
+  }
+  return output;
+}
+
 /**
  * Rewrite one VEVENT inside a multi-object resource -- a recurring master
  * plus any exception overrides -- addressed by its RECURRENCE-ID, or, when
@@ -432,6 +518,7 @@ export function patchIcsEvent(
   draft: IcsDraft,
   recurrenceId: string | null,
   newRecurrenceIdLine: string | null = null,
+  seriesPatch?: Partial<IcsDraft>,
 ): string {
   const lines = unfold(raw);
   const output: string[] = [];
@@ -446,7 +533,11 @@ export function patchIcsEvent(
     const isTarget = recurrenceId === null ? id === null : id === recurrenceId;
     if (isTarget) {
       found = true;
-      output.push(...rewriteEventLines(eventLines, draft));
+      output.push(
+        ...(seriesPatch
+          ? rewriteEventPatch(eventLines, seriesPatch)
+          : rewriteEventLines(eventLines, draft)),
+      );
     } else {
       output.push(...eventLines);
     }

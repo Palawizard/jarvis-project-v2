@@ -1,5 +1,6 @@
 import {
   CalendarProviderError,
+  rebaseSeriesPatch,
   type CalendarClient,
   type CalendarEventDraft,
   type GoogleCredentials,
@@ -163,13 +164,27 @@ export class GoogleCalendarClient implements CalendarClient {
     ref: RemoteEventRef,
     draft: CalendarEventDraft,
     scope: RecurrenceScope = 'occurrence',
+    patch: Partial<CalendarEventDraft> = draft,
   ): Promise<RemoteEvent> {
     const targetId = scope === 'series' && ref.seriesId ? ref.seriesId : ref.remoteId;
+    let body = toGoogleEvent(draft);
+    let etag = ref.etag;
+    if (scope === 'series' && ref.seriesId) {
+      const master = toRemoteEvent(
+        await this.#json<GoogleEvent>(
+          'GET',
+          `${this.#eventsUrl()}/${encodeURIComponent(targetId)}`,
+        ),
+      );
+      if (!master) throw new CalendarProviderError('Google returned an invalid series master');
+      body = toGooglePatch(rebaseSeriesPatch(master, ref, draft, patch));
+      etag = master.etag;
+    }
     const updated = await this.#json<GoogleEvent>(
       'PATCH',
       `${this.#eventsUrl()}/${encodeURIComponent(targetId)}`,
-      toGoogleEvent(draft),
-      ref.etag ? { 'if-match': ref.etag } : undefined,
+      body,
+      etag ? { 'if-match': etag } : undefined,
     );
     return (
       toRemoteEvent(updated) ?? {
@@ -306,6 +321,20 @@ function toGoogleEvent(draft: CalendarEventDraft): Record<string, unknown> {
     start: toGoogleTime(draft.startsAt, draft.allDay),
     end: toGoogleTime(draft.endsAt, draft.allDay),
   };
+}
+
+function toGooglePatch(patch: Partial<CalendarEventDraft>): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (Object.prototype.hasOwnProperty.call(patch, 'title')) body.summary = patch.title;
+  if (Object.prototype.hasOwnProperty.call(patch, 'description')) {
+    body.description = patch.description;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'location')) body.location = patch.location;
+  if (patch.startsAt && patch.endsAt && patch.allDay !== undefined) {
+    body.start = toGoogleTime(patch.startsAt, patch.allDay);
+    body.end = toGoogleTime(patch.endsAt, patch.allDay);
+  }
+  return body;
 }
 
 function toGoogleTime(iso: string, allDay: boolean): GoogleTime {

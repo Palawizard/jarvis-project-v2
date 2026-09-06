@@ -9,6 +9,7 @@ import {
 } from './ical.js';
 import {
   CalendarProviderError,
+  rebaseSeriesPatch,
   type CalendarClient,
   type CalendarEventDraft,
   type IcloudCredentials,
@@ -238,6 +239,7 @@ export class CalDavClient implements CalendarClient {
     ref: RemoteEventRef,
     draft: CalendarEventDraft,
     scope: RecurrenceScope = 'series',
+    patch: Partial<CalendarEventDraft> = draft,
   ): Promise<RemoteEvent> {
     if (!ref.recurring) {
       const body = ref.raw
@@ -267,11 +269,16 @@ export class CalDavClient implements CalendarClient {
       throw new CalendarProviderError('this occurrence has no recurrence marker to target');
     }
     const current = await this.#dav('GET', seriesUrl);
+    const master = parseVEvents(current.text).find((event) => event.recurrenceId === null);
+    if (!master) throw new CalendarProviderError('the series has no master event to edit');
+    const seriesPatch =
+      scope === 'series' ? rebaseSeriesPatch(master, ref, draft, patch) : undefined;
     const body = patchIcsEvent(
       current.text,
       draft,
       scope === 'occurrence' ? recurrenceId : null,
       scope === 'occurrence' && ref.raw ? recurrenceIdLine(ref.raw) : null,
+      seriesPatch,
     );
     const response = await this.#dav('PUT', seriesUrl, {
       body,

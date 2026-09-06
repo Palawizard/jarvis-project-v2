@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { Markdown, PlainText } from './components.tsx';
 import { confirmationState, describePendingTarget } from './views/Chat.tsx';
-import { overlapsDay } from './views/Calendar.tsx';
+import { eventForm, eventPatch, overlapsDay } from './views/Calendar.tsx';
 import { mergeEvents } from './views/JobDetail.tsx';
 import type { CalendarEvent, JarvisEvent, Job } from './api.ts';
 
@@ -109,6 +109,29 @@ describe('web reviewer advisories', () => {
     } finally {
       process.env.TZ = zone;
     }
+  });
+
+  it('does not submit provider seconds as an edited series time', () => {
+    const original = eventForm({
+      id: 'evt_1',
+      accountId: 'acc_1',
+      remoteId: 'occurrence-2',
+      source: 'Work',
+      provider: 'google',
+      recurring: true,
+      seriesId: 'series-1',
+      title: 'Standup',
+      startsAt: '2026-09-11T09:00:30.500Z',
+      endsAt: '2026-09-11T10:00:30.500Z',
+      allDay: false,
+      description: null,
+      location: null,
+      updatedAt: '2026-09-01T00:00:00.000Z',
+      syncedAt: '2026-09-01T00:00:00.000Z',
+    });
+    expect(eventPatch(original, { ...original, title: 'Renamed standup' })).toEqual({
+      title: 'Renamed standup',
+    });
   });
 
   it('unions overlapping event pages by id, oldest first', () => {

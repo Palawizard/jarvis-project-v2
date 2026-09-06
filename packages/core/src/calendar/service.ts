@@ -466,6 +466,11 @@ export class CalendarService {
       description: patch.description === undefined ? existing.description : patch.description,
       location: patch.location === undefined ? existing.location : patch.location,
     });
+    const changed = Object.fromEntries(
+      (Object.keys(patch) as (keyof CalendarEventDraft)[])
+        .filter((key) => draft[key] !== existing[key])
+        .map((key) => [key, draft[key]]),
+    ) as Partial<CalendarEventDraft>;
     const row = this.deps.db
       .prepare('SELECT etag, raw FROM calendar_events WHERE id = ?')
       .get(id) as Row | undefined;
@@ -478,9 +483,13 @@ export class CalendarService {
           raw: (row?.raw as string | null) ?? null,
           recurring: existing.recurring,
           seriesId: existing.seriesId,
+          startsAt: existing.startsAt,
+          endsAt: existing.endsAt,
+          allDay: existing.allDay,
         },
         draft,
         effectiveScope,
+        changed,
       ),
     );
     if (existing.recurring && effectiveScope === 'series') {
@@ -545,6 +554,9 @@ export class CalendarService {
           raw: (row?.raw as string | null) ?? null,
           recurring: existing.recurring,
           seriesId: existing.seriesId,
+          startsAt: existing.startsAt,
+          endsAt: existing.endsAt,
+          allDay: existing.allDay,
         },
         effectiveScope,
       ),

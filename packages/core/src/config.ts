@@ -92,6 +92,14 @@ export interface JarvisConfig {
     rawHistoryRetentionDays: number;
   };
 
+  calendar: {
+    /** How often connected calendars are pulled in the background. */
+    syncIntervalMs: number;
+    /** Mirror window. Past days keep "what did I do", future days keep the plan. */
+    windowPastDays: number;
+    windowFutureDays: number;
+  };
+
   tools: {
     /** Hard ceiling on one tool invocation, unless the tool declares its own. */
     defaultTimeoutMs: number;
@@ -209,6 +217,11 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
         ['high', 'medium', 'low', 'info'],
       ),
       rawHistoryRetentionDays: envInt('JARVIS_RAW_HISTORY_RETENTION_DAYS', 90),
+    },
+    calendar: {
+      syncIntervalMs: Math.max(60_000, envInt('JARVIS_CALENDAR_SYNC_INTERVAL_MS', 5 * 60_000)),
+      windowPastDays: Math.max(1, envInt('JARVIS_CALENDAR_PAST_DAYS', 30)),
+      windowFutureDays: Math.max(1, envInt('JARVIS_CALENDAR_FUTURE_DAYS', 180)),
     },
     tools: {
       defaultTimeoutMs: envInt('JARVIS_TOOL_TIMEOUT_MS', 60_000),

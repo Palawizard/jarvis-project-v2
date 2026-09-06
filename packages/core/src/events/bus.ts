@@ -77,6 +77,10 @@ export type JarvisEventType =
   | 'memory.superseded'
   | 'memory.retrieved'
   | 'memory.deleted'
+  // Calendar payloads carry counts and ids only: never event titles, never a
+  // credential. The mirror itself is where the content lives.
+  | 'calendar.synced'
+  | 'calendar.sync.failed'
   | 'project.analysis.started'
   | 'project.analysis.completed'
   | 'project.analysis.failed'

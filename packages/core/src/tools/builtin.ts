@@ -9,6 +9,7 @@ import type { JobLifecycle } from '../jobs/lifecycle.js';
 import type { JobPipeline } from '../jobs/pipeline.js';
 import type { SessionService } from '../sessions/service.js';
 import type { MemoryKind, MemoryScope } from '../memory/types.js';
+import type { CalendarService } from '../calendar/service.js';
 
 const SCOPES = ['user', 'project', 'session', 'procedure'] as const;
 const KINDS = [
@@ -32,6 +33,7 @@ export interface BuiltinToolDeps {
   sessions: SessionService;
   pipeline: JobPipeline;
   lifecycle: JobLifecycle;
+  calendar: CalendarService;
 }
 
 /**
@@ -82,6 +84,103 @@ export function registerBuiltinTools(
         score: Number(r.score.toFixed(4)),
         reason: r.reason,
       }));
+    },
+  });
+
+  // --------------------------------------------------------------- calendar --
+
+  // A local instant is what natural language produces ("tomorrow at 9"), so the
+  // offset form has to be accepted here as well as in ChatActionSchema. Bare
+  // `z.iso.datetime()` only accepts `Z` and rejected exactly what the chat
+  // prompt asks the model for. Storage still normalises to UTC.
+  const instant = z.iso.datetime({ offset: true });
+
+  const eventShape = {
+    title: z.string().min(1).max(400),
+    startsAt: instant,
+    endsAt: instant,
+    allDay: z.boolean(),
+    description: z.string().max(4000).nullable(),
+    location: z.string().max(400).nullable(),
+  };
+
+  // Defaults are a property of creating an event, never of changing one.
+  const eventDraft = z
+    .object({
+      ...eventShape,
+      allDay: eventShape.allDay.default(false),
+      description: eventShape.description.default(null),
+      location: eventShape.location.default(null),
+    })
+    .strict();
+
+  // Deliberately not `eventDraft.partial()`: `.partial()` keeps the defaults, so
+  // a title-only patch would arrive with allDay/description/location filled in
+  // and updateEvent would push those over the real values in Google or iCloud.
+  const eventPatch = z
+    .object(eventShape)
+    .partial()
+    .strict()
+    .refine((value) => Object.keys(value).length > 0, 'nothing to change');
+
+  registry.register({
+    name: 'calendar.list',
+    revision: '2',
+    description: 'Read synced calendar events from Jarvis local mirror.',
+    risk: 'observe',
+    input: z
+      .object({
+        from: instant.optional(),
+        to: instant.optional(),
+        accountId: z.string().optional(),
+        search: z.string().max(200).optional(),
+        limit: z.number().int().min(1).max(500).default(100),
+      })
+      .strict(),
+    async execute(input) {
+      return deps.calendar.events(input);
+    },
+  });
+
+  registry.register({
+    name: 'calendar.create',
+    revision: '2',
+    description: 'Create an event in a connected Google or iCloud calendar.',
+    risk: 'sensitive',
+    input: z.object({ accountId: z.string().min(1), draft: eventDraft }).strict(),
+    async execute(input) {
+      return deps.calendar.createEvent(input);
+    },
+  });
+
+  // A recurring event's occurrence is the safer default: it is what "this
+  // meeting" means unless the human explicitly picked "entire series" in the
+  // UI or the model was explicitly told which was meant.
+  const recurrenceScope = z.enum(['occurrence', 'series']).default('occurrence');
+
+  registry.register({
+    name: 'calendar.update',
+    revision: '4',
+    description:
+      'Update an event in its connected Google or iCloud calendar. For a recurring event, ' +
+      '"scope" chooses this occurrence or the entire series.',
+    risk: 'sensitive',
+    input: z.object({ id: z.string().min(1), patch: eventPatch, scope: recurrenceScope }).strict(),
+    async execute(input) {
+      return deps.calendar.updateEvent(input.id, input.patch, input.scope);
+    },
+  });
+
+  registry.register({
+    name: 'calendar.delete',
+    revision: '2',
+    description:
+      'Permanently delete an event from its connected calendar. For a recurring event, ' +
+      '"scope" chooses this occurrence or the entire series.',
+    risk: 'destructive',
+    input: z.object({ id: z.string().min(1), scope: recurrenceScope }).strict(),
+    async execute(input) {
+      return deps.calendar.deleteEvent(input.id, input.scope);
     },
   });
 

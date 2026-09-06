@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import {
@@ -20,7 +21,13 @@ import {
   type ToolExecutionStatus,
   type ToolExecutionOutcome,
   type VisualInteraction,
+  type CalendarProviderId,
+  type GoogleCredentials,
+  type RemoteCalendar,
   agentIsolationPreflight,
+  exchangeGoogleCode,
+  GOOGLE_AUTH_URL,
+  GOOGLE_CALENDAR_SCOPE,
 } from '@jarvis/core';
 
 const JOB_STATUSES = new Set<string>([
@@ -47,6 +54,7 @@ const MEMORY_KINDS = new Set<MemoryKind>([
   'other',
 ]);
 const MEMORY_STATUSES = new Set<string>(['active', 'superseded', 'expired', 'deleted', 'all']);
+const GOOGLE_CONNECTION_COOKIE = 'jarvis_google_connection';
 
 /**
  * HTTP surface. Thin on purpose: every route delegates to a core service, so the
@@ -55,6 +63,25 @@ const MEMORY_STATUSES = new Set<string>(['active', 'superseded', 'expired', 'del
 export function createRoutes(jarvis: Jarvis): Hono {
   const app = new Hono();
   const git = new GitWorkspace(jarvis.config.worktreesDir);
+  const pendingGoogle = new Map<
+    string,
+    {
+      clientId: string;
+      clientSecret: string;
+      redirectUri: string;
+      returnTo: string;
+      expiresAt: number;
+    }
+  >();
+  // Holds an exchanged refresh token just long enough for the human to pick
+  // which calendar to connect. Bounded and single-use, the same shape as
+  // `pendingGoogle`'s CSRF state -- and the only place this credential lives
+  // outside the database: never the URL, a log line, or the account row until
+  // the human actually chooses one.
+  const pendingGoogleConnections = new Map<
+    string,
+    { credentials: GoogleCredentials; calendars: RemoteCalendar[]; expiresAt: number }
+  >();
 
   const fail = (message: string, status = 400) => Response.json({ error: message }, { status });
   /**
@@ -73,13 +100,23 @@ export function createRoutes(jarvis: Jarvis): Hono {
   };
   const allowedOrigin = (origin: string | undefined) =>
     Boolean(origin && jarvis.config.controlOrigins.includes(origin));
+  const googleConnection = (cookie: string | undefined): string | null => {
+    const match = cookie?.match(new RegExp(`(?:^|;\\s*)${GOOGLE_CONNECTION_COOKIE}=([^;]+)`));
+    return match?.[1] && /^[a-f0-9-]{36}$/i.test(match[1]) ? match[1] : null;
+  };
+  const clearGoogleConnectionCookie = `${GOOGLE_CONNECTION_COOKIE}=; Path=/api/calendar/google/connection; HttpOnly; SameSite=Lax; Max-Age=0`;
 
   // Loopback is not authentication. Only pairing/status and preflight bypass
   // the browser capability; every other /api route, including reads and SSE,
   // is private.
   app.use('/api/*', async (c, next) => {
     const path = c.req.path;
-    if (c.req.method === 'OPTIONS' || path === '/api/auth/status' || path === '/api/auth/pair') {
+    if (
+      c.req.method === 'OPTIONS' ||
+      path === '/api/auth/status' ||
+      path === '/api/auth/pair' ||
+      path === '/api/calendar/google/callback'
+    ) {
       await next();
       return;
     }
@@ -1081,6 +1118,271 @@ export function createRoutes(jarvis: Jarvis): Hono {
     }
     if (!jarvis.memory.forget(id)) return fail('memory not found', 404);
     return c.json({ deleted: true, mode: 'soft' });
+  });
+
+  // --------------------------------------------------------------- calendar --
+
+  app.get('/api/calendar/accounts', (c) => c.json(jarvis.calendar.accounts()));
+
+  app.post('/api/calendar/google/authorize', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      clientId?: unknown;
+      clientSecret?: unknown;
+      redirectUri?: unknown;
+      returnTo?: unknown;
+    };
+    if (
+      typeof body.clientId !== 'string' ||
+      !body.clientId.trim() ||
+      typeof body.clientSecret !== 'string' ||
+      !body.clientSecret.trim() ||
+      typeof body.redirectUri !== 'string' ||
+      typeof body.returnTo !== 'string'
+    ) {
+      return fail(
+        'Google OAuth client id, client secret, redirect URI and return URL are required',
+      );
+    }
+    let redirect: URL;
+    let returnTo: URL;
+    try {
+      redirect = new URL(body.redirectUri);
+      returnTo = new URL(body.returnTo);
+    } catch {
+      return fail('invalid OAuth URL');
+    }
+    if (
+      !allowedOrigin(redirect.origin) ||
+      redirect.pathname !== '/api/calendar/google/callback' ||
+      !allowedOrigin(returnTo.origin)
+    ) {
+      return fail('OAuth URLs must use an allowed Jarvis origin', 403);
+    }
+    for (const [key, pending] of pendingGoogle) {
+      if (pending.expiresAt < Date.now()) pendingGoogle.delete(key);
+    }
+    const state = randomUUID();
+    pendingGoogle.set(state, {
+      clientId: body.clientId.trim(),
+      clientSecret: body.clientSecret.trim(),
+      redirectUri: redirect.toString(),
+      returnTo: returnTo.origin,
+      expiresAt: Date.now() + 10 * 60_000,
+    });
+    const url = new URL(GOOGLE_AUTH_URL);
+    url.search = new URLSearchParams({
+      client_id: body.clientId.trim(),
+      redirect_uri: redirect.toString(),
+      response_type: 'code',
+      scope: GOOGLE_CALENDAR_SCOPE,
+      access_type: 'offline',
+      prompt: 'consent',
+      include_granted_scopes: 'true',
+      state,
+    }).toString();
+    return c.json({ url: url.toString(), redirectUri: redirect.toString() });
+  });
+
+  app.get('/api/calendar/google/callback', async (c) => {
+    const state = c.req.query('state') ?? '';
+    const pending = pendingGoogle.get(state);
+    pendingGoogle.delete(state);
+    if (!pending || pending.expiresAt < Date.now())
+      return fail('Google authorization expired', 400);
+    const redirect = (status: 'error' | 'choose', params: Record<string, string> = {}) => {
+      const url = new URL('/calendar', pending.returnTo);
+      url.searchParams.set('google', status);
+      for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+      return new Response(null, { status: 302, headers: { location: url.toString() } });
+    };
+    const code = c.req.query('code');
+    if (!code) {
+      return redirect('error', {
+        message: (c.req.query('error') ?? 'Google returned no code').slice(0, 300),
+      });
+    }
+    try {
+      const credentials = await exchangeGoogleCode({
+        clientId: pending.clientId,
+        clientSecret: pending.clientSecret,
+        code,
+        redirectUri: pending.redirectUri,
+      });
+      // Discovered here, server-side, with the credential that never leaves
+      // this process: the browser only ever sees the calendar list, not the
+      // refresh token that produced it.
+      const calendars = await jarvis.calendar.discover({ provider: 'google', credentials });
+      for (const [key, entry] of pendingGoogleConnections) {
+        if (entry.expiresAt < Date.now()) pendingGoogleConnections.delete(key);
+      }
+      const connection = randomUUID();
+      pendingGoogleConnections.set(connection, {
+        credentials,
+        calendars,
+        expiresAt: Date.now() + 10 * 60_000,
+      });
+      const response = redirect('choose');
+      // The opaque selector is intentionally HttpOnly, bounded and same-site:
+      // unlike the old query parameter, it is never exposed in a browser URL
+      // or ordinary UI state, and it is not an OAuth credential.
+      response.headers.set(
+        'set-cookie',
+        `${GOOGLE_CONNECTION_COOKIE}=${connection}; Path=/api/calendar/google/connection; HttpOnly; SameSite=Lax; Max-Age=600`,
+      );
+      return response;
+    } catch (error) {
+      return redirect('error', {
+        message: (error instanceof Error ? error.message : String(error)).slice(0, 300),
+      });
+    }
+  });
+
+  // Reconnecting must not silently re-pick the primary calendar: the human
+  // sees every writable calendar this credential can reach and connects the
+  // one they choose. Primary sorts first (see `GoogleCalendarClient.calendars`)
+  // so it stays the easy default without being the only option.
+  app.get('/api/calendar/google/connection', (c) => {
+    const token = googleConnection(c.req.header('cookie'));
+    const pending = token ? pendingGoogleConnections.get(token) : null;
+    if (!pending || pending.expiresAt < Date.now()) {
+      return fail('this Google connection has expired; reconnect', 400);
+    }
+    return c.json({ calendars: pending.calendars });
+  });
+
+  app.post('/api/calendar/google/connection', async (c) => {
+    const token = googleConnection(c.req.header('cookie'));
+    const pending = token ? pendingGoogleConnections.get(token) : null;
+    if (!pending || pending.expiresAt < Date.now()) {
+      return fail('this Google connection has expired; reconnect', 400);
+    }
+    const body = (await c.req.json().catch(() => ({}))) as {
+      calendarId?: unknown;
+      label?: unknown;
+    };
+    try {
+      const account = await jarvis.calendar.connect({
+        provider: 'google',
+        credentials: pending.credentials,
+        ...(typeof body.calendarId === 'string' ? { calendarId: body.calendarId } : {}),
+        ...(typeof body.label === 'string' ? { label: body.label } : {}),
+      });
+      pendingGoogleConnections.delete(token as string);
+      const response = c.json(account, 201);
+      response.headers.set('set-cookie', clearGoogleConnectionCookie);
+      return response;
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 422);
+    }
+  });
+
+  app.post('/api/calendar/discover', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      provider?: unknown;
+      credentials?: unknown;
+    };
+    if (body.provider !== 'google' && body.provider !== 'icloud') return fail('invalid provider');
+    try {
+      return c.json(
+        await jarvis.calendar.discover({
+          provider: body.provider as CalendarProviderId,
+          credentials: body.credentials,
+        }),
+      );
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 422);
+    }
+  });
+
+  app.post('/api/calendar/accounts', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      provider?: unknown;
+      credentials?: unknown;
+      calendarId?: unknown;
+      label?: unknown;
+    };
+    if (body.provider !== 'google' && body.provider !== 'icloud') return fail('invalid provider');
+    try {
+      const account = await jarvis.calendar.connect({
+        provider: body.provider as CalendarProviderId,
+        credentials: body.credentials,
+        ...(typeof body.calendarId === 'string' ? { calendarId: body.calendarId } : {}),
+        ...(typeof body.label === 'string' ? { label: body.label } : {}),
+      });
+      return c.json(account, 201);
+    } catch (error) {
+      return fail(error instanceof Error ? error.message : String(error), 422);
+    }
+  });
+
+  app.delete('/api/calendar/accounts/:id', (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.calendar.disconnect(id)) return fail('calendar account not found', 404);
+    return c.json({ disconnected: true });
+  });
+
+  app.post('/api/calendar/sync', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { accountId?: unknown };
+    if (body.accountId !== undefined && typeof body.accountId !== 'string') {
+      return fail('accountId must be a string');
+    }
+    return c.json(await jarvis.calendar.sync(body.accountId as string | undefined));
+  });
+
+  app.get('/api/calendar/events', (c) => {
+    const from = c.req.query('from');
+    const to = c.req.query('to');
+    const limit = Number(c.req.query('limit') ?? '200');
+    if ((from && Number.isNaN(Date.parse(from))) || (to && Number.isNaN(Date.parse(to)))) {
+      return fail('from and to must be ISO-8601 dates');
+    }
+    return c.json(
+      jarvis.calendar.events({
+        ...(from ? { from: new Date(from).toISOString() } : {}),
+        ...(to ? { to: new Date(to).toISOString() } : {}),
+        ...(c.req.query('accountId') ? { accountId: c.req.query('accountId') } : {}),
+        ...(c.req.query('search') ? { search: c.req.query('search') } : {}),
+        limit: Number.isFinite(limit) ? limit : 200,
+      }),
+    );
+  });
+
+  app.post('/api/calendar/events', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    return c.json(
+      await jarvis.tools.execute(
+        'calendar.create',
+        { accountId: body.accountId, draft: body.draft },
+        { actor: 'user' },
+      ),
+    );
+  });
+
+  app.patch('/api/calendar/events/:id', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.calendar.event(id)) return fail('calendar event not found', 404);
+    const patch = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const scope = c.req.query('scope');
+    return c.json(
+      await jarvis.tools.execute(
+        'calendar.update',
+        { id, patch, ...(scope ? { scope } : {}) },
+        { actor: 'user' },
+      ),
+    );
+  });
+
+  app.delete('/api/calendar/events/:id', async (c) => {
+    const id = c.req.param('id');
+    if (!jarvis.calendar.event(id)) return fail('calendar event not found', 404);
+    const scope = c.req.query('scope');
+    return c.json(
+      await jarvis.tools.execute(
+        'calendar.delete',
+        { id, ...(scope ? { scope } : {}) },
+        { actor: 'user' },
+      ),
+    );
   });
 
   app.get('/api/context-packs/:id', (c) => {

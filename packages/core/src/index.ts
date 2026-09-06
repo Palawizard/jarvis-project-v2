@@ -3,6 +3,16 @@ export { loadConfig, getConfig, setConfig, ensureDirs, type JarvisConfig } from 
 export { openDb, transaction, parseJson, type Db } from './db/index.js';
 export { HumanControlAuth } from './auth/control.js';
 export { EventBus, type JarvisEvent, type JarvisEventType } from './events/bus.js';
+export {
+  CalendarService,
+  describeEvent,
+  normaliseDraft,
+  parseCredentials,
+  type CalendarServiceDeps,
+  type CalendarSyncReport,
+} from './calendar/service.js';
+export * from './calendar/types.js';
+export { exchangeGoogleCode, GOOGLE_AUTH_URL, GOOGLE_CALENDAR_SCOPE } from './calendar/google.js';
 
 export { MemoryService, calibrateSemantic, toFtsQuery } from './memory/service.js';
 export * from './memory/types.js';

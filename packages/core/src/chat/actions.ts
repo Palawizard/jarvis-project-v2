@@ -70,6 +70,48 @@ export const ChatActionSchema = z.discriminatedUnion('action', [
 
   z
     .object({
+      action: z.literal('list_calendar_events'),
+      from: z.iso.datetime({ offset: true }).optional(),
+      to: z.iso.datetime({ offset: true }).optional(),
+      calendar: ref.optional(),
+      search: z.string().min(1).max(200).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('create_calendar_event'),
+      calendar: ref.optional(),
+      title: z.string().min(1).max(400),
+      startsAt: z.iso.datetime({ offset: true }),
+      endsAt: z.iso.datetime({ offset: true }).optional(),
+      allDay: z.boolean().optional(),
+      description: z.string().max(4000).nullable().optional(),
+      location: z.string().max(400).nullable().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('update_calendar_event'),
+      event: ref,
+      title: z.string().min(1).max(400).optional(),
+      startsAt: z.iso.datetime({ offset: true }).optional(),
+      endsAt: z.iso.datetime({ offset: true }).optional(),
+      allDay: z.boolean().optional(),
+      description: z.string().max(4000).nullable().optional(),
+      location: z.string().max(400).nullable().optional(),
+      scope: z.enum(['occurrence', 'series']).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('delete_calendar_event'),
+      event: ref,
+      scope: z.enum(['occurrence', 'series']).optional(),
+    })
+    .strict(),
+
+  z
+    .object({
       action: z.literal('clarify'),
       question: z.string().min(1).max(600),
       options: z.array(z.string().min(1).max(200)).max(8).optional(),
@@ -108,6 +150,10 @@ export const ACTION_TOOLS: Record<ChatActionName, string | null> = {
   archive_conversation: 'conversation.archive',
   delete_conversation: 'conversation.delete',
   search: 'search.everything',
+  list_calendar_events: 'calendar.list',
+  create_calendar_event: 'calendar.create',
+  update_calendar_event: 'calendar.update',
+  delete_calendar_event: 'calendar.delete',
 };
 
 /**
@@ -169,12 +215,20 @@ Supported actions and their fields:
 - {"action":"archive_conversation","archived"?:boolean}
 - {"action":"delete_conversation","conversation"?:string}
 - {"action":"search","query":string}
+- {"action":"list_calendar_events","from"?:ISO-8601,"to"?:ISO-8601,"calendar"?:string,"search"?:string}
+- {"action":"create_calendar_event","calendar"?:string,"title":string,"startsAt":ISO-8601,"endsAt"?:ISO-8601,"allDay"?:boolean,"description"?:string|null,"location"?:string|null}
+- {"action":"update_calendar_event","event":string,"title"?:string,"startsAt"?:ISO-8601,"endsAt"?:ISO-8601,"allDay"?:boolean,"description"?:string|null,"location"?:string|null,"scope"?:"occurrence"|"series"}
+- {"action":"delete_calendar_event","event":string,"scope"?:"occurrence"|"series"}
 - {"action":"clarify","question":string,"options"?:string[]}
 
 Rules:
 - An ordinary question, explanation, opinion or brainstorm gets NO action block.
 - Omitting "project"/"job" means "the one this conversation is already about".
 - If several projects or jobs could be meant, use "clarify" instead of guessing.
+- Calendar ids and event ids are shown in the calendar context. Use them when available.
+- For a recurring event, ask whether the user means this occurrence or the entire series before
+  sending an update or delete action; set "scope" to their explicit choice.
+- Times must be ISO-8601 instants with an explicit UTC offset. Never invent a missing date.
 - Destructive actions (delete, unregister) are only ever REQUESTS. Jarvis asks
   the human to confirm them; you can neither confirm nor perform them, and you
   must not claim that you did.

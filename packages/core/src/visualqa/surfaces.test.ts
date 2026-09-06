@@ -118,9 +118,10 @@ describe('resolveVisualPlan', () => {
         'mobile-conversation-drawer',
         'projects',
         'jobs-list',
-        // The shell renders these two as well: a broad set that skips them lets a
-        // routing or layout regression on either page ship with clean evidence.
+        // The shell renders these as well: a broad set that skips them lets a
+        // routing or layout regression on any of these pages ship with clean evidence.
         'job-detail-paused',
+        'calendar',
         'tools',
       ]);
       expect(plan?.reasons.every((reason) => reason.includes('global UI smoke'))).toBe(true);
@@ -133,6 +134,7 @@ describe('resolveVisualPlan', () => {
     const plan = resolveVisualPlan(job(), project(), ['apps/web/src/components.tsx']);
     expect(names(plan).sort()).toEqual(
       [
+        'calendar',
         'chat-workspace',
         'destructive-dialog',
         'job-detail-paused',

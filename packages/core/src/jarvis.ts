@@ -26,6 +26,7 @@ import { registerBuiltinTools } from './tools/builtin.js';
 import type { ToolRegistry } from './tools/registry.js';
 import { createLogger } from './logger.js';
 import { HumanControlAuth } from './auth/control.js';
+import { CalendarService } from './calendar/service.js';
 
 const log = createLogger('jarvis');
 
@@ -57,6 +58,7 @@ export class Jarvis {
   readonly upgrades: UpgradeManager;
   readonly tools: ToolRegistry;
   readonly control: HumanControlAuth;
+  readonly calendar: CalendarService;
 
   constructor(config: JarvisConfig = getConfig()) {
     this.config = config;
@@ -65,6 +67,7 @@ export class Jarvis {
     this.db = openDb(config);
     this.bus = new EventBus(this.db);
     this.control = new HumanControlAuth(this.db);
+    this.calendar = new CalendarService({ db: this.db, bus: this.bus, config });
     this.memory = new MemoryService({ db: this.db, bus: this.bus, config });
     this.context = new ContextPackBuilder(this.db, this.memory, config);
     this.projects = new ProjectService(this.db);
@@ -138,6 +141,7 @@ export class Jarvis {
         sessions: this.sessions,
         pipeline: this.pipeline,
         lifecycle: this.lifecycle,
+        calendar: this.calendar,
       },
       {
         db: this.db,
@@ -157,6 +161,7 @@ export class Jarvis {
       jobs: this.jobs,
       sessions: this.sessions,
       tools: this.tools,
+      calendar: this.calendar,
     });
   }
 
@@ -199,6 +204,7 @@ export class Jarvis {
     this.memory.trimCoreUserMemory();
     this.sessions.pruneHistory(this.config.pipeline.rawHistoryRetentionDays);
     this.tools.pruneAudit(this.config.tools.auditRetentionDays);
+    this.calendar.start();
 
     const selfProject = await this.registerSelf().catch((error: unknown) => {
       log.warn('could not register Jarvis as a project', { error: String(error) });
@@ -292,6 +298,7 @@ export class Jarvis {
   }
 
   close(): void {
+    this.calendar.stop();
     this.db.close();
   }
 }

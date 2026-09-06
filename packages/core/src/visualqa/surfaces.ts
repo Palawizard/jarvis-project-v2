@@ -247,6 +247,11 @@ export const SELF_VISUAL_SURFACES: SelfSurface[] = [
     scenario: navSurface('nav-memory', 'memory-view'),
   },
   {
+    name: 'calendar',
+    patterns: [/^apps\/web\/src\/views\/Calendar\.tsx$/i],
+    scenario: navSurface('nav-calendar', 'calendar-view'),
+  },
+  {
     name: 'tools',
     patterns: [/^apps\/web\/src\/views\/Tools[^/]*\.tsx$/i],
     scenario: { ...navSurface('nav-tools', 'tools-view'), fixture: 'chat-workspace' },
@@ -275,6 +280,7 @@ const SELF_COMPONENT_SMOKE = [
   'jobs-list',
   'job-detail-paused',
   'projects',
+  'calendar',
   'tools',
 ];
 // App.tsx, styles.css, api.ts and hooks.ts shape every screen, so a change to
@@ -291,6 +297,7 @@ const SELF_GLOBAL_SMOKE = [
   'projects',
   'jobs-list',
   'job-detail-paused',
+  'calendar',
   'tools',
 ];
 

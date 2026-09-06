@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 15;
 
 /**
  * A LIKE pattern for a term a human typed.
@@ -297,6 +297,68 @@ export const MIGRATIONS = new Map<number, string>([
     ALTER TABLE routing_decisions ADD COLUMN effort TEXT;
     ALTER TABLE routing_decisions ADD COLUMN score INTEGER;
     ALTER TABLE routing_decisions ADD COLUMN factors TEXT NOT NULL DEFAULT '[]';`,
+  ],
+  [
+    14,
+    // Connected calendars and their mirrored events.
+    //
+    // Purely additive: no existing table is touched, so every memory, Job and
+    // project survives untouched and an instance with no connected calendar
+    // reads back exactly as it did before.
+    //
+    // `credentials` holds the user's own calendar credential (a Google refresh
+    // token, or an Apple app-specific password). It is read only by
+    // CalendarService, never returned by an API route, never emitted on the
+    // bus and never logged. The database file is already chmod 600; there is no
+    // second key to protect it with that would not itself sit beside it.
+    //
+    // `calendar_events` is a MIRROR of the provider, not a source of truth, so
+    // it carries no local-edit state: every row was last written by the
+    // provider, which is what makes sync a window replace instead of a merge.
+    `CREATE TABLE calendar_accounts (
+      id            TEXT PRIMARY KEY,
+      provider      TEXT NOT NULL,
+      label         TEXT NOT NULL,
+      credentials   TEXT NOT NULL,
+      calendar_id   TEXT NOT NULL,
+      calendar_name TEXT,
+      status        TEXT NOT NULL DEFAULT 'active',
+      error         TEXT,
+      last_sync_at  TEXT,
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL
+    );
+
+    CREATE TABLE calendar_events (
+      id          TEXT PRIMARY KEY,
+      account_id  TEXT NOT NULL REFERENCES calendar_accounts(id) ON DELETE CASCADE,
+      remote_id   TEXT NOT NULL,
+      etag        TEXT,
+      title       TEXT NOT NULL,
+      description TEXT,
+      location    TEXT,
+      starts_at   TEXT NOT NULL,
+      ends_at     TEXT NOT NULL,
+      all_day     INTEGER NOT NULL DEFAULT 0,
+      recurring   INTEGER NOT NULL DEFAULT 0,
+      raw         TEXT,
+      updated_at  TEXT NOT NULL,
+      synced_at   TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX calendar_events_remote ON calendar_events(account_id, remote_id);
+    CREATE INDEX idx_calendar_events_window ON calendar_events(starts_at, ends_at);`,
+  ],
+  [
+    15,
+    // A recurring event's series id: Google's `recurringEventId`, or the
+    // CalDAV/iCloud master resource URL. Needed so a `series`-scoped update or
+    // delete can address the whole recurring event instead of the one
+    // occurrence -- see `RecurrenceScope`.
+    //
+    // Additive and nullable: every row that existed before this migration
+    // reads back with series_id NULL, exactly what a non-recurring event
+    // already had no other way to express.
+    `ALTER TABLE calendar_events ADD COLUMN series_id TEXT;`,
   ],
 ]);
 

@@ -359,6 +359,41 @@
       "expectedSelectorTimeoutMs": 10000
     },
     {
+      "name": "calendar",
+      "matchers": [
+        {
+          "exact": "apps/web/src/views/Calendar.tsx"
+        }
+      ],
+      "route": "/",
+      "expectedSelector": "[data-testid='calendar-view']",
+      "viewports": ["desktop", "mobile"],
+      "interactions": [
+        {
+          "action": "click",
+          "selector": "[data-testid='nav-calendar']"
+        }
+      ],
+      "viewportInteractions": {
+        "mobile": [
+          {
+            "action": "click",
+            "selector": "[data-testid='mobile-drawer-open']"
+          },
+          {
+            "action": "wait",
+            "selector": "[data-testid='conversation-sidebar']",
+            "timeoutMs": 10000
+          },
+          {
+            "action": "click",
+            "selector": "[data-testid='nav-calendar']"
+          }
+        ]
+      },
+      "expectedSelectorTimeoutMs": 10000
+    },
+    {
       "name": "tools",
       "matchers": [
         {
@@ -438,6 +473,7 @@
         "projects",
         "jobs-list",
         "job-detail-paused",
+        "calendar",
         "tools"
       ]
     },
@@ -453,6 +489,7 @@
         "jobs-list",
         "job-detail-paused",
         "projects",
+        "calendar",
         "tools"
       ]
     },

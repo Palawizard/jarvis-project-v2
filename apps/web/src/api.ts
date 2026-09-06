@@ -569,6 +569,58 @@ export interface SearchHit {
   subtitle: string;
 }
 
+export type CalendarProvider = 'google' | 'icloud';
+
+/** Which part of a repeating event a write targets. See core's `RecurrenceScope`. */
+export type RecurrenceScope = 'occurrence' | 'series';
+
+export interface CalendarAccount {
+  id: string;
+  provider: CalendarProvider;
+  label: string;
+  calendarId: string;
+  calendarName: string | null;
+  status: 'active' | 'error';
+  error: string | null;
+  lastSyncAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CalendarEventDraft {
+  title: string;
+  startsAt: string;
+  endsAt: string;
+  allDay: boolean;
+  description: string | null;
+  location: string | null;
+}
+
+export interface CalendarEvent extends CalendarEventDraft {
+  id: string;
+  accountId: string;
+  provider: CalendarProvider;
+  source: string;
+  remoteId: string;
+  recurring: boolean;
+  seriesId: string | null;
+  updatedAt: string;
+  syncedAt: string;
+}
+
+export interface RemoteCalendar {
+  id: string;
+  name: string;
+}
+
+export interface CalendarSyncReport {
+  accountId: string;
+  label: string;
+  synced: number;
+  removed: number;
+  error: string | null;
+}
+
 export interface AuthStatus {
   authenticated: boolean;
   paired: boolean;
@@ -708,6 +760,65 @@ export const api = {
     }),
 
   search: (query: string) => request<SearchHit[]>(`/api/search?q=${encodeURIComponent(query)}`),
+
+  calendarAccounts: () => request<CalendarAccount[]>('/api/calendar/accounts'),
+  authorizeGoogleCalendar: (clientId: string, clientSecret: string) =>
+    request<{ url: string; redirectUri: string }>('/api/calendar/google/authorize', {
+      method: 'POST',
+      body: JSON.stringify({
+        clientId,
+        clientSecret,
+        redirectUri: `${location.origin}/api/calendar/google/callback`,
+        returnTo: location.origin,
+      }),
+    }),
+  discoverCalendars: (provider: CalendarProvider, credentials: Record<string, string>) =>
+    request<RemoteCalendar[]>('/api/calendar/discover', {
+      method: 'POST',
+      body: JSON.stringify({ provider, credentials }),
+    }),
+  connectCalendar: (
+    provider: CalendarProvider,
+    credentials: Record<string, string>,
+    calendarId: string,
+    label?: string,
+  ) =>
+    request<CalendarAccount>('/api/calendar/accounts', {
+      method: 'POST',
+      body: JSON.stringify({ provider, credentials, calendarId, label }),
+    }),
+  /** The calendars a just-completed Google OAuth round trip can reach. */
+  googleConnectionCalendars: () =>
+    request<{ calendars: RemoteCalendar[] }>('/api/calendar/google/connection'),
+  /** Finishes that OAuth round trip by connecting the calendar the human picked. */
+  connectGoogleConnection: (calendarId: string, label?: string) =>
+    request<CalendarAccount>('/api/calendar/google/connection', {
+      method: 'POST',
+      body: JSON.stringify({ calendarId, label }),
+    }),
+  disconnectCalendar: (id: string) =>
+    request<{ disconnected: boolean }>(`/api/calendar/accounts/${id}`, { method: 'DELETE' }),
+  syncCalendars: (accountId?: string) =>
+    request<CalendarSyncReport[]>('/api/calendar/sync', {
+      method: 'POST',
+      body: JSON.stringify(accountId ? { accountId } : {}),
+    }),
+  calendarEvents: (params: { from: string; to: string; accountId?: string; search?: string }) =>
+    request<CalendarEvent[]>(`/api/calendar/events?${new URLSearchParams(clean(params))}`),
+  createCalendarEvent: (accountId: string, draft: CalendarEventDraft) =>
+    request<ToolOutcome>('/api/calendar/events', {
+      method: 'POST',
+      body: JSON.stringify({ accountId, draft }),
+    }),
+  updateCalendarEvent: (id: string, patch: Partial<CalendarEventDraft>, scope?: RecurrenceScope) =>
+    request<ToolOutcome>(`/api/calendar/events/${id}${scope ? `?scope=${scope}` : ''}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  deleteCalendarEvent: (id: string, scope?: RecurrenceScope) =>
+    request<ToolOutcome>(`/api/calendar/events/${id}${scope ? `?scope=${scope}` : ''}`, {
+      method: 'DELETE',
+    }),
 
   session: () =>
     request<{ session: Session; rendered: string; messages: Message[] }>('/api/session'),

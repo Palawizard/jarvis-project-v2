@@ -2,8 +2,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import { Markdown, PlainText } from './components.tsx';
 import { confirmationState, describePendingTarget } from './views/Chat.tsx';
+import { overlapsDay } from './views/Calendar.tsx';
 import { mergeEvents } from './views/JobDetail.tsx';
-import type { JarvisEvent, Job } from './api.ts';
+import type { CalendarEvent, JarvisEvent, Job } from './api.ts';
 
 describe('web reviewer advisories', () => {
   it('requires a genuine Markdown table delimiter row', () => {
@@ -78,6 +79,36 @@ describe('web reviewer advisories', () => {
     expect(describePendingTarget(undefined, [], new Map())).toEqual([
       'the exact target described in the pending request',
     ]);
+  });
+
+  it('draws a one-day all-day event on exactly one cell in any timezone', () => {
+    // Stored as midnight-UTC bounds with an exclusive end, as normaliseDraft writes it.
+    const event = {
+      allDay: true,
+      startsAt: '2026-09-10T00:00:00.000Z',
+      endsAt: '2026-09-11T00:00:00.000Z',
+    } as CalendarEvent;
+    const timed = {
+      allDay: false,
+      startsAt: '2026-09-10T08:00:00.000Z',
+      endsAt: '2026-09-10T09:00:00.000Z',
+    } as CalendarEvent;
+
+    const zone = process.env.TZ;
+    try {
+      // East and west of UTC: an instant comparison lands on the wrong side in both.
+      for (const tz of ['Europe/Paris', 'America/New_York', 'UTC']) {
+        process.env.TZ = tz;
+        const days = [9, 10, 11].map((date) => new Date(2026, 8, date));
+        expect(days.filter((day) => overlapsDay(event, day)).map((day) => day.getDate())).toEqual([
+          10,
+        ]);
+        // Timed events still use instant overlap, so they follow the local clock.
+        expect(days.some((day) => overlapsDay(timed, day))).toBe(true);
+      }
+    } finally {
+      process.env.TZ = zone;
+    }
   });
 
   it('unions overlapping event pages by id, oldest first', () => {

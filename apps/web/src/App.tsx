@@ -17,6 +17,7 @@ import { JobsView } from './views/Jobs.tsx';
 import { JobDetailView } from './views/JobDetail.tsx';
 import { MemoryView } from './views/Memory.tsx';
 import { ToolsView } from './views/Tools.tsx';
+import { CalendarView } from './views/Calendar.tsx';
 
 export type Route =
   | { name: 'home' }
@@ -25,6 +26,7 @@ export type Route =
   | { name: 'jobs' }
   | { name: 'job'; id: string }
   | { name: 'memory' }
+  | { name: 'calendar' }
   | { name: 'tools' };
 
 function routeFromPath(pathname = location.pathname): Route {
@@ -34,6 +36,7 @@ function routeFromPath(pathname = location.pathname): Route {
   if (parts[0] === 'jobs' && parts[1]) return { name: 'job', id: parts[1] };
   if (parts[0] === 'jobs') return { name: 'jobs' };
   if (parts[0] === 'memory') return { name: 'memory' };
+  if (parts[0] === 'calendar') return { name: 'calendar' };
   if (parts[0] === 'tools') return { name: 'tools' };
   return { name: 'home' };
 }
@@ -425,6 +428,11 @@ function AuthenticatedApp() {
             count={health.data?.memory.active}
           />
           <Nav
+            active={route.name === 'calendar'}
+            label="Calendar"
+            onClick={() => navigate({ name: 'calendar' })}
+          />
+          <Nav
             active={route.name === 'tools'}
             label="Tools"
             onClick={() => navigate({ name: 'tools' })}
@@ -505,6 +513,7 @@ function AuthenticatedApp() {
         {route.name === 'memory' && (
           <MemoryView projects={projects.data ?? []} lastEvent={lastEvent} />
         )}
+        {route.name === 'calendar' && <CalendarView lastEvent={lastEvent} />}
         {route.name === 'tools' && (
           <ToolsView projects={projects.data ?? []} projectId={null} lastEvent={lastEvent} />
         )}

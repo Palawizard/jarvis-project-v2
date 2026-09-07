@@ -234,13 +234,14 @@ describe('calendar mirror', () => {
     // The web form sends a materialised draft. The provider still receives
     // only the value that changed, so a series update cannot copy an
     // occurrence's dates onto its master.
+    const current = service.event(event.id) as CalendarEvent;
     await service.updateEvent(event.id, {
       title: 'Offsite (final)',
-      startsAt: renamed.startsAt,
-      endsAt: renamed.endsAt,
-      allDay: renamed.allDay,
-      description: renamed.description,
-      location: renamed.location,
+      startsAt: current.startsAt,
+      endsAt: current.endsAt,
+      allDay: current.allDay,
+      description: current.description,
+      location: current.location,
     });
     expect(sentPatch).toEqual({ title: 'Offsite (final)' });
 
@@ -556,5 +557,124 @@ describe('calendar mirror', () => {
     } finally {
       globalThis.fetch = original;
     }
+  });
+
+  it('identifies a CalDAV series from its stored RRULE, not from the expansion', async () => {
+    const seriesUrl = 'https://cal.example/work/series.ics';
+    const stored = [
+      'BEGIN:VCALENDAR',
+      'BEGIN:VEVENT',
+      'UID:series@example',
+      'DTSTART;TZID=Europe/Paris:20260910T090000',
+      'DTEND;TZID=Europe/Paris:20260910T100000',
+      'RRULE:FREQ=DAILY;COUNT=3',
+      'SUMMARY:Standup',
+      'END:VEVENT',
+      'END:VCALENDAR',
+    ].join('\r\n');
+    // RFC 4791 §9.6.5: expansion drops RRULE, and the first instance carries no
+    // RECURRENCE-ID of its own. 09:00 in Paris is 07:00Z in September.
+    const instance = (day: string, labelled = true) =>
+      [
+        'BEGIN:VEVENT',
+        'UID:series@example',
+        ...(labelled ? [`RECURRENCE-ID;TZID=Europe/Paris:${day}T090000`] : []),
+        `DTSTART:${day}T070000Z`,
+        `DTEND:${day}T080000Z`,
+        'SUMMARY:Standup',
+        'END:VEVENT',
+      ].join('\r\n');
+    const expansion = (...events: string[]) =>
+      ['BEGIN:VCALENDAR', ...events, 'END:VCALENDAR'].join('\r\n');
+
+    const events = async (expanded: string) => {
+      const original = globalThis.fetch;
+      globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+        const text = String(init?.body ?? '').includes('expand') ? expanded : stored;
+        return new Response(
+          '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response>' +
+            `<d:href>${seriesUrl}</d:href><d:getetag>"v1"</d:getetag>` +
+            `<c:calendar-data xmlns:c="urn:ietf:params:xml:ns:caldav"><![CDATA[${text}]]>` +
+            '</c:calendar-data></d:response></d:multistatus>',
+          { status: 207, headers: { 'content-type': 'application/xml' } },
+        );
+      }) as typeof fetch;
+      try {
+        return await new CalDavClient(
+          { appleId: 'a@b.c', appPassword: 'pw' },
+          'https://cal.example/work/',
+        ).events({ from: draft.startsAt, to: draft.endsAt });
+      } finally {
+        globalThis.fetch = original;
+      }
+    };
+
+    // A window holding only the first instance still reads as a series, and its
+    // occurrence id is the master's own DTSTART, in the master's own zone.
+    const alone = await events(expansion(instance('20260910', false)));
+    expect(alone).toHaveLength(1);
+    expect(alone[0]).toMatchObject({
+      remoteId: `${seriesUrl}#20260910T090000`,
+      seriesId: seriesUrl,
+      recurring: true,
+    });
+    expect(alone[0]?.raw).toContain('RECURRENCE-ID;TZID=Europe/Paris:20260910T090000');
+
+    // The whole expanded window: the unlabelled first instance is addressable
+    // alongside the ones the server did label.
+    const many = await events(
+      expansion(instance('20260910', false), instance('20260911'), instance('20260912')),
+    );
+    expect(many.map((event) => event.remoteId)).toEqual([
+      `${seriesUrl}#20260910T090000`,
+      `${seriesUrl}#20260911T090000`,
+      `${seriesUrl}#20260912T090000`,
+    ]);
+
+    const first = many[0] as RemoteEvent;
+    const ref: RemoteEventRef = {
+      remoteId: first.remoteId,
+      etag: first.etag,
+      raw: first.raw,
+      recurring: first.recurring,
+      seriesId: first.seriesId,
+      startsAt: first.startsAt,
+      endsAt: first.endsAt,
+      allDay: first.allDay,
+    };
+
+    // Editing and deleting that first occurrence must reach the provider and
+    // leave the recurrence rule standing.
+    const puts: Array<{ body: string; ifMatch: string | null }> = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === 'GET') return new Response(stored, { headers: { etag: '"v1"' } });
+      puts.push({
+        body: String(init?.body ?? ''),
+        ifMatch: new Headers(init?.headers).get('if-match'),
+      });
+      return new Response('', { headers: { etag: '"v2"' } });
+    }) as typeof fetch;
+    try {
+      const dav = new CalDavClient(
+        { appleId: 'a@b.c', appPassword: 'pw' },
+        'https://cal.example/work/',
+      );
+      const edited = { ...draft, title: 'Just today', startsAt: ref.startsAt };
+      await dav.update(ref, edited, 'occurrence');
+      await dav.remove(ref, 'occurrence');
+    } finally {
+      globalThis.fetch = original;
+    }
+    expect(puts).toHaveLength(2);
+    expect(puts.every((put) => put.ifMatch === '"v1"')).toBe(true);
+    // The override names the first instance; the series keeps its rule.
+    expect(puts[0]?.body).toContain('RECURRENCE-ID;TZID=Europe/Paris:20260910T090000');
+    expect(puts[0]?.body).toContain('SUMMARY:Just today');
+    expect(puts[0]?.body).toContain('RRULE:FREQ=DAILY;COUNT=3');
+    expect(puts[0]?.body).toContain('DTSTART;TZID=Europe/Paris:20260910T090000');
+    // Deleting it excludes the instance and, again, keeps the rule.
+    expect(puts[1]?.body).toContain('EXDATE;TZID=Europe/Paris:20260910T090000');
+    expect(puts[1]?.body).toContain('RRULE:FREQ=DAILY;COUNT=3');
   });
 });

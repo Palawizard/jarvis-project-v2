@@ -304,26 +304,72 @@ function timeLines(draft: Pick<IcsDraft, 'startsAt' | 'endsAt' | 'allDay'>): str
   ];
 }
 
+/**
+ * One date-time property line, in the value type and zone `template` uses.
+ *
+ * Keeping the original form matters twice over: a rewritten DTSTART must stay
+ * on the TZID its RRULE expands against, and a RECURRENCE-ID must match the
+ * master's DTSTART value type, as RFC 5545 requires.
+ */
+function renderTimeLine(
+  name: string,
+  template: string | null,
+  iso: string,
+  allDay: boolean,
+): string {
+  if (allDay) return `${name};VALUE=DATE:${icsStamp(iso, true)}`;
+  const property = template ? parseProperty(template) : null;
+  const head = template?.split(':', 1)[0];
+  const prefix =
+    property && head && property.params.VALUE !== 'DATE' ? head.replace(/^[^;]+/, name) : name;
+  const value = property?.params.TZID
+    ? zonedStamp(iso, property.params.TZID)
+    : property?.value.trim().endsWith('Z') === false
+      ? icsStamp(iso, false).slice(0, -1)
+      : icsStamp(iso, false);
+  return `${prefix}:${value}`;
+}
+
 function eventTimeLines(
   lines: string[],
   draft: Pick<IcsDraft, 'startsAt' | 'endsAt' | 'allDay'>,
 ): string[] {
   const original = (name: string) =>
     lines.find((line) => parseProperty(line)?.name === name) ?? null;
-  const render = (name: 'DTSTART' | 'DTEND', template: string | null, iso: string) => {
-    if (draft.allDay) return `${name};VALUE=DATE:${icsStamp(iso, true)}`;
-    const property = template ? parseProperty(template) : null;
-    const prefix = property?.params.VALUE === 'DATE' ? name : (template?.split(':', 1)[0] ?? name);
-    const value = property?.params.TZID
-      ? zonedStamp(iso, property.params.TZID)
-      : property?.value.trim().endsWith('Z') === false
-        ? icsStamp(iso, false).slice(0, -1)
-        : icsStamp(iso, false);
-    return `${prefix}:${value}`;
-  };
   const start = original('DTSTART');
   const end = original('DTEND') ?? start?.replace(/^DTSTART/i, 'DTEND') ?? null;
-  return [render('DTSTART', start, draft.startsAt), render('DTEND', end, draft.endsAt)];
+  return [
+    renderTimeLine('DTSTART', start, draft.startsAt, draft.allDay),
+    renderTimeLine('DTEND', end, draft.endsAt, draft.allDay),
+  ];
+}
+
+/**
+ * Give an expanded occurrence the RECURRENCE-ID that addresses it.
+ *
+ * `<C:expand>` strips RRULE and RDATE (RFC 4791 §9.6.5) and need not label the
+ * first instance, so an occurrence can come back with no way to name itself.
+ * RFC 5545 defines that name exactly: the instance's own start, written in the
+ * value type and zone the master's DTSTART uses. Returns null when the master
+ * has no DTSTART or the instance has no VEVENT to stamp -- neither is an
+ * iCalendar object Jarvis can address.
+ */
+export function stampRecurrenceId(
+  instanceRaw: string,
+  masterRaw: string,
+  instanceStart: string,
+): { raw: string; recurrenceId: string } | null {
+  const template = unfold(masterRaw).find((line) => parseProperty(line)?.name === 'DTSTART');
+  const start = template ? parseProperty(template) : null;
+  if (!template || !start) return null;
+  const allDay = start.params.VALUE === 'DATE' || /^\d{8}$/.test(start.value.trim());
+  const line = renderTimeLine('RECURRENCE-ID', template, instanceStart, allDay);
+  const recurrenceId = parseProperty(line)?.value.trim();
+  const lines = unfold(instanceRaw);
+  const end = lines.findIndex((entry) => entry.toUpperCase().startsWith('END:VEVENT'));
+  if (!recurrenceId || end < 0) return null;
+  lines.splice(end, 0, line);
+  return { raw: lines.map(fold).join('\r\n'), recurrenceId };
 }
 
 function draftLines(draft: IcsDraft): string[] {

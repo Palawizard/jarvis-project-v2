@@ -6,6 +6,7 @@ import {
   patchIcsEvent,
   parseVEvents,
   recurrenceIdLine,
+  stampRecurrenceId,
 } from './ical.js';
 import {
   CalendarProviderError,
@@ -150,53 +151,95 @@ export class CalDavClient implements CalendarClient {
     return calendars;
   }
 
+  /**
+   * Two reports, because one cannot answer both questions.
+   *
+   * `<C:expand>` gives occurrences Jarvis can show without evaluating RRULE
+   * itself, but RFC 4791 §9.6.5 has the server strip RRULE and RDATE from what
+   * it returns, so the expanded copy can never say whether a resource is a
+   * series -- and a window holding only the first instance looks exactly like a
+   * plain event. Guessing from that would classify a series as non-recurring
+   * and let a later update write the synthetic expanded VEVENT back over the
+   * real resource, dropping the recurrence rule. The unexpanded copy is the
+   * only authority on recurrence, so it is fetched alongside and is what every
+   * `raw` here comes from.
+   */
   async events(range: { from: string; to: string }): Promise<RemoteEvent[]> {
-    const response = await this.#dav('REPORT', this.calendarUrl, {
-      depth: '1',
-      body:
-        '<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">' +
-        '<d:prop><d:getetag/><c:calendar-data>' +
-        // Ask the server to expand recurrence: an occurrence Jarvis can show is
-        // worth more than a master rule it would have to evaluate itself.
-        `<c:expand start="${icsStamp(range.from)}" end="${icsStamp(range.to)}"/>` +
-        '</c:calendar-data></d:prop>' +
-        '<c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">' +
-        `<c:time-range start="${icsStamp(range.from)}" end="${icsStamp(range.to)}"/>` +
-        '</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>',
-    });
+    const [instances, sources] = await Promise.all([
+      this.#query(range, true),
+      this.#query(range, false),
+    ]);
 
     const events: RemoteEvent[] = [];
-    for (const block of elements(response.text, 'response')) {
-      const href = firstElement(block, 'href');
-      const data = firstElement(block, 'calendar-data');
-      if (!href || !data) continue;
-      const resource = resolve(href, response.url);
-      const etag = firstElement(block, 'getetag')?.trim().replace(/^"|"$/g, '') ?? null;
-      const parsed = parseVEvents(decodeXml(data));
-      // One resource holding several VEVENTs is an expanded series: each
-      // occurrence gets a distinct id so the mirror can show them all. The
-      // resource itself -- without the recurrence-id fragment -- is the
-      // series id: what a `series`-scoped update or delete addresses.
-      const expanded = parsed.length > 1;
+    for (const [resource, instance] of instances) {
+      const source = sources.get(resource);
+      const parsed = parseVEvents(instance.text);
+      const stored = source ? parseVEvents(source.text) : [];
+      const master = stored.find((event) => event.recurrenceId === null) ?? null;
+      // Recurrence comes from the stored resource's own RRULE, RDATE and
+      // RECURRENCE-ID properties, never from how many VEVENTs the expansion
+      // happened to return in this window.
+      const series = source
+        ? stored.some((event) => event.recurring)
+        : parsed.length > 1 || parsed.some((event) => event.recurrenceId !== null);
+      const etag = instance.etag ?? source?.etag ?? null;
       for (const event of parsed) {
-        const recurring = expanded || event.recurring;
+        // The resource itself -- without the recurrence-id fragment -- is the
+        // series id: what a `series`-scoped update or delete addresses.
+        const stamped =
+          series && master && !event.recurrenceId
+            ? stampRecurrenceId(event.raw, master.raw, event.startsAt)
+            : null;
+        const recurrenceId = event.recurrenceId ?? stamped?.recurrenceId ?? null;
         events.push({
-          remoteId:
-            recurring && event.recurrenceId ? `${resource}#${event.recurrenceId}` : resource,
+          remoteId: series && recurrenceId ? `${resource}#${recurrenceId}` : resource,
           etag,
-          raw: event.raw,
+          // A non-recurring event carries the real resource, so an update
+          // patches what the server actually holds rather than the expansion's
+          // synthetic, TZID-flattened copy of it.
+          raw: series ? (stamped?.raw ?? event.raw) : (source?.text ?? event.raw),
           title: event.summary,
           description: event.description,
           location: event.location,
           startsAt: event.startsAt,
           endsAt: event.endsAt,
           allDay: event.allDay,
-          recurring,
-          seriesId: recurring ? resource : null,
+          recurring: series,
+          seriesId: series ? resource : null,
         });
       }
     }
     return events;
+  }
+
+  /** Every calendar object in the window, by resource URL. */
+  async #query(
+    range: { from: string; to: string },
+    expand: boolean,
+  ): Promise<Map<string, { etag: string | null; text: string }>> {
+    const span = `start="${icsStamp(range.from)}" end="${icsStamp(range.to)}"`;
+    const response = await this.#dav('REPORT', this.calendarUrl, {
+      depth: '1',
+      body:
+        '<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">' +
+        '<d:prop><d:getetag/><c:calendar-data>' +
+        (expand ? `<c:expand ${span}/>` : '') +
+        '</c:calendar-data></d:prop>' +
+        '<c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">' +
+        `<c:time-range ${span}/>` +
+        '</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>',
+    });
+    const found = new Map<string, { etag: string | null; text: string }>();
+    for (const block of elements(response.text, 'response')) {
+      const href = firstElement(block, 'href');
+      const data = firstElement(block, 'calendar-data');
+      if (!href || !data) continue;
+      found.set(resolve(href, response.url), {
+        etag: firstElement(block, 'getetag')?.trim().replace(/^"|"$/g, '') ?? null,
+        text: decodeXml(data),
+      });
+    }
+    return found;
   }
 
   async create(draft: CalendarEventDraft): Promise<RemoteEvent> {

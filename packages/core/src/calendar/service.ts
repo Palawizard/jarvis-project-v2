@@ -3,7 +3,7 @@ import type { EventBus } from '../events/bus.js';
 import type { JarvisConfig } from '../config.js';
 import { newId, nowIso } from '../ids.js';
 import { createLogger } from '../logger.js';
-import { addCalendarDays, calendarDate, localIso } from './dates.js';
+import { addCalendarDays, calendarDate } from './dates.js';
 import { GoogleCalendarClient } from './google.js';
 import { CalDavClient } from './caldav.js';
 import {
@@ -201,12 +201,14 @@ export class CalendarService {
     // DATES. Comparing an all-day event as an instant is what made the 10th
     // show up on the 9th for a caller in UTC-11 and on the 11th for one in
     // UTC+14. The bounds keep both readings because the caller's own lexical
-    // date survives all the way here -- see `localIso`.
+    // date survives all the way here -- see `localIso`. The upper bound accepts
+    // both an exclusive next-midnight and an inclusive same-day end -- see
+    // `allDayUpperDate`.
     if (query.to) {
       where.push(
         `(CASE WHEN e.all_day = 1 THEN substr(e.starts_at, 1, 10) < ? ELSE e.starts_at < ? END)`,
       );
-      params.push(calendarDate(query.to), utcInstant(query.to));
+      params.push(allDayUpperDate(query.to), utcInstant(query.to));
     }
     if (query.from) {
       where.push(
@@ -247,25 +249,6 @@ export class CalendarService {
       )
       .get(id) as Row | undefined;
     return row ? rowToEvent(row) : null;
-  }
-
-  /**
-   * What is coming up, as a few lines of plain text.
-   *
-   * This is what makes Jarvis answer "am I free Thursday?" without the user
-   * naming a tool: it goes into the conversational prompt beside the project
-   * registry. Bounded on purpose — the mirror can hold a year and the prompt
-   * cannot.
-   */
-  renderUpcoming(limit = 12, now: Date = new Date()): string {
-    if (!this.accounts().length) return '';
-    // Local, offset-bearing bounds: an all-day event on the user's own today
-    // must not be filtered out because UTC has already moved on.
-    const from = localIso(now);
-    const to = localIso(new Date(now.getTime() + 14 * 86_400_000));
-    const events = this.events({ from, to, limit });
-    if (!events.length) return 'Nothing scheduled in the next 14 days.';
-    return events.map((event) => `- ${describeEvent(event)}`).join('\n');
   }
 
   // ------------------------------------------------------------------ syncing --
@@ -827,6 +810,28 @@ function mustRefresh(provider: CalendarProviderId, scope: RecurrenceScope): bool
  * Bounds are compared as text against UTC columns, so an offset like `+02:00`
  * would sort wrong. Anything unparseable is left alone for SQLite to reject.
  */
+/**
+ * The EXCLUSIVE all-day date bound a `to` instant means.
+ *
+ * Both shapes a caller sends are honoured, because both are sensible and the
+ * model picks either one. A next-midnight bound (`2026-09-11T00:00:00+02:00`)
+ * is already exclusive and keeps its date. An inclusive same-day bound
+ * (`2026-09-10T23:59:59+02:00`, or any other instant past midnight) means the
+ * 10th is being asked about, so the exclusive date is the day after -- without
+ * this, "what do I have on September 10?" returned the timed events and
+ * silently dropped the all-day ones.
+ *
+ * Midnight is read LEXICALLY, from the offset the caller wrote: 00:00 at
+ * UTC-11 and 00:00 at UTC+14 are both midnight, and neither is midnight once
+ * converted to UTC. A bare `YYYY-MM-DD` has no clock at all, so it is midnight.
+ */
+const LOCAL_MIDNIGHT = /^\d{4}-\d{2}-\d{2}(T00:00(:00(\.0+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+
+function allDayUpperDate(value: string): string {
+  const date = calendarDate(value);
+  return LOCAL_MIDNIGHT.test(value.trim()) ? date : addCalendarDays(date, 1);
+}
+
 function utcInstant(value: string): string {
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();

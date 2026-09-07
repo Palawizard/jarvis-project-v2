@@ -8,7 +8,7 @@
  * recurrence rules that this code has no model for.
  */
 
-import { isCalendarDate } from './dates.js';
+import { isCalendarDate, zonedToUtc, zonedWallClock } from './dates.js';
 
 export interface ParsedEvent {
   uid: string | null;
@@ -20,6 +20,12 @@ export interface ParsedEvent {
   /** ISO-8601 UTC, exclusive. */
   endsAt: string;
   allDay: boolean;
+  /**
+   * The DTSTART TZID, when the event carries one: the zone its RRULE expands
+   * against, and the only thing that says which calendar date a timed endpoint
+   * is on. Null for an all-day, UTC or floating DTSTART.
+   */
+  timeZone: string | null;
   /** Set on an expanded occurrence of a repeating series. */
   recurrenceId: string | null;
   recurring: boolean;
@@ -104,57 +110,6 @@ function parseProperty(line: string): Property | null {
     }
   }
   return { name: name.toUpperCase(), params, value: line.slice(colon + 1) };
-}
-
-/** The UTC offset, in milliseconds, that `zone` had at `instant`. */
-function zoneOffsetMs(instant: number, zone: string): number {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: zone,
-    hour12: false,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  }).formatToParts(new Date(instant));
-  const field = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? '0');
-  // `hour` comes back as 24 at midnight in some ICU versions; Date.UTC normalises it.
-  const asUtc = Date.UTC(
-    field('year'),
-    field('month') - 1,
-    field('day'),
-    field('hour'),
-    field('minute'),
-    field('second'),
-  );
-  return asUtc - instant;
-}
-
-/**
- * A wall-clock time in a named zone, as a UTC instant.
- *
- * Two passes: the first offset is looked up at the naive instant, the second at
- * the corrected one, which is what makes the hour after a DST change land on
- * the right side of the transition. An unknown zone falls back to UTC rather
- * than throwing — a sync must not fail over one exotic TZID.
- */
-export function zonedToUtc(
-  year: number,
-  month: number,
-  day: number,
-  hour: number,
-  minute: number,
-  second: number,
-  zone: string,
-): string {
-  const naive = Date.UTC(year, month - 1, day, hour, minute, second);
-  try {
-    const corrected = naive - zoneOffsetMs(naive, zone);
-    return new Date(naive - zoneOffsetMs(corrected, zone)).toISOString();
-  } catch {
-    return new Date(naive).toISOString();
-  }
 }
 
 /**
@@ -266,6 +221,7 @@ function parseSingle(lines: string[]): ParsedEvent | null {
     startsAt,
     endsAt,
     allDay,
+    timeZone: start.params.TZID ?? null,
     recurrenceId: recurrenceId ? recurrenceId.value.trim() : null,
     recurring: Boolean(recurrenceId ?? props.get('RRULE') ?? props.get('RDATE')),
     raw: [...ICS_HEADER, ...lines, 'END:VCALENDAR'].join('\r\n'),
@@ -286,13 +242,7 @@ function icsStamp(iso: string, allDay: boolean): string {
 
 /** Render an instant as the wall clock a named TZID expects -- the inverse of `zonedToUtc`. */
 function zonedStamp(iso: string, zone: string): string {
-  const instant = new Date(iso).getTime();
-  try {
-    const wall = new Date(instant + zoneOffsetMs(instant, zone)).toISOString();
-    return icsStamp(wall, false).slice(0, -1);
-  } catch {
-    return icsStamp(iso, false).slice(0, -1);
-  }
+  return zonedWallClock(iso, zone).replace(/[-:]/g, '');
 }
 
 export interface IcsDraft {

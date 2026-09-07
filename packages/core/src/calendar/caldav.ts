@@ -334,7 +334,9 @@ export class CalDavClient implements CalendarClient {
     const master = parseVEvents(current.text).find((event) => event.recurrenceId === null);
     if (!master) throw new CalendarProviderError('the series has no master event to edit');
     const seriesPatch =
-      scope === 'series' ? rebaseSeriesPatch(master, ref, draft, patch) : undefined;
+      scope === 'series'
+        ? rebaseSeriesPatch(master, ref, draft, patch, master.timeZone)
+        : undefined;
     const body = patchIcsEvent(
       current.text,
       draft,

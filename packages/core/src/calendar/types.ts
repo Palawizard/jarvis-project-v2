@@ -9,7 +9,13 @@
  * reconciled, because a local edit that the provider refused never happened.
  */
 
-import { addCalendarDays, calendarDate, diffCalendarDays } from './dates.js';
+import {
+  addCalendarDays,
+  calendarDate,
+  diffCalendarDays,
+  zonedToUtc,
+  zonedWallClock,
+} from './dates.js';
 
 export type CalendarProviderId = 'google' | 'icloud';
 
@@ -120,12 +126,20 @@ const hasOwn = (value: object, key: keyof CalendarEventDraft): boolean =>
  * a 09:00 master at UTC+2 rebased from an occurrence at UTC+1 lands at 23:00
  * on the previous date. So anything touching an all-day side counts whole
  * calendar days between validated `YYYY-MM-DD` components instead.
+ *
+ * `timeZone` is the series' own zone -- the CalDAV master's DTSTART TZID, or
+ * Google's `start.timeZone`. Without it the calendar date of a TIMED endpoint
+ * is unknowable: a master at 01:30 Paris is stored as 23:30Z on the PREVIOUS
+ * day, so reading the date off the UTC text would rebase the whole series one
+ * day early across a DST change. Null means the event really is UTC or
+ * floating, which is the one case where the UTC text is the wall clock.
  */
 export function rebaseSeriesPatch(
-  master: Pick<CalendarEventDraft, 'startsAt'>,
+  master: Pick<CalendarEventDraft, 'startsAt' | 'allDay'>,
   occurrence: Pick<CalendarEventDraft, 'startsAt' | 'endsAt' | 'allDay'>,
   updated: CalendarEventDraft,
   patch: Partial<CalendarEventDraft>,
+  timeZone: string | null = null,
 ): Partial<CalendarEventDraft> {
   const result: Partial<CalendarEventDraft> = {};
   if (hasOwn(patch, 'title')) result.title = updated.title;
@@ -147,12 +161,16 @@ export function rebaseSeriesPatch(
       result.endsAt = new Date(rebasedStart + durationMs).toISOString();
     } else {
       // The master moves by the same number of CALENDAR DAYS the occurrence
-      // moved -- never by the difference between two UTC timestamps.
+      // moved -- never by the difference between two UTC timestamps. An
+      // all-day endpoint is already a lexical date and must never be zone
+      // converted; a timed one only has a date once read in the series' zone.
+      const dateOf = (iso: string, allDay: boolean): string =>
+        allDay || !timeZone ? calendarDate(iso) : zonedWallClock(iso, timeZone).slice(0, 10);
       const shift = diffCalendarDays(
-        calendarDate(updated.startsAt),
-        calendarDate(occurrence.startsAt),
+        dateOf(updated.startsAt, updated.allDay),
+        dateOf(occurrence.startsAt, occurrence.allDay),
       );
-      const anchor = addCalendarDays(calendarDate(master.startsAt), shift);
+      const anchor = addCalendarDays(dateOf(master.startsAt, master.allDay), shift);
       if (updated.allDay) {
         // -> ALL-DAY: exclusive end dates, so a one-day event is anchor + 1.
         const length = Math.max(
@@ -163,8 +181,19 @@ export function rebaseSeriesPatch(
         result.endsAt = `${addCalendarDays(anchor, length)}T00:00:00.000Z`;
       } else {
         // ALL-DAY -> TIMED: the master keeps the shifted date and takes the
-        // wall clock the human just chose for the occurrence.
-        const start = new Date(`${anchor}T${updated.startsAt.slice(11)}`);
+        // WALL CLOCK the human just chose -- read in the series' zone, so a
+        // DST change between the occurrence's date and the master's cannot
+        // move the master's clock by an hour.
+        const clock = (timeZone ? zonedWallClock(updated.startsAt, timeZone) : updated.startsAt)
+          .slice(11, 19)
+          .split(':')
+          .map(Number) as [number, number, number];
+        const [year, month, day] = anchor.split('-').map(Number) as [number, number, number];
+        const start = new Date(
+          timeZone
+            ? zonedToUtc(year, month, day, clock[0], clock[1], clock[2], timeZone)
+            : Date.UTC(year, month - 1, day, clock[0], clock[1], clock[2]),
+        );
         result.startsAt = start.toISOString();
         result.endsAt = new Date(start.getTime() + durationMs).toISOString();
       }

@@ -229,6 +229,9 @@ Rules:
 - For a recurring event, ask whether the user means this occurrence or the entire series before
   sending an update or delete action; set "scope" to their explicit choice.
 - Times must be ISO-8601 instants with an explicit UTC offset. Never invent a missing date.
+- "from"/"to" is a half-open range: prefer the NEXT day's local midnight as "to" (one day is
+  from 2026-09-10T00:00:00+02:00 to 2026-09-11T00:00:00+02:00). An inclusive same-day end such
+  as 23:59:59 is also understood and still returns that day's all-day events.
 - Destructive actions (delete, unregister) are only ever REQUESTS. Jarvis asks
   the human to confirm them; you can neither confirm nor perform them, and you
   must not claim that you did.

@@ -1,4 +1,4 @@
-import { assertCalendarDate, isCalendarDate } from './dates.js';
+import { assertCalendarDate, isCalendarDate, zonedWallClock } from './dates.js';
 import {
   CalendarProviderError,
   rebaseSeriesPatch,
@@ -25,6 +25,8 @@ const MAX_PAGES = 10;
 interface GoogleTime {
   date?: string;
   dateTime?: string;
+  /** The zone a recurring master's wall clock (and its RRULE) is anchored to. */
+  timeZone?: string;
 }
 
 interface GoogleEvent {
@@ -175,14 +177,16 @@ export class GoogleCalendarClient implements CalendarClient {
     let body = toGoogleEvent(draft);
     let etag = ref.etag;
     if (scope === 'series' && ref.seriesId) {
-      const master = toRemoteEvent(
-        await this.#json<GoogleEvent>(
-          'GET',
-          `${this.#eventsUrl()}/${encodeURIComponent(targetId)}`,
-        ),
+      const raw = await this.#json<GoogleEvent>(
+        'GET',
+        `${this.#eventsUrl()}/${encodeURIComponent(targetId)}`,
       );
+      const master = toRemoteEvent(raw);
       if (!master) throw new CalendarProviderError('Google returned an invalid series master');
-      body = toGooglePatch(rebaseSeriesPatch(master, ref, draft, patch));
+      // The master's own zone, which its RRULE expands against. Absent only
+      // when the event really is UTC or floating.
+      const timeZone = raw.start?.timeZone ?? null;
+      body = toGooglePatch(rebaseSeriesPatch(master, ref, draft, patch, timeZone), timeZone);
       etag = master.etag;
     }
     const updated = await this.#json<GoogleEvent>(
@@ -328,7 +332,10 @@ function toGoogleEvent(draft: CalendarEventDraft): Record<string, unknown> {
   };
 }
 
-function toGooglePatch(patch: Partial<CalendarEventDraft>): Record<string, unknown> {
+function toGooglePatch(
+  patch: Partial<CalendarEventDraft>,
+  timeZone: string | null = null,
+): Record<string, unknown> {
   const body: Record<string, unknown> = {};
   if (Object.prototype.hasOwnProperty.call(patch, 'title')) body.summary = patch.title;
   if (Object.prototype.hasOwnProperty.call(patch, 'description')) {
@@ -336,15 +343,19 @@ function toGooglePatch(patch: Partial<CalendarEventDraft>): Record<string, unkno
   }
   if (Object.prototype.hasOwnProperty.call(patch, 'location')) body.location = patch.location;
   if (patch.startsAt && patch.endsAt && patch.allDay !== undefined) {
-    body.start = toGoogleTime(patch.startsAt, patch.allDay);
-    body.end = toGoogleTime(patch.endsAt, patch.allDay);
+    body.start = toGoogleTime(patch.startsAt, patch.allDay, timeZone);
+    body.end = toGoogleTime(patch.endsAt, patch.allDay, timeZone);
   }
   return body;
 }
 
-function toGoogleTime(iso: string, allDay: boolean): GoogleTime {
-  return allDay
-    ? { date: assertCalendarDate(iso.slice(0, 10), 'all-day date') }
+function toGoogleTime(iso: string, allDay: boolean, timeZone: string | null = null): GoogleTime {
+  if (allDay) return { date: assertCalendarDate(iso.slice(0, 10), 'all-day date') };
+  // With the series' zone known, send the wall clock AND the zone: an instant
+  // alone would re-anchor a TZID-bound series to UTC, and RFC 3339 lets the
+  // offset be omitted exactly when `timeZone` supplies it.
+  return timeZone
+    ? { dateTime: zonedWallClock(iso, timeZone), timeZone }
     : { dateTime: new Date(iso).toISOString() };
 }
 

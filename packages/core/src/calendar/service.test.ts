@@ -58,6 +58,95 @@ const draft: CalendarEventDraft = {
   location: 'Office',
 };
 
+/** Exactly the keys a "move this occurrence" edit names. */
+const patchOf = (value: { startsAt: string; endsAt: string; allDay: boolean }) => ({
+  startsAt: value.startsAt,
+  endsAt: value.endsAt,
+  allDay: value.allDay,
+});
+
+/**
+ * A `series`-scoped update against a stubbed provider, returning exactly the
+ * payload the provider was asked to write. Shared by the rebasing tests: what
+ * they assert is the master the provider ends up with.
+ */
+const googlePatch = async (
+  master: Record<string, unknown>,
+  occurrence: { startsAt: string; endsAt: string; allDay: boolean },
+  updated: CalendarEventDraft,
+) => {
+  let sent: Record<string, unknown> = {};
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const target = String(url);
+    if (target.includes('/token')) {
+      return Response.json({ access_token: 'test-token', expires_in: 3600 });
+    }
+    if ((init?.method ?? 'GET') === 'GET') return Response.json(master);
+    sent = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+    return Response.json({ id: 'series', ...master });
+  }) as typeof fetch;
+  try {
+    await new GoogleCalendarClient(
+      { clientId: 'client', clientSecret: 'secret', refreshToken: 'refresh' },
+      'primary',
+    ).update(
+      {
+        remoteId: 'series_20261026',
+        etag: 'occ',
+        raw: null,
+        recurring: true,
+        seriesId: 'series',
+        ...occurrence,
+      },
+      updated,
+      'series',
+      patchOf(updated),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+  return sent;
+};
+
+const davPut = async (
+  master: string[],
+  occurrence: { startsAt: string; endsAt: string; allDay: boolean },
+  updated: CalendarEventDraft,
+) => {
+  const stored = ['BEGIN:VCALENDAR', 'BEGIN:VEVENT', ...master, 'END:VEVENT', 'END:VCALENDAR'].join(
+    '\r\n',
+  );
+  let body = '';
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    if ((init?.method ?? 'GET') === 'GET') return new Response(stored);
+    body = String(init?.body ?? '');
+    return new Response('', { headers: { etag: '"v2"' } });
+  }) as typeof fetch;
+  try {
+    await new CalDavClient(
+      { appleId: 'a@b.c', appPassword: 'pw' },
+      'https://cal.example/work/',
+    ).update(
+      {
+        remoteId: 'https://cal.example/work/series.ics#20261026T090000',
+        etag: 'v1',
+        raw: null,
+        recurring: true,
+        seriesId: 'https://cal.example/work/series.ics',
+        ...occurrence,
+      },
+      updated,
+      'series',
+      patchOf(updated),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+  return body;
+};
+
 describe('calendar mirror', () => {
   it('pulls provider changes and sends every local mutation back first', async () => {
     const db = openDb(loadConfig({ dbPath: ':memory:' }));
@@ -743,6 +832,39 @@ describe('calendar mirror', () => {
       expect([offset, onDay('2026-09-17', offset)]).toEqual([offset, []]);
     }
 
+    // The other shape a model sends for "what do I have on the 10th?": an
+    // INCLUSIVE same-day end. It must select the same day, in every offset.
+    const inclusiveDay = (date: string, offset: string) =>
+      service
+        .events({ from: `${date}T00:00:00.000${offset}`, to: `${date}T23:59:59.000${offset}` })
+        .filter((event) => event.allDay)
+        .map((event) => event.title);
+
+    for (const offset of ['Z', '+02:00', '-05:00', '+14:00', '-11:00']) {
+      expect([offset, inclusiveDay('2026-09-09', offset)]).toEqual([offset, []]);
+      expect([offset, inclusiveDay('2026-09-10', offset)]).toEqual([offset, ['One day']]);
+      expect([offset, inclusiveDay('2026-09-11', offset)]).toEqual([offset, []]);
+      expect([offset, inclusiveDay('2026-09-16', offset)]).toEqual([offset, ['Three days']]);
+      expect([offset, inclusiveDay('2026-09-17', offset)]).toEqual([offset, []]);
+      // Any instant past midnight means that day is being asked about, not
+      // just 23:59:59 -- a midday bound includes the day it names.
+      expect([offset, inclusiveDay('2026-09-10', offset)]).toEqual([offset, ['One day']]);
+    }
+    expect(
+      service
+        .events({ from: '2026-09-10T00:00:00.000Z', to: '2026-09-10T12:00:00.000Z' })
+        .filter((event) => event.allDay)
+        .map((event) => event.title),
+    ).toEqual(['One day']);
+    // Midnight is read lexically: an exclusive next-midnight bound at UTC-11 is
+    // the 11th in UTC, and must still not drag the 11th in.
+    expect(
+      service
+        .events({ from: '2026-09-10T00:00:00.000-11:00', to: '2026-09-11T00:00:00.000-11:00' })
+        .filter((event) => event.allDay)
+        .map((event) => event.title),
+    ).toEqual(['One day']);
+
     // Timed events keep instant semantics: 08:00Z is the 10th in UTC and still
     // the 9th for a caller at UTC-11.
     const timed = (date: string, offset: string) =>
@@ -756,6 +878,17 @@ describe('calendar mirror', () => {
     expect(timed('2026-09-10', 'Z')).toEqual(['Planning']);
     expect(timed('2026-09-10', '-11:00')).toEqual([]);
     expect(timed('2026-09-09', '-11:00')).toEqual(['Planning']);
+    // ...and an inclusive same-day bound must not widen a timed query either:
+    // 08:00Z is inside the 10th at UTC, still outside it at UTC-11.
+    const timedInclusive = (date: string, offset: string) =>
+      service
+        .events({ from: `${date}T00:00:00.000${offset}`, to: `${date}T23:59:59.000${offset}` })
+        .filter((event) => !event.allDay)
+        .map((event) => event.title);
+    expect(timedInclusive('2026-09-10', 'Z')).toEqual(['Planning']);
+    expect(timedInclusive('2026-09-10', '-11:00')).toEqual([]);
+    expect(timedInclusive('2026-09-09', '-11:00')).toEqual(['Planning']);
+    expect(timedInclusive('2026-09-11', 'Z')).toEqual([]);
     db.close();
   });
 
@@ -784,53 +917,6 @@ describe('calendar mirror', () => {
       endsAt: '2026-10-26T10:00:00.000Z',
       allDay: false,
     };
-    // Exactly the keys a "move this occurrence" edit names.
-    const patchOf = (value: { startsAt: string; endsAt: string; allDay: boolean }) => ({
-      startsAt: value.startsAt,
-      endsAt: value.endsAt,
-      allDay: value.allDay,
-    });
-
-    // ---------------------------------------------------------------- Google --
-    const googlePatch = async (
-      master: Record<string, unknown>,
-      occurrence: { startsAt: string; endsAt: string; allDay: boolean },
-      updated: CalendarEventDraft,
-    ) => {
-      let sent: Record<string, unknown> = {};
-      const original = globalThis.fetch;
-      globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-        const target = String(url);
-        if (target.includes('/token')) {
-          return Response.json({ access_token: 'test-token', expires_in: 3600 });
-        }
-        if ((init?.method ?? 'GET') === 'GET') return Response.json(master);
-        sent = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
-        return Response.json({ id: 'series', ...master });
-      }) as typeof fetch;
-      try {
-        await new GoogleCalendarClient(
-          { clientId: 'client', clientSecret: 'secret', refreshToken: 'refresh' },
-          'primary',
-        ).update(
-          {
-            remoteId: 'series_20261026',
-            etag: 'occ',
-            raw: null,
-            recurring: true,
-            seriesId: 'series',
-            ...occurrence,
-          },
-          updated,
-          'series',
-          patchOf(updated),
-        );
-      } finally {
-        globalThis.fetch = original;
-      }
-      return sent;
-    };
-
     // TIMED -> ALL-DAY. Elapsed-instant arithmetic would move the 09:00 (UTC+2)
     // master back to 23:00 on 2026-10-23; the calendar date it is on is the 24th.
     expect(
@@ -863,49 +949,6 @@ describe('calendar mirror', () => {
       end: { dateTime: '2026-10-24T10:00:00.000Z' },
     });
 
-    // ---------------------------------------------------------------- CalDAV --
-    const davPut = async (
-      master: string[],
-      occurrence: { startsAt: string; endsAt: string; allDay: boolean },
-      updated: CalendarEventDraft,
-    ) => {
-      const stored = [
-        'BEGIN:VCALENDAR',
-        'BEGIN:VEVENT',
-        ...master,
-        'END:VEVENT',
-        'END:VCALENDAR',
-      ].join('\r\n');
-      let body = '';
-      const original = globalThis.fetch;
-      globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-        if ((init?.method ?? 'GET') === 'GET') return new Response(stored);
-        body = String(init?.body ?? '');
-        return new Response('', { headers: { etag: '"v2"' } });
-      }) as typeof fetch;
-      try {
-        await new CalDavClient(
-          { appleId: 'a@b.c', appPassword: 'pw' },
-          'https://cal.example/work/',
-        ).update(
-          {
-            remoteId: 'https://cal.example/work/series.ics#20261026T090000',
-            etag: 'v1',
-            raw: null,
-            recurring: true,
-            seriesId: 'https://cal.example/work/series.ics',
-            ...occurrence,
-          },
-          updated,
-          'series',
-          patchOf(updated),
-        );
-      } finally {
-        globalThis.fetch = original;
-      }
-      return body;
-    };
-
     const timedToAllDay = await davPut(
       [
         'UID:series@example',
@@ -936,6 +979,151 @@ describe('calendar mirror', () => {
     expect(allDayToTimed).toContain('DTSTART:20261024T090000');
     expect(allDayToTimed).toContain('DTEND:20261024T100000');
     expect(allDayToTimed).toContain('RRULE:FREQ=DAILY;COUNT=5');
+  });
+
+  it('rebases a series inside the DST offset-crossing band without moving its date', async () => {
+    // Europe/Paris leaves CEST at 03:00 on 2026-10-25 and enters it at 02:00 on
+    // 2026-03-29. A master whose LOCAL clock is earlier than its UTC offset is
+    // stored on the PREVIOUS UTC day -- 01:30 Paris on the 24th is 23:30Z on the
+    // 23rd -- so any arithmetic that reads the date off the UTC text rebases the
+    // whole series one day early. The old 09:00 fixture sat outside that band
+    // and never saw it.
+    const paris = 'Europe/Paris';
+    const timed = (startsAt: string, endsAt: string) => ({ startsAt, endsAt, allDay: false });
+    const wholeDay = (from: string, to: string) => ({
+      startsAt: `${from}T00:00:00.000Z`,
+      endsAt: `${to}T00:00:00.000Z`,
+      allDay: true,
+    });
+
+    // ------------------------------------------------------------- autumn --
+    // Master 2026-10-24 01:30 CEST (23:30Z on the 23rd); the occurrence the
+    // human selected is 2026-10-26 01:30 CET, already on the other side.
+    const autumnOccurrence = timed('2026-10-26T00:30:00.000Z', '2026-10-26T01:30:00.000Z');
+    const autumnAsAllDay = { ...draft, ...wholeDay('2026-10-26', '2026-10-27') };
+
+    // TIMED -> ALL-DAY, Google. The master's date is the 24th in Paris.
+    expect(
+      await googlePatch(
+        {
+          id: 'series',
+          etag: 'master',
+          start: { dateTime: '2026-10-24T01:30:00+02:00', timeZone: paris },
+          end: { dateTime: '2026-10-24T02:30:00+02:00', timeZone: paris },
+        },
+        autumnOccurrence,
+        autumnAsAllDay,
+      ),
+    ).toMatchObject({ start: { date: '2026-10-24' }, end: { date: '2026-10-25' } });
+
+    // TIMED -> ALL-DAY, CalDAV. Same master, addressed by its DTSTART TZID.
+    const autumnDav = await davPut(
+      [
+        'UID:series@example',
+        'DTSTART;TZID=Europe/Paris:20261024T013000',
+        'DTEND;TZID=Europe/Paris:20261024T023000',
+        'RRULE:FREQ=DAILY;COUNT=5',
+        'SUMMARY:Standup',
+      ],
+      autumnOccurrence,
+      autumnAsAllDay,
+    );
+    expect(autumnDav).toContain('DTSTART;VALUE=DATE:20261024');
+    expect(autumnDav).toContain('DTEND;VALUE=DATE:20261025');
+    expect(autumnDav).not.toContain('20261023');
+    expect(autumnDav).toContain('RRULE:FREQ=DAILY;COUNT=5');
+
+    // ALL-DAY -> TIMED, Google. A recurring master always carries the zone its
+    // rule expands against, so the master takes the WALL CLOCK the human chose
+    // (01:30 Paris), not the 00:30 its UTC text happens to read.
+    const autumnAllDayOccurrence = wholeDay('2026-10-26', '2026-10-27');
+    const autumnAsTimed = { ...draft, ...autumnOccurrence };
+    expect(
+      await googlePatch(
+        {
+          id: 'series',
+          etag: 'master',
+          start: { date: '2026-10-24', timeZone: paris },
+          end: { date: '2026-10-25', timeZone: paris },
+        },
+        autumnAllDayOccurrence,
+        autumnAsTimed,
+      ),
+    ).toMatchObject({
+      start: { dateTime: '2026-10-24T01:30:00', timeZone: paris },
+      end: { dateTime: '2026-10-24T02:30:00', timeZone: paris },
+    });
+
+    // ALL-DAY -> TIMED, CalDAV. An all-day DTSTART carries no TZID, so there is
+    // no zone to read the clock in and the stored UTC one is the honest answer
+    // -- but the DATE must still be the 24th.
+    const autumnDavTimed = await davPut(
+      [
+        'UID:series@example',
+        'DTSTART;VALUE=DATE:20261024',
+        'DTEND;VALUE=DATE:20261025',
+        'RRULE:FREQ=DAILY;COUNT=5',
+        'SUMMARY:Standup',
+      ],
+      autumnAllDayOccurrence,
+      autumnAsTimed,
+    );
+    expect(autumnDavTimed).toContain('DTSTART:20261024T003000');
+    expect(autumnDavTimed).toContain('DTEND:20261024T013000');
+    expect(autumnDavTimed).toContain('RRULE:FREQ=DAILY;COUNT=5');
+
+    // ------------------------------------------------------------- spring --
+    // The mirror image: 2026-03-28 00:30 CET is 23:30Z on the 27th, and the
+    // occurrence 2026-03-30 00:30 CEST is 22:30Z on the 29th.
+    const springOccurrence = timed('2026-03-29T22:30:00.000Z', '2026-03-29T23:30:00.000Z');
+    const springAsAllDay = { ...draft, ...wholeDay('2026-03-30', '2026-03-31') };
+
+    expect(
+      await googlePatch(
+        {
+          id: 'series',
+          etag: 'master',
+          start: { dateTime: '2026-03-28T00:30:00+01:00', timeZone: paris },
+          end: { dateTime: '2026-03-28T01:30:00+01:00', timeZone: paris },
+        },
+        springOccurrence,
+        springAsAllDay,
+      ),
+    ).toMatchObject({ start: { date: '2026-03-28' }, end: { date: '2026-03-29' } });
+
+    const springDav = await davPut(
+      [
+        'UID:series@example',
+        'DTSTART;TZID=Europe/Paris:20260328T003000',
+        'DTEND;TZID=Europe/Paris:20260328T013000',
+        'RRULE:FREQ=DAILY;COUNT=5',
+        'SUMMARY:Standup',
+      ],
+      springOccurrence,
+      springAsAllDay,
+    );
+    expect(springDav).toContain('DTSTART;VALUE=DATE:20260328');
+    expect(springDav).toContain('DTEND;VALUE=DATE:20260329');
+    expect(springDav).not.toContain('20260327');
+
+    // ALL-DAY -> TIMED across the spring change: the master keeps the 28th and
+    // the 00:30 wall clock, which is 23:30Z on the 27th -- the case elapsed-UTC
+    // arithmetic gets wrong in both dimensions at once.
+    expect(
+      await googlePatch(
+        {
+          id: 'series',
+          etag: 'master',
+          start: { date: '2026-03-28', timeZone: paris },
+          end: { date: '2026-03-29', timeZone: paris },
+        },
+        wholeDay('2026-03-30', '2026-03-31'),
+        { ...draft, ...springOccurrence },
+      ),
+    ).toMatchObject({
+      start: { dateTime: '2026-03-28T00:30:00', timeZone: paris },
+      end: { dateTime: '2026-03-28T01:30:00', timeZone: paris },
+    });
   });
 
   it('refreshes every CalDAV sibling occurrence onto the new ETag before reporting success', async () => {

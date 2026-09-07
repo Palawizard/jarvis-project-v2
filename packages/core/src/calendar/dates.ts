@@ -85,3 +85,72 @@ export function localIso(date: Date): string {
     `${offset < 0 ? '-' : '+'}${pad(Math.trunc(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`
   );
 }
+
+/** The UTC offset, in milliseconds, that `zone` had at `instant`. */
+function zoneOffsetMs(instant: number, zone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone,
+    hour12: false,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(new Date(instant));
+  const field = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? '0');
+  const asUtc = Date.UTC(
+    field('year'),
+    field('month') - 1,
+    field('day'),
+    field('hour'),
+    field('minute'),
+    field('second'),
+  );
+  return asUtc - instant;
+}
+
+/**
+ * A wall-clock time in a named zone, as a UTC instant.
+ *
+ * Two passes: the first offset is looked up at the naive instant, the second at
+ * the corrected one, which is what makes the hour after a DST change land on
+ * the right side of the transition. An unknown zone falls back to UTC rather
+ * than throwing — a sync must not fail over one exotic TZID.
+ */
+export function zonedToUtc(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+  zone: string,
+): string {
+  const naive = Date.UTC(year, month - 1, day, hour, minute, second);
+  try {
+    const corrected = naive - zoneOffsetMs(naive, zone);
+    return new Date(naive - zoneOffsetMs(corrected, zone)).toISOString();
+  } catch {
+    return new Date(naive).toISOString();
+  }
+}
+
+/**
+ * The wall clock `zone` shows at `iso`, as `YYYY-MM-DDTHH:MM:SS` — the inverse
+ * of `zonedToUtc`, and the only honest way to ask which calendar DATE a timed
+ * instant falls on. `2026-10-23T23:30:00Z` is the 24th at 01:30 in Paris; its
+ * UTC text says the 23rd. Falls back to UTC for an unknown zone.
+ */
+export function zonedWallClock(iso: string, zone: string): string {
+  const instant = new Date(iso);
+  if (Number.isNaN(instant.getTime())) throw new Error(`invalid date: ${iso}`);
+  try {
+    return new Date(instant.getTime() + zoneOffsetMs(instant.getTime(), zone))
+      .toISOString()
+      .slice(0, 19);
+  } catch {
+    return instant.toISOString().slice(0, 19);
+  }
+}

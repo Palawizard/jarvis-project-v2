@@ -1795,17 +1795,32 @@ export class JobPipeline {
     signal: AbortSignal,
   ): Promise<Job> {
     if (job.compiledBrief || job.executionRecommendation || job.validationOnly) return job;
-    const recommendation = await this.advisor.advise({
-      request: job.request,
-      project,
-      selfDevelopment: project.isSelf,
-      ...((await this.continuationFacts(job)) ?? {}),
-      cwd: this.advisorScratchDir(job.id),
-      jobId: job.id,
-      signal,
-    });
-    if (!recommendation) return job;
-    return this.deps.jobs.patch(job.id, { executionRecommendation: recommendation });
+    // TOTAL, by construction. This stage produces ADVICE: the Job is created,
+    // started and implemented whether or not it answers, so nothing that
+    // happens inside it may become the reason a Job failed. The advisor already
+    // returns null for every failure it can name; this catches the ones it
+    // cannot -- a partially wired registry, a scratch directory that cannot be
+    // created -- and falls back to the deterministic policy exactly as a
+    // missing recommendation does.
+    try {
+      const recommendation = await this.advisor.advise({
+        request: job.request,
+        project,
+        selfDevelopment: project.isSelf,
+        ...((await this.continuationFacts(job)) ?? {}),
+        cwd: this.advisorScratchDir(job.id),
+        jobId: job.id,
+        signal,
+      });
+      if (!recommendation) return job;
+      return this.deps.jobs.patch(job.id, { executionRecommendation: recommendation });
+    } catch (error) {
+      log.warn('execution advice failed; falling back to deterministic policy', {
+        jobId: job.id,
+        error: String(error),
+      });
+      return job;
+    }
   }
 
   /**

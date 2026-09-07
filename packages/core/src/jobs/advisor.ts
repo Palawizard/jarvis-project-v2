@@ -195,7 +195,7 @@ export class ExecutionAdvisor {
         memoryProposals: [],
       };
     }
-    this.deps.agents.recordResult(provider.id, result);
+    this.deps.agents.recordResult?.(provider.id, result);
 
     if (input.signal?.aborted || result.status === 'cancelled') {
       return this.failed(input, startedAt, 'cancelled', audit);

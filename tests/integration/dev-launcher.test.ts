@@ -251,7 +251,7 @@ describe('pnpm dev supervisor bootstrap', () => {
       JARVIS_CODEX_BIN: 'C:\\__jarvis_codex_disabled__\\codex.exe',
       JARVIS_CLAUDE_PERMISSION_MODE: 'acceptEdits',
       JARVIS_LOG_LEVEL: 'debug',
-      JARVIS_PROVIDER_COOLDOWN_MS: '1000',
+      JARVIS_PROVIDER_ATTEMPTS: '2',
       JARVIS_WEB_PORT: '',
     });
     expect(preserved).toEqual({
@@ -261,7 +261,7 @@ describe('pnpm dev supervisor bootstrap', () => {
       JARVIS_CODEX_BIN: 'C:\\__jarvis_codex_disabled__\\codex.exe',
       JARVIS_CLAUDE_PERMISSION_MODE: 'acceptEdits',
       JARVIS_LOG_LEVEL: 'debug',
-      JARVIS_PROVIDER_COOLDOWN_MS: '1000',
+      JARVIS_PROVIDER_ATTEMPTS: '2',
     });
     for (const name of RUNTIME_ENV_ALLOWLIST) {
       expect(name).not.toMatch(SECRET_ENV_NAME);

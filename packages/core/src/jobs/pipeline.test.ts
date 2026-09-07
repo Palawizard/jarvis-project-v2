@@ -2464,6 +2464,28 @@ describe('semantic execution advice', () => {
     h.db.close();
   });
 
+  // ADVICE MUST NEVER FAIL A JOB. It did once: the advisor called a registry
+  // method a partially wired registry did not have, the TypeError escaped
+  // `execute`, and a Job that would otherwise have completed paused with a
+  // crash reason. The whole stage is advisory; nothing inside it may become the
+  // reason work stopped.
+  it('completes the Job when the advisor throws', async () => {
+    const h = await harness({
+      review: APPROVES.review,
+      advisor: {
+        advise: async () => {
+          throw new TypeError('agents.recordResult is not a function');
+        },
+      },
+    });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('awaiting_user');
+    expect(job.executionRecommendation).toBeNull();
+    expect(h.provider.calls.find((call) => call.role === 'implementer')?.model).toBe('sonnet');
+    h.db.close();
+  });
+
   it('falls back to the deterministic policy when the advisor returns nothing', async () => {
     const h = await harness({
       review: APPROVES.review,

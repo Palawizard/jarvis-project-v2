@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 /**
  * A LIKE pattern for a term a human typed.
@@ -371,6 +371,32 @@ export const MIGRATIONS = new Map<number, string>([
     // migration keeps exactly the editable behaviour it already had, and the
     // next discovery/connect is what can narrow it.
     `ALTER TABLE calendar_accounts ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;`,
+  ],
+  [
+    17,
+    // HEAD-bound pipeline evidence.
+    //
+    // The Job row already recorded which commit a review approved
+    // (`reviewed_head`) and which one Visual QA passed (`visual_head`). It
+    // recorded nothing about deterministic verification, nothing about a review
+    // that ran successfully and asked for changes, and nothing about the final
+    // gate -- so Resume had no way to tell "this evidence still describes the
+    // current candidate" from "this stage never ran", and re-ran the expensive
+    // one on an unchanged HEAD every time.
+    //
+    // Every column is additive and nullable. A Job written before this
+    // migration reads back with no evidence heads, which is exactly what it
+    // has: its stages ran, but nobody wrote down which commit they described.
+    // The conservative fallback is the old behaviour -- re-run -- so an old Job
+    // still opens, still resumes, and never claims evidence it cannot prove.
+    `ALTER TABLE jobs ADD COLUMN verified_head TEXT;
+    ALTER TABLE jobs ADD COLUMN review_blocked_head TEXT;
+    ALTER TABLE jobs ADD COLUMN final_gate_head TEXT;
+    ALTER TABLE jobs ADD COLUMN visual_attempt_head TEXT;
+    ALTER TABLE jobs ADD COLUMN verification_signature TEXT;
+    ALTER TABLE jobs ADD COLUMN pause_failure_kind TEXT;
+    ALTER TABLE jobs ADD COLUMN execution_recommendation TEXT;
+    CREATE INDEX idx_jobs_verified_head ON jobs(id, verified_head);`,
   ],
 ]);
 

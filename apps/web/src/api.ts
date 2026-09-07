@@ -124,8 +124,20 @@ export interface Job {
   visualFixCycles: number;
   resumeStage: JobStage | null;
   pauseReason: string | null;
+  /** Classified pause cause; null for a product pause. */
+  pauseFailureKind: string | null;
+  /** HEAD-bound evidence: each names the exact commit a stage's result describes. */
+  verifiedHead: string | null;
   reviewedHead: string | null;
+  reviewBlockedHead: string | null;
   visualHead: string | null;
+  visualAttemptHead: string | null;
+  finalGateHead: string | null;
+  executionRecommendation: {
+    capabilityTier: 'normal' | 'strong';
+    effort: 'low' | 'medium' | 'high';
+    reasons: string[];
+  } | null;
   candidateBaseSha: string | null;
   candidateSourceSha: string | null;
   validationOnly: boolean;
@@ -324,7 +336,35 @@ export interface JobDetail {
   contextPacks: ContextPack[];
   project: Project | null;
   staleness: StaleJobReport | null;
+  /** What pressing Resume would actually do. Null unless the Job is paused. */
+  resumePlan: ResumePlan | null;
+  providerHealth: Array<{
+    provider: 'claude' | 'codex';
+    lastFailure: { at: string; kind: string; reset?: string } | null;
+  }>;
   deletionPlan: JobDeletionPlan;
+}
+
+export interface ResumePlan {
+  candidateHead: string | null;
+  recovery: { kind: string; detail: string; options: string[] } | null;
+  plan: {
+    kind:
+      | 'plan'
+      | 'resume_agent'
+      | 'verify'
+      | 'verification_repair'
+      | 'review'
+      | 'review_repair'
+      | 'visual_qa'
+      | 'visual_repair'
+      | 'final_gate'
+      | 'finish'
+      | 'none';
+    reason: string;
+    reusing: string[];
+    recovery: string[];
+  };
 }
 
 export interface CandidateApplication {
@@ -872,6 +912,8 @@ export const api = {
     request<{ started: boolean }>(`/api/jobs/${id}/start`, { method: 'POST' }),
   cancelJob: (id: string) => request<ToolOutcome>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
   resumeJob: (id: string) => request<ToolOutcome>(`/api/jobs/${id}/resume`, { method: 'POST' }),
+  adoptJobHead: (id: string) =>
+    request<ToolOutcome>(`/api/jobs/${id}/adopt-head`, { method: 'POST' }),
   archiveJob: (id: string, archived: boolean) =>
     request<ToolOutcome>(`/api/jobs/${id}/archive`, {
       method: 'POST',

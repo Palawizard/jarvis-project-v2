@@ -1,5 +1,13 @@
 import { useEffect, useState } from 'react';
-import { api, artifactUrl, type ContextPack, type JarvisEvent, type Job } from '../api.ts';
+import {
+  api,
+  artifactUrl,
+  type ContextPack,
+  type JarvisEvent,
+  type Job,
+  type JobDetail,
+  type ResumePlan,
+} from '../api.ts';
 import { useAsync } from '../hooks.ts';
 import {
   Badge,
@@ -130,8 +138,14 @@ export function JobDetailView({
     routingDecisions,
     upgrade,
     staleness,
+    resumePlan,
     deletionPlan,
   } = detail.data;
+  // A Resume that cannot change anything is not a Resume. Saying so before the
+  // button is pressed is the whole point: the old generic button re-ran a full
+  // verification suite and a second reviewer on an unchanged candidate to
+  // arrive back at exactly the same paused state.
+  const resumeUseless = resumePlan?.plan.kind === 'none';
   const review = reviews[reviews.length - 1];
   const implementationRun = runs.findLast(
     (run) => (run.role === 'implementer' || run.role === 'fixer') && !!run.result,
@@ -221,10 +235,46 @@ export function JobDetailView({
             Delete
           </button>
         )}
+        {job.stage === 'paused' &&
+          resumePlan?.recovery?.options.some((option) =>
+            option.startsWith('Adopt current HEAD'),
+          ) && (
+            <button
+              data-testid="adopt-head"
+              className="btn sm danger"
+              onClick={() => {
+                if (
+                  !confirm(
+                    'Make the commit currently in the candidate worktree this Job’s candidate? ' +
+                      'Nothing has reviewed it, and the evidence recorded for the previous ' +
+                      'commit becomes stale.',
+                  )
+                ) {
+                  return;
+                }
+                void api
+                  .adoptJobHead(job.id)
+                  .then((outcome) => {
+                    setActionError(
+                      outcome.status === 'succeeded'
+                        ? null
+                        : `could not adopt the current HEAD (${outcome.status})`,
+                    );
+                    detail.reload();
+                  })
+                  .catch((error: unknown) =>
+                    setActionError(error instanceof Error ? error.message : String(error)),
+                  );
+              }}
+            >
+              Adopt current HEAD
+            </button>
+          )}
         {job.stage === 'paused' && (
           <button
             data-testid="resume-job"
-            className="btn sm primary"
+            className={resumeUseless ? 'btn sm' : 'btn sm primary'}
+            title={resumeUseless ? resumePlan?.plan.reason : undefined}
             onClick={() =>
               void api
                 .resumeJob(job.id)
@@ -331,9 +381,7 @@ export function JobDetailView({
       )}
       {actionError && <div className="alert error">{actionError}</div>}
       {job.stage === 'paused' && (
-        <div className="alert error" role="status" data-testid="pause-explanation">
-          Paused at {job.resumeStage ?? 'unknown stage'}: {job.pauseReason ?? job.error}
-        </div>
+        <PausedPanel job={job} plan={resumePlan} providerHealth={detail.data.providerHealth} />
       )}
       {staleness?.stale && (
         <div className="alert error" role="status" data-testid="stale-job">
@@ -1093,6 +1141,102 @@ function CompiledBrief({ brief }: { brief: NonNullable<Job['compiledBrief']> }) 
         </div>
       )}
     </Card>
+  );
+}
+
+/** How a transition kind reads to a person about to press Resume. */
+const TRANSITION_LABEL: Record<ResumePlan['plan']['kind'], string> = {
+  plan: 'create the candidate worktree and run the implementer',
+  resume_agent: 'continue the interrupted agent run',
+  verify: 'run deterministic verification',
+  verification_repair: 'run a verification fixer',
+  review: 'run the independent code review',
+  review_repair: 'run one batch fixer for the review findings',
+  visual_qa: 'run interactive Visual QA',
+  visual_repair: 'run the visual fixer',
+  final_gate: 'run the closing verification gate',
+  finish: 'hand the candidate over for approval',
+  none: 'nothing — no automatic transition can make progress',
+};
+
+/**
+ * What a paused Job is actually waiting for.
+ *
+ * Everything here is recorded state, and the "Resume will" line is computed by
+ * the same planner the pipeline runs — so it cannot promise something different
+ * from what the button does. The evidence rows exist because "verification
+ * passed" and "verification passed ON THIS COMMIT" are different claims, and
+ * only the second one means Resume can skip it.
+ */
+function PausedPanel({
+  job,
+  plan,
+  providerHealth,
+}: {
+  job: Job;
+  plan: ResumePlan | null;
+  providerHealth: JobDetail['providerHealth'];
+}) {
+  const head = plan?.candidateHead ?? job.headRef;
+  const at = (value: string | null): string =>
+    value && head && value === head ? `on ${value.slice(0, 8)}` : value ? 'stale' : 'none';
+  const failures = providerHealth.filter((entry) => entry.lastFailure);
+  return (
+    <div className="alert error" role="status" data-testid="pause-explanation">
+      <div>
+        <strong>
+          Paused at {job.resumeStage ?? 'unknown stage'}
+          {job.pauseFailureKind ? ` — provider ${job.pauseFailureKind}` : ''}
+        </strong>
+      </div>
+      <div style={{ whiteSpace: 'pre-wrap', marginTop: 4 }}>{job.pauseReason ?? job.error}</div>
+      <div className="mem-meta" style={{ marginTop: 8 }} data-testid="pause-evidence">
+        <span>candidate {head ? head.slice(0, 8) : 'none'}</span>
+        <span>verification {at(job.verifiedHead)}</span>
+        <span>
+          review{' '}
+          {job.reviewedHead && job.reviewedHead === head
+            ? `approved ${head.slice(0, 8)}`
+            : job.reviewBlockedHead && job.reviewBlockedHead === head
+              ? 'changes requested'
+              : at(job.reviewedHead)}
+        </span>
+        {job.visualAttemptHead && <span>visual QA {job.visualQaStatus ?? 'recorded'}</span>}
+        <span>
+          repair budgets — verification {job.fixCycles}, review {job.reviewFixCycles}, visual{' '}
+          {job.visualFixCycles}
+        </span>
+      </div>
+      {failures.length > 0 && (
+        <div className="small dim" style={{ marginTop: 6 }}>
+          last provider failure —{' '}
+          {failures
+            .map(
+              (entry) =>
+                `${entry.provider}: ${entry.lastFailure?.kind}` +
+                (entry.lastFailure?.reset ? ` (reported reset ${entry.lastFailure.reset})` : ''),
+            )
+            .join('; ')}
+          . Informational only: Resume may retry any provider immediately.
+        </div>
+      )}
+      {plan && (
+        <div style={{ marginTop: 8 }} data-testid="resume-plan">
+          <strong>Resume will {TRANSITION_LABEL[plan.plan.kind]}.</strong>
+          <div className="small">{plan.plan.reason}</div>
+          {plan.plan.reusing.length > 0 && (
+            <div className="small dim">Reused, not re-run: {plan.plan.reusing.join(' · ')}</div>
+          )}
+          {plan.plan.recovery.length > 0 && (
+            <ul className="small" style={{ marginBottom: 0 }}>
+              {plan.plan.recovery.map((option) => (
+                <li key={option}>{option}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 

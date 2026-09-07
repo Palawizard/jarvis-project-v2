@@ -11,13 +11,16 @@ import type { AgentEvent, AgentRole } from './types.js';
  * the filesystem to "check" its answer is a coding agent nobody asked for. The
  * brief compiler is the same shape: it restates an already-authorised request
  * into a bounded schema, and a compiler that could go and read the repository
- * would be an implementer that runs before the Job exists.
+ * would be an implementer that runs before the Job exists. The execution advisor
+ * answers one bounded question -- how much model does this Job need -- from
+ * trusted structured facts, and has even less to reach for.
  */
 const TOOL_FREE_ROLES: ReadonlySet<AgentRole> = new Set<AgentRole>([
   'chat',
   'router',
   'autostart_verifier',
   'brief_compiler',
+  'execution_advisor',
 ]);
 
 export function isToolFreeRole(role: AgentRole): boolean {

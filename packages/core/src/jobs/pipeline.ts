@@ -1,5 +1,6 @@
 import type { Db } from '../db/index.js';
 import fs from 'node:fs';
+import path from 'node:path';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
@@ -30,9 +31,18 @@ import {
 import { InteractiveVisualQaAgent } from '../visualqa/agent.js';
 import { VISUAL_QA_BUDGET } from '../visualqa/interactive.js';
 import { startCandidateRuntime } from '../runtime/candidate.js';
-import { GitWorkspace, repoStatus } from '../git/workspace.js';
+import { GitWorkspace, isAncestor, repoStatus } from '../git/workspace.js';
 import { MEMORY_PROPOSAL_INSTRUCTIONS } from '../agents/proposals.js';
 import { renderBrief } from './brief.js';
+import { ExecutionAdvisor, type ContinuationFacts } from './advisor.js';
+import {
+  evidenceFor,
+  planNextTransition,
+  staleEvidencePatch,
+  verificationProgress,
+  verificationSignature,
+  type NextTransition,
+} from './evidence.js';
 import {
   proposalToInput,
   type AgentEvent,
@@ -61,6 +71,39 @@ export interface PipelineDeps {
   review: ReviewEngine;
   visualQa?: VisualQaEngine;
   visualAgent?: InteractiveVisualQaAgent;
+  /**
+   * Semantic execution advice for a Job created without a compiled brief.
+   * Optional so the pipeline stays constructible in isolation; when it is
+   * absent the deterministic policy decides, exactly as it always did.
+   */
+  advisor?: ExecutionAdvisor;
+}
+
+/** Why a paused candidate cannot simply be resumed, and what to do instead. */
+export type CandidateAssessment =
+  | {
+      ok: true;
+      head: string;
+      /**
+       * The worktree is on a commit this Job has not recorded, but the run that
+       * was interrupted was one Jarvis itself launched into this worktree. The
+       * commit is the candidate; the caller records it. See case B.
+       */
+      trustedAgentChange?: boolean;
+    }
+  | {
+      ok: false;
+      kind: 'no_checkpoint' | 'workspace_invalid' | 'dirty_worktree' | 'external_head_change';
+      head?: string;
+      detail: string;
+      recovery: string[];
+    };
+
+/** What pressing Resume on this Job would actually do. */
+export interface ResumePlan {
+  candidateHead: string | null;
+  recovery: { kind: string; detail: string; options: string[] } | null;
+  plan: NextTransition;
 }
 
 /** One agent stage's outcome, including *why* it failed if it did. */
@@ -111,6 +154,7 @@ export class JobPipeline {
   private readonly git: GitWorkspace;
   private readonly visualQa: VisualQaEngine;
   private readonly visualAgent: InteractiveVisualQaAgent;
+  private readonly advisor: ExecutionAdvisor;
   private readonly running = new Map<string, AbortController>();
 
   constructor(private readonly deps: PipelineDeps) {
@@ -127,6 +171,9 @@ export class JobPipeline {
         this.config.artifactsDir,
         deps.bus,
       );
+    this.advisor =
+      deps.advisor ??
+      new ExecutionAdvisor({ config: this.config, agents: deps.agents, bus: deps.bus });
   }
 
   private async runCandidateGates(input: {
@@ -146,6 +193,8 @@ export class JobPipeline {
     let provider = input.implementerProvider;
     let infrastructureAttempts = 0;
     let verificationMutationCycles = 0;
+    /** Failure count of the previous full verification, for the progress gate. */
+    let previousFailures: number | null = null;
     /** Set only by a visual repair, so the recheck verifies the fix, not the app. */
     let recheckGoals: string[] = [];
     let verificationCycle =
@@ -164,12 +213,33 @@ export class JobPipeline {
       let report: VerificationReport;
       let verifiedHead = '';
       for (;;) {
+        // EVIDENCE REUSE. A verification report is a statement about one exact
+        // tree. If the Job row says this commit passed and the commit has not
+        // moved, running the suite again would spend minutes re-deriving an
+        // answer already on disk -- which is exactly what made Resume so
+        // expensive: a Job that paused waiting for a reviewer re-ran the entire
+        // deterministic gate before it was allowed to try the reviewer again.
+        const headNow = await this.git.resolveCommit(input.cwd, 'HEAD');
+        const reusable =
+          job.verifiedHead === headNow ? verification.latestRepairableReport(jobId) : null;
+        if (reusable?.passed) {
+          report = reusable;
+          verifiedHead = headNow;
+          this.deps.bus.emit({
+            type: 'job.evidence.reused',
+            jobId,
+            payload: { stage: 'verification', head: headNow, checks: reusable.ran },
+          });
+          break;
+        }
+
         const verificationPatch = {
           pauseReason: null,
           error: null,
           restartReason: null,
           repairKind: null,
           repairCheckpoint: null,
+          pauseFailureKind: null,
         };
         if (job.stage === 'verifying') jobs.patch(jobId, verificationPatch);
         else jobs.transition(jobId, 'verifying', verificationPatch);
@@ -212,12 +282,21 @@ export class JobPipeline {
             return;
           }
         }
-        if (report.passed) break;
+        if (report.passed) {
+          // The evidence head is written HERE and nowhere else: at the moment a
+          // real run proved this exact commit, using the commit that was read
+          // before the run and re-asserted by `validateCandidate` after it.
+          job = jobs.patch(jobId, { verifiedHead, verificationSignature: null });
+          break;
+        }
         if (report.failureKind === 'cancelled') {
           jobs.transition(jobId, 'cancelled');
           return;
         }
         if (report.failureKind === 'infrastructure') {
+          // Infrastructure spends an ATTEMPT, never a product repair cycle:
+          // nothing about the candidate caused it, and a fixer sent at the
+          // source would be editing code to fix a missing executable.
           if (infrastructureAttempts < this.config.pipeline.verificationInfraRetries) {
             infrastructureAttempts += 1;
             this.deps.bus.emit({
@@ -227,9 +306,10 @@ export class JobPipeline {
             });
             continue;
           }
-          this.pause(
+          this.pauseInfrastructure(
             jobId,
             'verifying',
+            'unavailable',
             `Verification infrastructure attempts exhausted (${infrastructureAttempts + 1} total).\n\n${report.failureSummary}`,
           );
           return;
@@ -242,17 +322,44 @@ export class JobPipeline {
           );
           return;
         }
-        if (job.fixCycles >= this.config.pipeline.maxFixCycles) {
+        // PROGRESS-AWARE REPAIR. A bare counter was wrong in both directions:
+        // it paused a Job that had gone from "unit and integration both fail"
+        // to "two stale unit assertions" -- real progress one more fixer would
+        // have finished -- and it happily spent a second fixer on a failure
+        // that had not moved at all. The budget still bounds the loop; the
+        // signature decides whether the next run inside it can achieve anything.
+        const signature = verificationSignature(report);
+        const failures = report.results.filter((result) => result.status !== 'passed').length;
+        const progress = verificationProgress({
+          cycle: job.fixCycles,
+          previousSignature: job.verificationSignature,
+          signature,
+          ...(previousFailures !== null ? { previousFailures } : {}),
+          failures,
+        });
+        previousFailures = failures;
+        job = jobs.patch(jobId, { verificationSignature: signature });
+        if (job.fixCycles >= this.config.pipeline.maxFixCycles || !progress.progressed) {
           this.pause(
             jobId,
             'verifying',
-            report.failureSummary || 'deterministic verification failed',
+            [
+              job.fixCycles >= this.config.pipeline.maxFixCycles
+                ? `Verification repair budget spent (${job.fixCycles} of ` +
+                  `${this.config.pipeline.maxFixCycles} product fixers).`
+                : `No further automatic repair: ${progress.reason}.`,
+              report.failureSummary || 'deterministic verification failed',
+            ]
+              .filter(Boolean)
+              .join('\n\n'),
           );
           return;
         }
         const cycle = job.fixCycles + 1;
+        // The budget is deliberately NOT charged here. A fixer that never ran --
+        // because every provider was rate-limited -- must not consume a product
+        // repair cycle; the counter is written once the fixer has completed.
         jobs.transition(jobId, 'fixing', {
-          fixCycles: cycle,
           repairKind: 'verification',
           repairCheckpoint: {
             kind: 'verification',
@@ -287,19 +394,20 @@ export class JobPipeline {
           return;
         }
         if (fixed.status !== 'completed') {
-          this.pause(
+          this.pauseInfrastructure(
             jobId,
             'fixing',
+            fixed.failureKind,
             `${agentStagePauseReason(fixed, 'verification fixer provider attempts exhausted')}\n\n${report.failureSummary}`,
           );
           return;
         }
         provider = fixed.provider;
         await this.git.commitPending(input.cwd, `jarvis: verification fix ${cycle}`);
-        job = jobs.patch(jobId, {
-          reviewedHead: null,
-          visualHead: null,
-          headRef: await this.git.resolveCommit(input.cwd, 'HEAD'),
+        // Charged now, and only now: a product repair cycle counts a fixer that
+        // actually ran against real deterministic evidence.
+        job = this.moveCandidate(jobId, await this.git.resolveCommit(input.cwd, 'HEAD'), {
+          fixCycles: cycle,
           repairKind: null,
           repairCheckpoint: null,
         });
@@ -318,11 +426,7 @@ export class JobPipeline {
             return;
           }
           verificationMutationCycles += 1;
-          job = jobs.patch(jobId, {
-            headRef: headAfterVerification,
-            reviewedHead: null,
-            visualHead: null,
-          });
+          job = this.moveCandidate(jobId, headAfterVerification);
           continue;
         }
       }
@@ -334,43 +438,90 @@ export class JobPipeline {
             job.candidateSourceSha as string,
           )
         : await this.git.validateCandidate(input.cwd, job.baseRef as string, verifiedHead);
-      job = jobs.patch(jobId, { headRef: changes.head, reviewedHead: null, visualHead: null });
-
-      const session = job.sessionId ? sessions.get(job.sessionId) : null;
-      const reviewerPack = await context.build({
-        role: 'reviewer',
-        query: `${job.goal}\n${job.request}`,
-        projectId: input.project.id,
-        sessionId: job.sessionId,
-        jobId,
-        projectSnapshot: renderProjectSnapshot(input.project),
-        sessionState: session ? sessions.renderState(session.state) : null,
-      });
+      job = this.moveCandidate(jobId, changes.head);
       jobs.transition(jobId, 'reviewing');
-      const reviewResult = await review.review({
-        jobId,
-        cwd: input.cwd,
-        request: job.request,
-        goal: job.goal,
-        acceptance: job.acceptance,
-        diff: changes.diff,
-        files: changes.files,
-        verification: report,
-        contextPack: reviewerPack.rendered,
-        contextPackId: reviewerPack.id,
-        ...(provider ? { implementerProvider: provider } : {}),
-        implementerSummary: input.implementerSummary,
-        headRef: changes.head,
-        signals: {
-          ...briefSignals(job),
-          ...(input.project.isSelf ? { selfDevelopment: true } : {}),
-        },
-        signal: input.signal,
-      });
-      if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
-      if (reviewResult.verdict === 'error') {
-        this.pause(jobId, 'reviewing', reviewResult.summary);
-        return;
+
+      // NEVER REVIEW THE SAME UNCHANGED CANDIDATE TWICE.
+      //
+      // A review is a judgement about one exact tree, and a second independent
+      // reviewer looking at that same tree can only re-derive it -- at full
+      // reviewer cost. Both outcomes count as evidence: an approval AND a
+      // request for changes. The one that does NOT is a reviewer that failed on
+      // quota, capacity, timeout or a protocol error, because no review
+      // happened; those write no evidence head and Resume is free to try again.
+      const evidence = evidenceFor(jobs.get(jobId) as Job, changes.head);
+      let reviewResult =
+        evidence.reviewApproved || evidence.reviewBlocked
+          ? (review
+              .list(jobId)
+              .findLast((row) => row.headRef === changes.head && row.verdict !== 'error') ?? null)
+          : null;
+      if (reviewResult) {
+        this.deps.bus.emit({
+          type: 'job.evidence.reused',
+          jobId,
+          payload: {
+            stage: 'code_review',
+            head: changes.head,
+            verdict: reviewResult.verdict,
+            findings: reviewResult.findings.length,
+          },
+        });
+      } else {
+        const session = job.sessionId ? sessions.get(job.sessionId) : null;
+        const reviewerPack = await context.build({
+          role: 'reviewer',
+          query: `${job.goal}\n${job.request}`,
+          projectId: input.project.id,
+          sessionId: job.sessionId,
+          jobId,
+          projectSnapshot: renderProjectSnapshot(input.project),
+          sessionState: session ? sessions.renderState(session.state) : null,
+        });
+        reviewResult = await review.review({
+          jobId,
+          cwd: input.cwd,
+          request: job.request,
+          goal: job.goal,
+          acceptance: job.acceptance,
+          diff: changes.diff,
+          files: changes.files,
+          verification: report,
+          contextPack: reviewerPack.rendered,
+          contextPackId: reviewerPack.id,
+          ...(provider ? { implementerProvider: provider } : {}),
+          implementerSummary: input.implementerSummary,
+          headRef: changes.head,
+          signals: {
+            ...briefSignals(job),
+            ...(input.project.isSelf ? { selfDevelopment: true } : {}),
+          },
+          signal: input.signal,
+        });
+        if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
+        if (reviewResult.verdict === 'error') {
+          // Infrastructure, not a verdict. No evidence head is written, no
+          // review repair cycle is spent, and the verification evidence above
+          // stays valid -- a reviewer that could not run says nothing about
+          // whether the checks passed.
+          this.pauseInfrastructure(
+            jobId,
+            'reviewing',
+            // The summary carries the provider's own (redacted) wording, which
+            // is the only place a quota or capacity outage is distinguishable
+            // from a broken structured answer.
+            classifyAgentFailure({ status: 'failed', error: reviewResult.summary }),
+            reviewResult.summary,
+          );
+          return;
+        }
+        const found = reviewResult.findings.filter((finding) =>
+          this.config.pipeline.codeReviewBlockingSeverities.includes(finding.severity),
+        );
+        job = jobs.patch(
+          jobId,
+          found.length ? { reviewBlockedHead: changes.head } : { reviewedHead: changes.head },
+        );
       }
       const blockers = reviewResult.findings.filter((finding) =>
         this.config.pipeline.codeReviewBlockingSeverities.includes(finding.severity),
@@ -389,8 +540,10 @@ export class JobPipeline {
           return;
         }
         const cycle = job.reviewFixCycles + 1;
+        // Not charged here: a review repair cycle counts a fixer that actually
+        // ran against real findings, so a provider outage before it starts
+        // leaves the budget intact for a later Resume.
         jobs.transition(jobId, 'fixing', {
-          reviewFixCycles: cycle,
           repairKind: 'code_review',
           repairCheckpoint: {
             kind: 'code_review',
@@ -425,24 +578,26 @@ export class JobPipeline {
           return;
         }
         if (fixed.status !== 'completed') {
-          this.pause(
+          this.pauseInfrastructure(
             jobId,
             'fixing',
+            fixed.failureKind,
             `${agentStagePauseReason(fixed, 'code-review fixer provider attempts exhausted')}\n\n${renderCodeBlockers(blockers)}`,
           );
           return;
         }
         provider = fixed.provider;
         await this.git.commitPending(input.cwd, `jarvis: code review fix ${cycle}`);
-        jobs.patch(jobId, {
-          reviewedHead: null,
-          visualHead: null,
+        // The batch fixer ran against real findings: charge the cycle, move the
+        // candidate, and let the loop re-verify and take ONE fresh final review
+        // on the commit that actually changed.
+        this.moveCandidate(jobId, await this.git.resolveCommit(input.cwd, 'HEAD'), {
+          reviewFixCycles: cycle,
           repairKind: null,
           repairCheckpoint: null,
         });
         continue;
       }
-      job = jobs.patch(jobId, { reviewedHead: changes.head });
 
       const changedFiles = changes.files.map((file) => file.path);
 
@@ -451,13 +606,44 @@ export class JobPipeline {
       // browser and never spends a visual model turn.
       const eligibility = visualQaEligibility({ job, project: input.project, changedFiles });
       let visualStatus: NonNullable<Job['visualQaStatus']> = 'skipped';
+      // Read fresh: the review branch above may have written to the row, and
+      // "has a browser already looked at THIS commit" has to be answered from
+      // what is persisted now, not from a copy taken before the review.
+      job = jobs.get(jobId) as Job;
+      const visualEvidence = evidenceFor(job, changes.head);
       if (!eligibility.eligible) {
-        job = jobs.patch(jobId, { visualQaStatus: 'skipped' });
+        job = jobs.patch(jobId, {
+          visualQaStatus: 'skipped',
+          visualAttemptHead: changes.head,
+        });
         this.deps.bus.emit({
           type: 'visual_qa.skipped',
           jobId,
           payload: { reason: eligibility.reason, changedFiles },
         });
+      } else if (visualEvidence.visualAttempted) {
+        // A browser has already been driven against this exact commit. Driving
+        // it again cannot see anything different, and it is the most expensive
+        // stage in the pipeline.
+        visualStatus = job.visualQaStatus ?? 'skipped';
+        this.deps.bus.emit({
+          type: 'job.evidence.reused',
+          jobId,
+          payload: { stage: 'visual_qa', head: changes.head, status: visualStatus },
+        });
+        if (visualStatus === 'product_defect') {
+          // Reachable only defensively: the transition planner refuses to enter
+          // the gates at all when a defect stands and its repair budget is
+          // spent. Pausing here rather than continuing keeps the invariant that
+          // an evidenced product defect never reaches the final gate.
+          this.pause(
+            jobId,
+            'visual_qa',
+            'Visual QA found a product defect on this exact candidate and its repair budget ' +
+              'is spent. Resume cannot improve an unchanged candidate.',
+          );
+          return;
+        }
       } else {
         // Changed-surface planning is now a HINT source, never a coverage
         // contract. A catalog that cannot map the diff costs the agent some
@@ -581,7 +767,10 @@ export class JobPipeline {
           if (job.visualFixCycles >= maxVisualCycles) {
             // The single repair cycle is spent. This is a real, evidenced
             // product defect, so it pauses for a human rather than looping.
-            jobs.patch(jobId, { visualQaStatus: 'product_defect' });
+            jobs.patch(jobId, {
+              visualQaStatus: 'product_defect',
+              visualAttemptHead: changes.head,
+            });
             this.pause(jobId, 'visual_qa', renderVisualBlockers(visual));
             return;
           }
@@ -593,8 +782,8 @@ export class JobPipeline {
             .map((check) => check.goal)
             .slice(0, 8);
           jobs.transition(jobId, 'fixing', {
-            visualFixCycles: cycle,
             visualQaStatus: 'product_defect',
+            visualAttemptHead: changes.head,
             repairKind: 'visual',
             repairCheckpoint: {
               kind: 'visual',
@@ -630,18 +819,18 @@ export class JobPipeline {
             return;
           }
           if (fixed.status !== 'completed') {
-            this.pause(
+            this.pauseInfrastructure(
               jobId,
               'fixing',
+              fixed.failureKind,
               `${agentStagePauseReason(fixed, 'visual fixer provider attempts exhausted')}\n\n${renderVisualBlockers(visual)}`,
             );
             return;
           }
           provider = fixed.provider;
           await this.git.commitPending(input.cwd, `jarvis: visual fix ${cycle}`);
-          jobs.patch(jobId, {
-            reviewedHead: null,
-            visualHead: null,
+          this.moveCandidate(jobId, await this.git.resolveCommit(input.cwd, 'HEAD'), {
+            visualFixCycles: cycle,
             repairKind: null,
             repairCheckpoint: null,
           });
@@ -650,7 +839,11 @@ export class JobPipeline {
 
         if (visual.verdict === 'pass') {
           visualStatus = 'passed';
-          jobs.patch(jobId, { visualHead: changes.head, visualQaStatus: 'passed' });
+          jobs.patch(jobId, {
+            visualHead: changes.head,
+            visualAttemptHead: changes.head,
+            visualQaStatus: 'passed',
+          });
         } else {
           // Inconclusive or infrastructure after the one retry. Neither is a
           // product defect and neither may reach a source fixer, so the Job
@@ -658,7 +851,15 @@ export class JobPipeline {
           // never recorded as a visual pass, and `visualHead` stays null.
           visualStatus =
             visual.verdict === 'infrastructure_error' ? 'infrastructure_error' : 'inconclusive';
-          jobs.patch(jobId, { visualQaStatus: visualStatus });
+          // `visualAttemptHead` is still written: the two attempts this stage is
+          // allowed have been spent on this exact commit, and a Resume that ran
+          // them again would spend a browser and a visual model turn to reach
+          // the same unjudged answer. `visualHead` deliberately stays null --
+          // this is not a pass and approval must keep seeing that.
+          jobs.patch(jobId, {
+            visualQaStatus: visualStatus,
+            visualAttemptHead: changes.head,
+          });
           log.warn('visual QA could not judge the candidate', {
             jobId,
             verdict: visual.verdict,
@@ -701,7 +902,13 @@ export class JobPipeline {
       const finalSteps = (input.project.config.verification?.steps ?? []).filter(
         (step) => step.kind === 'final',
       );
-      if (finalSteps.length > 0) {
+      if (finalSteps.length > 0 && (jobs.get(jobId) as Job).finalGateHead === changes.head) {
+        this.deps.bus.emit({
+          type: 'job.evidence.reused',
+          jobId,
+          payload: { stage: 'final_gate', head: changes.head },
+        });
+      } else if (finalSteps.length > 0) {
         const finalReport = await verification.run({
           jobId,
           cwd: input.cwd,
@@ -729,6 +936,7 @@ export class JobPipeline {
           );
           return;
         }
+        jobs.patch(jobId, { finalGateHead: changes.head });
       }
 
       const episodeId = await this.consolidate({
@@ -833,9 +1041,11 @@ export class JobPipeline {
         });
         return;
       }
-      // The target may have moved on since this candidate was checkpointed —
+      // The TARGET may have moved on since this candidate was checkpointed —
       // exactly what happens after Jarvis self-updates. Old reviewed work must
-      // not be resumed against a repository it has never seen.
+      // not be resumed against a repository it has never seen. This one stays a
+      // refusal: a candidate is only meaningful relative to the base it
+      // branched from, and "restart against the current base" is the answer.
       const target = await repoStatus(project.rootPath);
       if (target.head && target.head !== job.baseRef) {
         const detail =
@@ -850,13 +1060,74 @@ export class JobPipeline {
         });
         return;
       }
-      await this.git.validateRecoveryWorkspace({
-        repoRoot: project.rootPath,
-        worktreePath: job.worktreePath,
-        baseRef: job.baseRef,
-        expectedHead: job.headRef,
-        allowDirty: resumeStage === 'implementing' || resumeStage === 'fixing',
+
+      // The CANDIDATE worktree, which is a different question with a different
+      // answer. An unexpected HEAD here used to throw, and the throw became a
+      // permanent "Resume refused" on the Job row: a Job whose agent had
+      // legitimately committed, or whose candidate a human had deliberately
+      // moved, was unrecoverable without editing the database. HEAD binding is
+      // still strict — nothing is adopted silently — but a mismatch is now a
+      // recovery decision with named options rather than a dead end.
+      const recovery = await this.assessCandidate(job, project);
+      if (recovery.ok && recovery.trustedAgentChange) {
+        // Deliberately not reassigning `job`: the fields this block already
+        // proved non-null (worktree, base) are unchanged, and only `headRef`
+        // and the evidence move. `runCandidateGates` re-reads the row.
+        this.moveCandidate(jobId, recovery.head);
+        bus.emit({
+          type: 'system.recovery',
+          jobId,
+          payload: { reason: 'interrupted_agent_commit', worktreeHead: recovery.head },
+        });
+      }
+      if (!recovery.ok) {
+        const detail = [recovery.detail, '', 'Available recovery paths:', ...recovery.recovery]
+          .join('\n')
+          .slice(0, 20_000);
+        jobs.patch(jobId, { pauseReason: detail, error: detail });
+        bus.emit({
+          type: 'system.recovery',
+          jobId,
+          payload: {
+            reason: recovery.kind,
+            expectedHead: job.headRef,
+            ...(recovery.head ? { worktreeHead: recovery.head } : {}),
+          },
+        });
+        return;
+      }
+
+      // THE TRANSITION PLANNER. Resume no longer means "run the stage I was
+      // paused in": it means "do the next thing that can actually change
+      // something", computed from the evidence bound to this exact commit.
+      const plan = await this.planFor(job, project, recovery.head);
+      bus.emit({
+        type: 'job.transition.planned',
+        jobId,
+        payload: {
+          transition: plan.kind,
+          reason: plan.reason,
+          candidateHead: recovery.head,
+          reusing: plan.reusing,
+        },
       });
+      if (plan.kind === 'none') {
+        const detail = [
+          plan.reason + '.',
+          '',
+          `Candidate HEAD: ${recovery.head.slice(0, 8)}`,
+          plan.reusing.length ? `Still valid: ${plan.reusing.join(', ')}` : '',
+          '',
+          'Resume cannot make progress on an unchanged candidate.',
+          ...plan.recovery.map((option) => `- ${option}`),
+        ]
+          .filter((line) => line !== undefined)
+          .join('\n')
+          .slice(0, 20_000);
+        jobs.patch(jobId, { pauseReason: detail, error: detail });
+        return;
+      }
+
       const pack = await context.build({
         role: 'implementer',
         query: `${job.goal}\n${job.request}`,
@@ -873,7 +1144,7 @@ export class JobPipeline {
           .at(-1)?.result ?? 'resumed candidate';
       let provider = job.lastProvider ?? undefined;
       let runId = jobs.runs(jobId).at(-1)?.id ?? '';
-      if (resumeStage === 'implementing' || resumeStage === 'fixing') {
+      if (plan.kind === 'resume_agent') {
         let role: 'implementer' | 'fixer' | 'visual_fixer' = 'implementer';
         let prompt = buildResumePrompt(job, resumeStage);
         let imagePaths: string[] | undefined;
@@ -958,6 +1229,7 @@ export class JobPipeline {
           pauseReason: null,
           error: null,
           restartReason: null,
+          pauseFailureKind: null,
         });
         const resumed = await this.runAgentStage({
           jobId,
@@ -982,16 +1254,16 @@ export class JobPipeline {
           return;
         }
         if (resumed.status !== 'completed') {
-          this.pause(
+          this.pauseInfrastructure(
             jobId,
             resumeStage,
+            resumed.failureKind,
             agentStagePauseReason(resumed, 'resumed agent stage exhausted'),
           );
           return;
         }
         await this.git.commitPending(job.worktreePath, `jarvis: resume ${resumeStage}`);
-        jobs.patch(jobId, {
-          headRef: await this.git.resolveCommit(job.worktreePath, 'HEAD'),
+        this.moveCandidate(jobId, await this.git.resolveCommit(job.worktreePath, 'HEAD'), {
           repairKind: null,
           repairCheckpoint: null,
         });
@@ -1085,6 +1357,15 @@ export class JobPipeline {
       });
       return;
     }
+
+    // SEMANTIC EXECUTION ADVICE, for a Job that has no compiled brief to carry
+    // it. On the chat path the Brief Compiler already answered this as a field
+    // of a call that was happening anyway, so this must not run there — the
+    // condition is exactly "there is no brief", and a brief whose optional
+    // advice is missing or malformed still counts as one. That is not a
+    // provider outage: the deterministic policy simply decides, as it always
+    // did. Persisted, so a later Resume never pays for it twice.
+    job = await this.ensureExecutionRecommendation(job, project, signal);
 
     job = jobs.transition(jobId, 'implementing');
     const implResult = await this.runAgentStage({
@@ -1214,6 +1495,8 @@ export class JobPipeline {
     signals?: TaskSignals;
   }): Promise<AgentStageOutcome> {
     let preferred = opts.preferredProvider;
+    /** The provider that already failed THIS logical action, if one has. */
+    let avoid: ProviderId | undefined;
     // A provider session has authority only as the pair (provider, id). A legacy
     // id without an owner is retired by omission rather than guessed.
     //
@@ -1228,10 +1511,16 @@ export class JobPipeline {
         ? opts.resumeSessionId
         : undefined;
     let last: AgentStageOutcome | undefined;
-    const maxAttempts = this.config.pipeline.agentStageRetries;
+    // BOUNDED PROVIDER ATTEMPTS. One logical AI action gets the preferred
+    // provider and, if that fails on infrastructure, ONE healthy alternate.
+    // Then it pauses. Not a chain of four, not a loop that comes back around to
+    // a provider that already said no -- a later Resume starts a fresh bounded
+    // attempt, and by then the account may simply work again.
+    const maxAttempts = Math.max(0, this.config.pipeline.providerAttempts - 1);
     for (let attempt = 0; attempt <= maxAttempts; attempt++) {
       const routed = await this.deps.agents.route(opts.role, {
         ...(preferred ? { prefer: preferred } : {}),
+        ...(avoid ? { avoid } : {}),
         jobId: opts.jobId,
         signals: {
           ...briefSignals(this.deps.jobs.get(opts.jobId)),
@@ -1262,7 +1551,10 @@ export class JobPipeline {
           resumeSessionId: resumeSessionId && provider === preferred ? resumeSessionId : undefined,
         });
         last = { ...result, provider };
-        if (result.status === 'completed' || result.status === 'cancelled') return last;
+        if (result.status === 'completed' || result.status === 'cancelled') {
+          await this.recordAgentHead(opts.jobId, opts.cwd);
+          return last;
+        }
         if (
           resumeSessionId &&
           provider === preferred &&
@@ -1293,11 +1585,18 @@ export class JobPipeline {
             resumeSessionId: undefined,
           });
           last = { ...fresh, provider };
-          if (fresh.status === 'completed' || fresh.status === 'cancelled') return last;
+          if (fresh.status === 'completed' || fresh.status === 'cancelled') {
+            await this.recordAgentHead(opts.jobId, opts.cwd);
+            return last;
+          }
           // The fresh-context recovery is a real provider execution and consumes
           // the next attempt in the existing stage budget.
           attempt += 1;
         }
+        // The next attempt goes somewhere else. Without this the retry routed
+        // straight back to the provider that had just failed, because the
+        // persistent cooldown that used to make it unavailable is gone.
+        avoid = provider;
         preferred = undefined;
         resumeSessionId = undefined;
       }
@@ -1313,6 +1612,7 @@ export class JobPipeline {
         },
       });
     }
+    await this.recordAgentHead(opts.jobId, opts.cwd);
     return last as AgentStageOutcome;
   }
 
@@ -1477,18 +1777,437 @@ export class JobPipeline {
     };
   }
 
+  /** A PRODUCT pause: the candidate itself is why nothing else can happen. */
+
+  /**
+   * The implementer's capability/effort advice, obtained once per Job.
+   *
+   * Order of preference, and each step is a deliberate saving:
+   *   1. the compiled brief's own recommendation — the chat path, already paid for;
+   *   2. a recommendation already persisted on this Job — a resumed or retried Job;
+   *   3. the Execution Advisor — one bounded tool-free call, direct Jobs only;
+   *   4. nothing, and `selectExecutionProfile` falls back to its deterministic
+   *      scoring exactly as it did before any of this existed.
+   */
+  private async ensureExecutionRecommendation(
+    job: Job,
+    project: Project,
+    signal: AbortSignal,
+  ): Promise<Job> {
+    if (job.compiledBrief || job.executionRecommendation || job.validationOnly) return job;
+    const recommendation = await this.advisor.advise({
+      request: job.request,
+      project,
+      selfDevelopment: project.isSelf,
+      ...((await this.continuationFacts(job)) ?? {}),
+      cwd: this.advisorScratchDir(job.id),
+      jobId: job.id,
+      signal,
+    });
+    if (!recommendation) return job;
+    return this.deps.jobs.patch(job.id, { executionRecommendation: recommendation });
+  }
+
+  /**
+   * Trusted structured facts about the candidate this Job continues, if it
+   * continues one.
+   *
+   * Measured, never narrated: git numstat, Jarvis's own review rows, Jarvis's
+   * own verification rows. A previous agent's prose about what it did is not a
+   * fact and is not sent. This is what lets a three-word continuation command
+   * in front of five thousand changed lines of auth and recurrence work route
+   * on the remaining difficulty rather than on the length of the sentence.
+   */
+  private async continuationFacts(job: Job): Promise<{ continuation: ContinuationFacts } | null> {
+    if (!job.predecessorJobId) return null;
+    const previous = this.deps.jobs.get(job.predecessorJobId);
+    if (!previous?.baseRef || !previous.headRef) return null;
+    const findings =
+      this.deps.review
+        .list(previous.id)
+        .findLast((review) => review.headRef === previous.headRef && review.verdict !== 'error')
+        ?.findings ?? [];
+    let files = 0;
+    let lines = 0;
+    let workspaces = 0;
+    let sensitive: string[] = [];
+    try {
+      if (previous.worktreePath && fs.existsSync(previous.worktreePath)) {
+        const changes = await this.git.collectChanges(previous.worktreePath, previous.baseRef);
+        const facts = classifyChangedPaths(changes.files.map((file) => file.path));
+        files = facts.filesChanged;
+        workspaces = facts.packagesTouched;
+        sensitive = [...facts.sensitive];
+        lines = changes.files.reduce((total, file) => total + file.added + file.removed, 0);
+      }
+    } catch {
+      /* an unreadable predecessor diff costs precision, never the Job */
+    }
+    const verification = this.deps.verification.latestRepairableReport(previous.id);
+    return {
+      continuation: {
+        sourceHead: previous.headRef,
+        base: previous.baseRef,
+        filesChanged: files,
+        linesChanged: lines,
+        workspacesTouched: workspaces,
+        sensitive,
+        verification:
+          verification.ran === 0 ? 'unknown' : verification.passed ? 'passed' : 'failed',
+        highSeverityFindings: findings.filter(
+          (finding) => finding.severity === 'high' || finding.severity === 'critical',
+        ).length,
+        mediumSeverityFindings: findings.filter((finding) => finding.severity === 'medium').length,
+        visualQa: previous.visualQaStatus,
+      },
+    };
+  }
+
+  /** An empty scratch directory for the advisor's output schema. Never a worktree. */
+  private advisorScratchDir(jobId: string): string {
+    const dir = path.join(this.config.artifactsDir, jobId, 'advice');
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  /**
+   * ADOPT A CANDIDATE HEAD JARVIS DID NOT CREATE. Human-authorised, always.
+   *
+   * Reached only through the `job.adoptHead` tool, which is `user`-actor and
+   * confirmed, because it is the one operation that lets an unreviewed commit
+   * become the candidate. It refuses anything that is not a clean descendant of
+   * the Job's own base, and it invalidates every piece of source-bound evidence
+   * — the pipeline then re-runs exactly the stages that no longer have an
+   * answer for this commit, which is the same rule as any other head change.
+   */
+  async adoptCandidateHead(jobId: string): Promise<{ from: string | null; to: string }> {
+    const job = this.deps.jobs.get(jobId);
+    if (!job) throw new Error('job not found');
+    if (job.stage !== 'paused') throw new Error(`job is ${job.stage}, not paused`);
+    if (job.validationOnly) {
+      throw new Error('validation-only jobs pin an immutable candidate and cannot adopt a HEAD');
+    }
+    if (!job.worktreePath || !job.baseRef) throw new Error('this Job has no candidate worktree');
+    const project = this.deps.projects.get(job.projectId);
+    if (!project) throw new Error('the project this Job targets is no longer registered');
+    const status = await this.git.validateRecoveryWorkspace({
+      repoRoot: project.rootPath,
+      worktreePath: job.worktreePath,
+      baseRef: job.baseRef,
+      expectedHead: null,
+      allowDirty: false,
+    });
+    const head = status.head as string;
+    if (head === job.headRef) throw new Error('the worktree is already at the recorded candidate');
+    if (!(await isAncestor(job.worktreePath, job.baseRef, head))) {
+      throw new Error('the current HEAD does not descend from this Job’s base');
+    }
+    const from = job.headRef;
+    this.moveCandidate(jobId, head, { pauseReason: null, error: null, pauseFailureKind: null });
+    this.deps.bus.emit({
+      type: 'job.head.adopted',
+      jobId,
+      payload: { from, to: head, base: job.baseRef },
+    });
+    return { from, to: head };
+  }
+
+  // ------------------------------------------------------------- recovery --
+
+  /**
+   * Is this candidate worktree in a state Jarvis may act on, and if not, what
+   * can a human do about it?
+   *
+   * Read-only and side-effect free, so the paused-Job view can call it to
+   * explain the situation before anyone presses anything. Exact HEAD binding is
+   * intact: a commit Jarvis did not record is NEVER silently adopted. What
+   * changed is the consequence — an unrecognised HEAD is a decision with named
+   * options instead of a permanent refusal.
+   */
+  private async assessCandidate(job: Job, project: Project): Promise<CandidateAssessment> {
+    if (!job.worktreePath || !job.baseRef) {
+      return {
+        ok: false,
+        kind: 'no_checkpoint',
+        detail: 'This paused Job has no recoverable worktree checkpoint.',
+        recovery: ['restart it as a new Job'],
+      };
+    }
+    // Everything except the expected-HEAD comparison is still a hard gate: the
+    // worktree must exist, be a repository, be THIS repository, and sit on top
+    // of this Job's own base. None of those is recoverable by adopting a commit.
+    const allowDirty = job.resumeStage === 'implementing' || job.resumeStage === 'fixing';
+    let status;
+    try {
+      status = await this.git.validateRecoveryWorkspace({
+        repoRoot: project.rootPath,
+        worktreePath: job.worktreePath,
+        baseRef: job.baseRef,
+        // Deliberately omitted: the HEAD comparison is made below, where a
+        // mismatch can be classified instead of thrown.
+        expectedHead: null,
+        allowDirty: true,
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        kind: 'workspace_invalid',
+        detail: `Resume refused: ${error instanceof Error ? error.message : String(error)}`,
+        recovery: ['inspect the candidate worktree', 'restart as a new Job', 'archive this Job'],
+      };
+    }
+
+    const head = status.head as string;
+    if (status.dirty && !allowDirty) {
+      // Case D. Jarvis owns this worktree but it did not make these edits, and
+      // committing somebody else's uncommitted work as a candidate would put
+      // changes nobody reviewed behind a reviewed HEAD.
+      return {
+        ok: false,
+        kind: 'dirty_worktree',
+        head,
+        detail:
+          `Resume refused: the candidate worktree has uncommitted changes Jarvis did not ` +
+          `make (${status.dirtyFiles.slice(0, 10).join(', ')}). They are not committed ` +
+          'automatically: nothing has reviewed them.',
+        recovery: [
+          'commit or revert the changes in the worktree yourself, then Resume',
+          'start a continuation Job from the current candidate',
+          'abandon the candidate',
+        ],
+      };
+    }
+    if (job.headRef && head !== job.headRef) {
+      const descends = await isAncestor(job.worktreePath, job.baseRef, head);
+      if (descends && allowDirty) {
+        // Case B. The Job was checkpointed inside an implementation or repair
+        // run that JARVIS launched into this worktree, and that run committed
+        // before it was interrupted -- an orchestrator restart gets no chance
+        // to run `recordAgentHead`. Refusing here is what used to discard half
+        // an hour of committed agent work behind an unrecoverable "recovery
+        // HEAD changed". The commit descends from this Job's own base and no
+        // other process writes here, so it is the candidate. The caller records
+        // it, which audits the move and invalidates the stale evidence.
+        return { ok: true, head, trustedAgentChange: true };
+      }
+      // Case C. A commit Jarvis did not create, on a Job that was not inside an
+      // agent run. Never adopted silently.
+      return {
+        ok: false,
+        kind: 'external_head_change',
+        head,
+        detail:
+          `Resume refused: this Job recorded candidate ${job.headRef.slice(0, 8)}, but the ` +
+          `worktree is now at ${head.slice(0, 8)}, which Jarvis did not create. ` +
+          (descends
+            ? 'It does sit on top of this Job’s base, so it can be adopted — but that is a ' +
+              'decision for you, not for the pipeline: every review, verification and ' +
+              'screenshot recorded so far describes the old commit.'
+            : 'It does not descend from this Job’s base, so it is not a candidate for this Job.'),
+        recovery: descends
+          ? [
+              'Adopt current HEAD — make it the candidate; evidence for the old commit ' +
+                'becomes stale and the required stages re-run',
+              'restore the recorded candidate in the worktree yourself, then Resume',
+              'abandon the candidate',
+            ]
+          : [
+              'restore the recorded candidate in the worktree yourself, then Resume',
+              'restart as a new Job',
+              'abandon the candidate',
+            ],
+      };
+    }
+    return { ok: true, head };
+  }
+
+  /**
+   * What Resume would do, without doing it.
+   *
+   * The paused-Job view calls this so the button can say what it costs. It runs
+   * the SAME planner the pipeline runs, so the explanation cannot drift from
+   * the behaviour.
+   */
+  async resumePlan(jobId: string): Promise<ResumePlan | null> {
+    const job = this.deps.jobs.get(jobId);
+    if (!job) return null;
+    const project = this.deps.projects.get(job.projectId);
+    if (!project) return null;
+    const assessment = await this.assessCandidate(job, project);
+    if (!assessment.ok) {
+      return {
+        candidateHead: assessment.head ?? job.headRef,
+        recovery: {
+          kind: assessment.kind,
+          detail: assessment.detail,
+          options: assessment.recovery,
+        },
+        plan: {
+          kind: 'none',
+          reason: assessment.detail,
+          reusing: [],
+          recovery: assessment.recovery,
+        },
+      };
+    }
+    return {
+      candidateHead: assessment.head,
+      recovery: null,
+      plan: await this.planFor(job, project, assessment.head),
+    };
+  }
+
+  /** The transition planner's inputs, assembled from the repository. */
+  private async planFor(
+    job: Job,
+    project: Project,
+    candidateHead: string,
+  ): Promise<NextTransition> {
+    let visualExpected = false;
+    // Short-circuit before reading the diff. Eligibility cannot be true without
+    // either a Job-level override or a project visual runtime, and the diff read
+    // is several git invocations on a path that runs on every Resume and every
+    // paused-Job view.
+    const couldRunVisualQa = Boolean(job.visualQaConfig ?? project.config.visualQa);
+    try {
+      const changed =
+        couldRunVisualQa && job.baseRef
+          ? await this.git.collectChanges(job.worktreePath as string, job.baseRef)
+          : null;
+      visualExpected = changed
+        ? visualQaEligibility({
+            job,
+            project,
+            changedFiles: changed.files.map((file) => file.path),
+          }).eligible
+        : false;
+    } catch {
+      // A diff Jarvis cannot read is not a reason to claim Visual QA is done.
+      visualExpected = false;
+    }
+    return planNextTransition({
+      job,
+      candidateHead,
+      visualExpected,
+      finalGateConfigured: (project.config.verification?.steps ?? []).some(
+        (step) => step.kind === 'final',
+      ),
+      config: this.config,
+    });
+  }
+
   private pause(jobId: string, resumeStage: Job['stage'], reason: string): void {
-    reason = redactSecrets(reason);
+    this.pauseWith(jobId, resumeStage, reason, null);
+  }
+
+  /**
+   * An INFRASTRUCTURE pause: a provider, a CLI or the orchestrator failed, and
+   * nothing about the candidate caused it.
+   *
+   * Recorded distinctly because the two are acted on differently everywhere
+   * downstream: no product repair budget was spent, no evidence was
+   * invalidated, and Resume can simply try again -- which the paused-Job view
+   * says out loud instead of offering an unexplained button.
+   */
+  private pauseInfrastructure(
+    jobId: string,
+    resumeStage: Job['stage'],
+    kind: AgentFailureKind | undefined,
+    reason: string,
+  ): void {
+    this.pauseWith(jobId, resumeStage, reason, kind ?? 'unavailable');
+  }
+
+  private pauseWith(
+    jobId: string,
+    resumeStage: Job['stage'],
+    rawReason: string,
+    failureKind: AgentFailureKind | null,
+  ): void {
+    const reason = redactSecrets(rawReason);
     this.deps.jobs.transition(jobId, 'paused', {
       resumeStage,
       pauseReason: reason.slice(0, 20_000),
       error: reason.slice(0, 20_000),
+      pauseFailureKind: failureKind,
     });
     this.deps.bus.emit({
       type: 'system.recovery',
       jobId,
-      payload: { reason: 'pipeline_paused', resumeStage, detail: reason.slice(0, 2_000) },
+      payload: {
+        reason: 'pipeline_paused',
+        resumeStage,
+        ...(failureKind ? { failureKind, infrastructure: true } : {}),
+        detail: reason.slice(0, 2_000),
+      },
     });
+  }
+
+  /**
+   * Record the candidate HEAD, invalidating exactly the evidence that a source
+   * change makes stale.
+   *
+   * A NO-OP when the commit has not moved, and that is the whole point: every
+   * write of `headRef` in the pipeline goes through here, so a stage that
+   * changed nothing can no longer wipe the evidence of the stages before it.
+   * The previous code cleared `reviewedHead` and `visualHead` on every pass
+   * through the loop whether or not anything had changed, which is why a Resume
+   * could never reuse anything.
+   *
+   * Historical rows are untouched. Each review, verification and screenshot
+   * carries the head it describes, so invalidating means "stops matching the
+   * current candidate", never "is deleted".
+   */
+  private moveCandidate(jobId: string, head: string, extra: Partial<Job> = {}): Job {
+    const job = this.deps.jobs.get(jobId) as Job;
+    if (job.headRef === head) {
+      return Object.keys(extra).length ? this.deps.jobs.patch(jobId, extra) : job;
+    }
+    const previous = job.headRef ?? '';
+    const stale = Object.entries(evidenceFor(job, previous))
+      .filter(([key, value]) => key !== 'head' && value === true)
+      .map(([key]) => key);
+    this.deps.bus.emit({
+      type: 'job.evidence.invalidated',
+      jobId,
+      payload: { from: previous, to: head, invalidated: stale },
+    });
+    return this.deps.jobs.patch(jobId, {
+      ...staleEvidencePatch(),
+      headRef: head,
+      ...extra,
+    });
+  }
+
+  /**
+   * TRUSTED AGENT HEAD CHANGE.
+   *
+   * Jarvis started this run, in a worktree it owns, on a branch it created, so
+   * a commit that appeared during it is the candidate -- including when the run
+   * then failed on quota. That case is how a Job used to become unresumable:
+   * `headRef` still named the commit from before the run, and the recovery
+   * check refused the mismatch permanently, stranding work that had already
+   * been committed. Recorded whatever the outcome was.
+   *
+   * Still bounded: only a commit that descends from the Job's own recorded base
+   * is adopted. An agent that reset the branch to something unrelated is not a
+   * candidate, and falls through to the external-change recovery path.
+   */
+  private async recordAgentHead(jobId: string, cwd: string): Promise<void> {
+    const job = this.deps.jobs.get(jobId);
+    if (!job?.baseRef || !job.worktreePath) return;
+    if (path.resolve(cwd) !== path.resolve(job.worktreePath)) return;
+    try {
+      const head = await this.git.resolveCommit(cwd, 'HEAD');
+      if (head === job.headRef) return;
+      if (!(await isAncestor(cwd, job.baseRef, head))) return;
+      this.moveCandidate(jobId, head);
+    } catch (error) {
+      log.warn('could not record the candidate head after an agent run', {
+        jobId,
+        error: String(error),
+      });
+    }
   }
 
   /**
@@ -1617,14 +2336,19 @@ export function candidateRejectionReason(
 function briefSignals(job: Job | null | undefined): TaskSignals {
   if (!job) return {};
   const brief = job.compiledBrief;
-  if (!brief) return { hasCompiledBrief: false, requestChars: job.request.length };
+  // Two producers, one field. The brief carries the recommendation on the chat
+  // path; the Execution Advisor writes it onto the Job for a direct one. Policy
+  // reads exactly one thing either way, and applies the same floors to it.
+  const recommendation = brief?.executionRecommendation ?? job.executionRecommendation;
+  const advice = recommendation ? { executionRecommendation: recommendation } : {};
+  if (!brief) {
+    return { hasCompiledBrief: false, requestChars: job.request.length, ...advice };
+  }
   return {
     hasCompiledBrief: true,
     requirements: brief.requirements.length,
     acceptanceCriteria: brief.acceptanceCriteria.length,
-    ...(brief.executionRecommendation
-      ? { executionRecommendation: brief.executionRecommendation }
-      : {}),
+    ...advice,
   };
 }
 
@@ -1743,7 +2467,13 @@ ${input.failures.slice(0, 12_000)}
 
 Fix the underlying cause, not the symptom. Do not disable, skip or weaken checks
 to make them pass. If a failure is pre-existing and unrelated to your change, say
-so explicitly in your summary instead of papering over it.`;
+so explicitly in your summary instead of papering over it.
+
+Use TARGETED checks while you work — the single failing test file, the one type
+error — as often as you need. Do NOT run the project's full suite to prove the
+fix: Jarvis runs the whole thing itself, once, on the commit you leave behind,
+and records the real exit codes. Running it here costs minutes per edit and
+proves nothing Jarvis is going to take your word for.`;
 }
 
 /**
@@ -1852,6 +2582,14 @@ ${JSON.stringify(input.blockers, null, 2)}
 
 ## Latest deterministic verification
 ${input.verification.results.map((result) => `- ${result.name}: ${result.status}`).join('\n')}
+
+Address ALL of the blocking findings above in this one pass. This is the single
+batch repair for them, not the first of several: a fresh independent reviewer
+looks at the commit you leave behind, and there is no third round.
+
+Use targeted checks while you work — the tests covering what you actually touched.
+Do NOT run the project's full suite to prove the fix; Jarvis runs it itself, once,
+on that commit, and records the real exit codes.
 
 Do not weaken checks or address advisory findings unless the blocking fix requires it. Finish with a concise summary.`;
 }

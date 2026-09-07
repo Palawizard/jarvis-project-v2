@@ -244,6 +244,21 @@ export class VerificationEngine {
     }));
   }
 
+  /**
+   * The most recent REPAIRABLE-phase report on record.
+   *
+   * How verification evidence is reused: when the Job row says a commit was
+   * verified and the candidate is still that commit, this rebuilds the report
+   * the reviewer and the fixer prompts need without running a single command.
+   * The closing `kind: 'final'` gate is excluded because it is a different
+   * question asked at a different moment, and its cycle number is higher.
+   */
+  latestRepairableReport(jobId: string): VerificationReport {
+    const all = this.list(jobId).filter((result) => result.kind !== 'final');
+    const cycle = all.reduce((latest, result) => Math.max(latest, result.cycle), -1);
+    return reportFromResults(all.filter((result) => result.cycle === cycle));
+  }
+
   /** Reconstruct the final deterministic gate from persisted evidence. */
   latestReport(jobId: string): VerificationReport {
     const all = this.list(jobId);

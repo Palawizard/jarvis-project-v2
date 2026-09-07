@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import type { Db } from '../db/index.js';
 import { parseJson } from '../db/index.js';
 import { newId, nowIso } from '../ids.js';
@@ -71,6 +73,60 @@ const REVIEW_SCHEMA = z
   .strict();
 
 /**
+ * The same shape as JSON Schema, handed to the provider as `outputSchemaPath`.
+ *
+ * This is the actual fix for the failure that used to burn reviewers three at a
+ * time: "Reviewer output failed strict structured validation: expected exactly
+ * one terminal JSON block". The JSON was only ever ASKED for, in prose, and a
+ * model that answered around the fence produced an unusable review — which then
+ * looked like a reason to spend another comprehensive reviewer, and another.
+ * `--json-schema` / `--output-schema` CONSTRAINS the final message instead, and
+ * the adapters return the parsed value as `AgentRunResult.structuredOutput`.
+ *
+ * The prompt still describes the fields, because the schema says what shape the
+ * answer has and the prompt says what it means. And the Zod schema above still
+ * re-validates everything: a provider's enforcement is not Jarvis's trust
+ * boundary, and this stays fail-closed — an answer that does not validate is
+ * an infrastructure failure, never a silent approval.
+ */
+export const REVIEW_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['verdict', 'summary', 'findings'],
+  properties: {
+    verdict: { type: 'string', enum: ['approve', 'request_changes'] },
+    summary: {
+      type: 'string',
+      maxLength: 4000,
+      description: '2-4 sentences on what changed and whether it meets the request.',
+    },
+    findings: {
+      type: 'array',
+      maxItems: 60,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['severity', 'category', 'file', 'line', 'description', 'recommendation'],
+        properties: {
+          severity: {
+            type: 'string',
+            enum: ['critical', 'high', 'medium', 'low', 'info'],
+          },
+          category: {
+            type: 'string',
+            enum: ['correctness', 'security', 'design', 'tests', 'performance', 'style'],
+          },
+          file: { type: 'string', maxLength: 500 },
+          line: { type: 'integer', minimum: 1 },
+          description: { type: 'string', maxLength: 4000 },
+          recommendation: { type: 'string', maxLength: 4000 },
+        },
+      },
+    },
+  },
+} as const;
+
+/**
  * Independent review pass.
  *
  * The reviewer gets a deliberately narrow input: the request, acceptance
@@ -87,10 +143,19 @@ export class ReviewEngine {
     private readonly config: JarvisConfig = getConfig(),
   ) {}
 
+  /**
+   * One comprehensive review, with a BOUNDED provider attempt budget.
+   *
+   * A reviewer that fails on quota, capacity, a timeout or a protocol error has
+   * not reviewed anything, so the alternate provider is tried once and then the
+   * Job pauses. It never becomes a chain, and a later Resume starts a fresh
+   * bounded attempt rather than being locked out by a recorded cooldown.
+   */
   async review(opts: ReviewOptions): Promise<Review> {
     let avoid = opts.implementerProvider;
     let last: Review | undefined;
-    for (let attempt = 0; attempt <= this.config.pipeline.agentStageRetries; attempt++) {
+    const maxAttempts = Math.max(0, this.config.pipeline.providerAttempts - 1);
+    for (let attempt = 0; attempt <= maxAttempts; attempt++) {
       last = await this.reviewOnce(opts, avoid);
       if (last.verdict !== 'error' || opts.signal?.aborted) return last;
       if (last.provider === 'none') return last;
@@ -137,6 +202,12 @@ export class ReviewEngine {
     }
 
     const prompt = buildReviewPrompt(opts);
+    // The schema file lives in the artifacts directory, NEVER in the candidate
+    // worktree: a file written there would show up as an uncommitted change and
+    // the candidate-identity assertions would (correctly) refuse the review.
+    const schemaPath = routed.capabilities.structuredOutput
+      ? this.writeReviewSchema(opts.jobId)
+      : null;
     const runId = newId('run');
     const startedAt = nowIso();
     this.db
@@ -165,6 +236,7 @@ export class ReviewEngine {
           role: 'reviewer',
           ...(routed.decision?.model ? { model: routed.decision.model } : {}),
           ...(routed.decision?.effort ? { effort: routed.decision.effort } : {}),
+          ...(schemaPath ? { outputSchemaPath: schemaPath } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
         },
         (event) => {
@@ -223,10 +295,23 @@ export class ReviewEngine {
       return review;
     }
 
-    const parsed = parseReviewOutput(
-      result.result,
-      this.config.pipeline.codeReviewBlockingSeverities,
-    );
+    // Provider-native structured output first; the terminal fenced block is the
+    // fallback, for a provider that cannot be constrained AND for a CLI that
+    // accepted the flag and answered in prose anyway. The fallback is kept
+    // deliberately: making the constrained channel the only way in would turn
+    // one CLI regression into "no review is possible", which is the failure
+    // this change exists to remove rather than relocate.
+    //
+    // Nothing is loosened by it. Both paths end at `checkReviewValue`, the same
+    // strict schema with the same rules, and an answer that does not validate
+    // is an `error` verdict — infrastructure, never a silent approval.
+    const parsed =
+      result.structuredOutput !== undefined
+        ? checkReviewValue(
+            result.structuredOutput,
+            this.config.pipeline.codeReviewBlockingSeverities,
+          )
+        : parseReviewOutput(result.result, this.config.pipeline.codeReviewBlockingSeverities);
     if (parsed.verdict === 'error') {
       const protocolError = redactSecrets(
         parsed.summary || 'reviewer returned invalid structured output',
@@ -264,6 +349,20 @@ export class ReviewEngine {
       },
     });
     return review;
+  }
+
+  /** Fixed name, fixed content, outside the candidate worktree. */
+  private writeReviewSchema(jobId: string): string | null {
+    try {
+      const dir = path.join(this.config.artifactsDir, jobId);
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, 'review-output-schema.json');
+      fs.writeFileSync(file, JSON.stringify(REVIEW_OUTPUT_SCHEMA), { mode: 0o600 });
+      return file;
+    } catch {
+      // A schema Jarvis cannot write costs the constrained path, not the review.
+      return null;
+    }
   }
 
   private persist(input: Omit<Review, 'id' | 'createdAt'>): Review {
@@ -365,7 +464,9 @@ ${diff}
 
 ## Required output
 
-Reply with ONE fenced json block and nothing else after it:
+Answer with the structured object below. If your runtime constrains the final
+message to a schema, that constrained answer IS the review; otherwise reply with
+ONE fenced json block and nothing else after it:
 
 \`\`\`json
 {
@@ -408,24 +509,40 @@ export function parseReviewOutput(
   try {
     const raw = block.trim();
     if (hasDuplicateJsonKeys(raw)) return invalidReview('duplicate JSON object key');
-    const checked = REVIEW_SCHEMA.safeParse(JSON.parse(raw));
-    if (!checked.success) return invalidReview(checked.error.issues[0]?.message);
-    const findings = checked.data.findings as ReviewFinding[];
-    const blocking = findings.filter((finding) => blockingSeverities.includes(finding.severity));
-    if (blocking.some((finding) => !finding.recommendation.trim())) {
-      return invalidReview('blocking findings require a recommendation');
-    }
-    if (checked.data.verdict === 'request_changes' && blocking.length === 0) {
-      return invalidReview('request_changes requires at least one configured blocking finding');
-    }
-    return {
-      verdict: blocking.length ? 'request_changes' : 'approve',
-      summary: checked.data.summary,
-      findings,
-    };
+    return checkReviewValue(JSON.parse(raw), blockingSeverities);
   } catch {
     return invalidReview();
   }
+}
+
+/**
+ * The trusted validation both paths end at.
+ *
+ * Whether the object arrived through the provider's constrained-output channel
+ * or was scraped out of a fenced block, the same rules decide whether it is a
+ * review: the strict schema, a recommendation on every blocking finding, and a
+ * `request_changes` that actually names one. The schema was never the loose
+ * part — the transport was.
+ */
+export function checkReviewValue(
+  value: unknown,
+  blockingSeverities: readonly string[] = ['critical', 'high'],
+): { verdict: Review['verdict']; summary: string; findings: ReviewFinding[] } {
+  const checked = REVIEW_SCHEMA.safeParse(value);
+  if (!checked.success) return invalidReview(checked.error.issues[0]?.message);
+  const findings = checked.data.findings as ReviewFinding[];
+  const blocking = findings.filter((finding) => blockingSeverities.includes(finding.severity));
+  if (blocking.some((finding) => !finding.recommendation.trim())) {
+    return invalidReview('blocking findings require a recommendation');
+  }
+  if (checked.data.verdict === 'request_changes' && blocking.length === 0) {
+    return invalidReview('request_changes requires at least one configured blocking finding');
+  }
+  return {
+    verdict: blocking.length ? 'request_changes' : 'approve',
+    summary: checked.data.summary,
+    findings,
+  };
 }
 
 function hasDuplicateJsonKeys(text: string): boolean {

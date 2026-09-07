@@ -131,6 +131,24 @@ export {
   type BriefCompilerInput,
   type BriefCompilationFailure,
 } from './jobs/brief.js';
+export {
+  ExecutionAdvisor,
+  buildAdvisorPrompt,
+  ADVISOR_OUTPUT_SCHEMA,
+  type ExecutionAdvisorInput,
+  type ContinuationFacts,
+  type AdvisorFailure,
+} from './jobs/advisor.js';
+export {
+  planNextTransition,
+  evidenceFor,
+  staleEvidencePatch,
+  verificationProgress,
+  verificationSignature,
+  type NextTransition,
+  type TransitionKind,
+  type CandidateEvidence,
+} from './jobs/evidence.js';
 export { JobLifecycle, type StaleJobReport, type JobDeletionPlan } from './jobs/lifecycle.js';
 export {
   canTransition,
@@ -149,6 +167,8 @@ export {
   renderProjectSnapshot,
   agentStagePauseReason,
   type AgentStageOutcome,
+  type ResumePlan,
+  type CandidateAssessment,
 } from './jobs/pipeline.js';
 export {
   CandidateApplicationService,
@@ -189,6 +209,8 @@ export {
 export {
   ReviewEngine,
   parseReviewOutput,
+  checkReviewValue,
+  REVIEW_OUTPUT_SCHEMA,
   type Review,
   type ReviewFinding,
 } from './review/engine.js';

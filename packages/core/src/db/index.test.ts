@@ -5,6 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadConfig } from '../config.js';
 import { MIGRATIONS, SCHEMA_VERSION, openDb } from './index.js';
+import { EventBus } from '../events/bus.js';
+import { JobService, type Job } from '../jobs/service.js';
+import { planNextTransition } from '../jobs/evidence.js';
 
 const homes: string[] = [];
 
@@ -432,5 +435,81 @@ describe('database migrations', () => {
     future.prepare("UPDATE schema_meta SET value='99' WHERE key='schema_version'").run();
     future.close();
     expect(() => openDb(config)).toThrow('unsupported database schema version 99');
+  });
+});
+
+// A Job written before schema 17 has no evidence heads, no failure signature
+// and no persisted recommendation. It must still open, still read back, and
+// still resume — falling back conservatively to "run the stage" rather than
+// claiming evidence it cannot prove.
+describe('pre-evidence Jobs after migration 17', () => {
+  it('keeps an old Job readable and plans conservatively for it', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-migration-v16-'));
+    homes.push(home);
+    const config = loadConfig({ home });
+    const legacy = new DatabaseSync(config.dbPath);
+    legacy.exec(fs.readFileSync(path.join(import.meta.dirname, 'schema.sql'), 'utf8'));
+    legacy.prepare('INSERT INTO schema_meta(key,value) VALUES (?,?)').run('schema_version', '1');
+    for (let version = 2; version <= 16; version++) {
+      legacy.exec(MIGRATIONS.get(version) as string);
+    }
+    legacy.prepare("UPDATE schema_meta SET value='16' WHERE key='schema_version'").run();
+    legacy
+      .prepare(
+        `INSERT INTO projects (id, name, root_path, default_branch, stack, commands, is_self,
+          config, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run('prj_v16', 'legacy', home, 'main', '{}', '{}', 0, '{}', 'now', 'now');
+    legacy
+      .prepare(
+        `INSERT INTO jobs (id, project_id, request, goal, stage, status, base_ref, head_ref,
+          reviewed_head, visual_head, worktree_path, resume_stage, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        'job_v16',
+        'prj_v16',
+        'do it',
+        'do it',
+        'paused',
+        'paused',
+        'base',
+        'head',
+        'head',
+        null,
+        home,
+        'reviewing',
+        'now',
+        'now',
+      );
+    legacy.close();
+
+    const migrated = openDb(config);
+    expect(
+      migrated.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get(),
+    ).toEqual({ value: String(SCHEMA_VERSION) });
+
+    const bus = new EventBus(migrated);
+    const job = new JobService(migrated, bus).get('job_v16');
+    expect(job).not.toBeNull();
+    // The review it really did record is preserved; everything schema 17 added
+    // reads back as "not recorded", which is exactly what it is.
+    expect(job?.reviewedHead).toBe('head');
+    expect(job?.verifiedHead).toBeNull();
+    expect(job?.reviewBlockedHead).toBeNull();
+    expect(job?.finalGateHead).toBeNull();
+    expect(job?.verificationSignature).toBeNull();
+    expect(job?.executionRecommendation).toBeNull();
+
+    // And the planner refuses to claim evidence nobody wrote down.
+    const next = planNextTransition({
+      job: job as Job,
+      candidateHead: 'head',
+      visualExpected: false,
+      finalGateConfigured: false,
+      config,
+    });
+    expect(next.kind).toBe('verify');
+    migrated.close();
   });
 });

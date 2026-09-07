@@ -668,9 +668,19 @@ describe('general conversation', () => {
     expect(failed.reply).toContain('provider state, not a problem with the code');
     expect(failed.assistantMessage?.status).toBe('failed');
 
-    // And the exhausted provider is cooled down rather than hammered again.
+    // And a retry is ALLOWED to reach the provider again.
+    //
+    // Its predecessor asserted the opposite: the quota failure put the provider
+    // into a persistent cooldown, so the retry never left the process and
+    // answered "No conversational provider is available". That was wrong for
+    // the same reason it was wrong on the Job pipeline — by the time the user
+    // presses Retry they may have switched account, the limit may have reset
+    // early, or the provider may never have meant what the parser read. The
+    // failure is recorded and reported; it is not a lock.
+    const before = h.provider.prompts.length;
     const retried = await h.chat.retry(conversation.id);
-    expect(retried.reply).toContain('No conversational provider is available');
+    expect(h.provider.prompts.length).toBe(before + 1);
+    expect(retried.reply).toContain('provider state, not a problem with the code');
   });
 
   it('retries a failed response without duplicating the user message', async () => {
@@ -2323,14 +2333,24 @@ describe('the deployed no-Job regression', () => {
       text: 'fix the login bug in Jarvis',
     });
 
-    // Zero Jobs and one attempt. The turn then reports provider state honestly:
-    // the same exhausted provider answers conversation, and saying so beats
-    // replying as though nothing had happened.
+    // The load-bearing part is unchanged: ZERO Jobs, no agent started, exactly
+    // one routing attempt. A classifier that could not answer never becomes a
+    // Job, whatever else the turn does.
     expect(h.jobs.list({ archived: 'all' })).toHaveLength(0);
     expect(h.started).toEqual([]);
     expect(h.provider.routing).toHaveLength(1);
-    expect(turn.kind).toBe('error');
-    expect(turn.reply).toMatch(/provider/i);
+
+    // The turn then falls through to an ordinary answer — which is what this
+    // path is written to do, and the rejection is recorded on the message so
+    // "why did my Job never start?" has an answer. Its predecessor expected an
+    // error here, but that came from the router's quota failure putting the
+    // provider into a persistent cooldown so the conversational call failed
+    // too. That cooldown is gone, and the assertion was measuring it rather
+    // than anything this code decides.
+    expect(turn.kind).toBe('chat');
+    expect(
+      (turn.assistantMessage?.metadata as { routing?: { rejected?: string } })?.routing?.rejected,
+    ).toBe('provider_failed');
   });
 
   it('will not start new work on an archived project', async () => {

@@ -34,8 +34,6 @@ export interface JarvisConfig {
     claudePermissionMode: 'acceptEdits' | 'bypassPermissions' | 'default' | 'plan';
     /** Hard ceiling on a single agent run. */
     runTimeoutMs: number;
-    /** Temporary backoff after a provider reports a rate limit. */
-    cooldownMs: number;
   };
 
   memory: {
@@ -80,11 +78,21 @@ export interface JarvisConfig {
   };
 
   pipeline: {
-    /** Max automatic implement->verify->fix loops before handing back to the user. */
+    /**
+     * PRODUCT repair budgets. Each one counts fixer runs that actually changed
+     * the candidate in response to real evidence — a failing check, a real
+     * review finding, a real visual defect. A provider outage never spends one:
+     * see `AgentFailureKind` and `INFRASTRUCTURE_FAILURE_KINDS`.
+     */
     maxFixCycles: number;
     maxReviewFixCycles: number;
     maxVisualFixCycles: number;
-    agentStageRetries: number;
+    /**
+     * ATTEMPT budget, and a different currency entirely: how many providers one
+     * logical AI action may be tried on before the Job pauses. Two means
+     * "preferred, then one healthy alternate, then stop" — never a chain.
+     */
+    providerAttempts: number;
     verificationInfraRetries: number;
     codeReviewBlockingSeverities: string[];
     visualBlockingSeverities: string[];
@@ -108,10 +116,23 @@ export interface JarvisConfig {
     /** Retention for finished tool audit rows, in days. 0 = keep forever. */
     auditRetentionDays: number;
     /**
-     * Ceiling on the JSON kept per input/result. Arguments above it are refused
-     * rather than truncated, because a truncated payload must never be replayed.
+     * Ceiling on the audit/UI PREVIEW kept for a tool result or error. Display
+     * only: it never decides whether a tool may run, and truncating here never
+     * touches the stored execution payload.
      */
     maxRecordChars: number;
+    /**
+     * Storage safety bound on the canonical arguments of one tool call.
+     *
+     * Deliberately large, and deliberately NOT reachable from the environment.
+     * Its predecessor was `maxRecordChars` — a 4,000-character display budget
+     * that also decided whether a call could execute, so a legitimate 4,644
+     * character structured request was refused outright. The two questions are
+     * now separate, and only this one is a correctness gate: arguments above it
+     * are refused rather than truncated, because a truncated payload must never
+     * be executed, approved or replayed.
+     */
+    maxInputChars: number;
   };
 }
 
@@ -177,7 +198,6 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
           .JARVIS_CLAUDE_PERMISSION_MODE as JarvisConfig['agents']['claudePermissionMode']) ||
         'acceptEdits',
       runTimeoutMs: envInt('JARVIS_AGENT_TIMEOUT_MS', 30 * 60_000),
-      cooldownMs: envInt('JARVIS_PROVIDER_COOLDOWN_MS', 10 * 60_000),
     },
     memory: {
       minImportance: envFloat('JARVIS_MEMORY_MIN_IMPORTANCE', 0.35),
@@ -201,10 +221,14 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
       },
     },
     pipeline: {
-      maxFixCycles: Math.max(0, envInt('JARVIS_MAX_FIX_CYCLES', 1)),
-      maxReviewFixCycles: Math.max(0, envInt('JARVIS_MAX_REVIEW_FIX_CYCLES', 2)),
-      maxVisualFixCycles: Math.max(0, envInt('JARVIS_MAX_VISUAL_FIX_CYCLES', 2)),
-      agentStageRetries: Math.max(0, envInt('JARVIS_AGENT_STAGE_RETRIES', 2)),
+      // Two verification fixers, and the second one has to earn it: it runs
+      // only when the failure signature actually moved. See `jobs/evidence.ts`.
+      maxFixCycles: Math.max(0, envInt('JARVIS_MAX_FIX_CYCLES', 2)),
+      // One batch fixer for all findings of one comprehensive review, then one
+      // fresh final review. Not a loop.
+      maxReviewFixCycles: Math.max(0, envInt('JARVIS_MAX_REVIEW_FIX_CYCLES', 1)),
+      maxVisualFixCycles: Math.max(0, envInt('JARVIS_MAX_VISUAL_FIX_CYCLES', 1)),
+      providerAttempts: Math.max(1, envInt('JARVIS_PROVIDER_ATTEMPTS', 2)),
       verificationInfraRetries: Math.max(0, envInt('JARVIS_VERIFICATION_INFRA_RETRIES', 2)),
       codeReviewBlockingSeverities: envSeverities(
         'JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES',
@@ -228,6 +252,9 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
       approvalTtlMs: envInt('JARVIS_TOOL_APPROVAL_TTL_MS', 24 * 60 * 60_000),
       auditRetentionDays: envInt('JARVIS_TOOL_AUDIT_RETENTION_DAYS', 90),
       maxRecordChars: envInt('JARVIS_TOOL_MAX_RECORD_CHARS', 4000),
+      // No environment override on purpose: raising it is the only interesting
+      // direction and that is the DoS knob.
+      maxInputChars: 256_000,
     },
     ...overrides,
   };

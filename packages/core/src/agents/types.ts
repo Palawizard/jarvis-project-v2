@@ -23,7 +23,7 @@ export interface RoutingDecision {
     provider: ProviderId;
     available: boolean;
     reason?: string;
-    cooldownUntil?: string;
+    lastFailureKind?: string;
   }>;
   signals: TaskSignals;
   createdAt: string;
@@ -46,7 +46,12 @@ export type AgentRole =
    * Tool-free compilation of an already-authorised request into a development
    * brief. Decides nothing: see `jobs/brief.ts`.
    */
-  | 'brief_compiler';
+  | 'brief_compiler'
+  /**
+   * Tool-free structured judgement of how much model ONE Job needs, for a Job
+   * created without a compiled brief. Decides nothing else: see `jobs/advisor.ts`.
+   */
+  | 'execution_advisor';
 
 export interface ProviderCapabilities {
   id: ProviderId;
@@ -77,8 +82,15 @@ export interface ProviderCapabilities {
    * that declare this.
    */
   enforcesToolAllowlist?: boolean;
-  cooldownUntil?: string;
+  /**
+   * The last failure this provider reported, and the reset moment it named if
+   * it named one. INFORMATIONAL ONLY -- neither field gates routing, so a
+   * stale or optimistic reset timestamp can never make a later Resume
+   * impossible. See `AgentRegistry.recordResult`.
+   */
   lastFailureAt?: string;
+  lastFailureKind?: string;
+  lastFailureReset?: string;
   lastSuccessAt?: string;
 }
 

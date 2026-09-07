@@ -53,10 +53,15 @@ export function isAllowedCapabilityTier(value: unknown): value is CapabilityTier
 }
 
 /**
- * The Job Brief Compiler's semantic read on ONE question: how much model does
- * the initial implementer need? Two independent dimensions — never a model
- * name, never a score — so trusted code stays the only thing that ever maps a
- * tier to a provider's model string.
+ * A semantic read on ONE question: how much model does the initial implementer
+ * need? Two independent dimensions — never a model name, never a score — so
+ * trusted code stays the only thing that ever maps a tier to a provider's model
+ * string.
+ *
+ * Two producers, one shape: the Job Brief Compiler emits it as a field of the
+ * brief on the chat path (no extra call), and the Execution Advisor emits it
+ * alone for a Job created directly with no brief. Neither may name a provider,
+ * a model, a project, a permission or a sandbox.
  *
  * Advice, not a decision: `selectExecutionProfile` is the only reader, applies
  * it to the `implementer` role only, and still runs it through the same role
@@ -185,9 +190,10 @@ export interface TaskSignals {
   requirements?: number;
   acceptanceCriteria?: number;
   /**
-   * The Brief Compiler's semantic advice for the INITIAL implementer only.
-   * `selectExecutionProfile` ignores this for every other role, including the
-   * compiler itself — see the docstring on `ExecutionRecommendation`.
+   * Semantic advice for the INITIAL implementer only, from the Brief Compiler
+   * or the Execution Advisor. `selectExecutionProfile` ignores this for every
+   * other role, including both producers themselves — see the docstring on
+   * `ExecutionRecommendation`.
    */
   executionRecommendation?: ExecutionRecommendation;
 
@@ -254,6 +260,16 @@ export const ROLE_POLICY: Record<AgentRole, RolePolicy> = {
     minEffort: 'low',
     maxEffort: 'low',
     note: 'bounded tool-free second opinion',
+  },
+  execution_advisor: {
+    // FIXED, and that is the point: an advisor that could choose its own
+    // capability tier would be recursively selecting the model that selects
+    // the model. One bounded structured judgement, always at the same cost.
+    fixed: { tier: 'normal', effort: 'medium' },
+    maxTier: 'normal',
+    minEffort: 'medium',
+    maxEffort: 'medium',
+    note: 'bounded tool-free execution advice',
   },
   brief_compiler: {
     maxTier: 'normal',

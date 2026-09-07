@@ -43,10 +43,7 @@ class FakeProvider implements AgentProvider {
   }
 }
 
-function registry(
-  providers: AgentProvider[],
-  opts: { now?: () => Date; cooldownMs?: number } = {},
-) {
+function registry(providers: AgentProvider[], opts: { now?: () => Date } = {}) {
   const config = loadConfig({
     home: '.jarvis/router-test',
     agents: {
@@ -54,7 +51,6 @@ function registry(
       reviewerProvider: undefined,
       claudePermissionMode: 'acceptEdits',
       runTimeoutMs: 1000,
-      cooldownMs: opts.cooldownMs ?? 60_000,
     },
   });
   return new AgentRegistry(config, { providers, ...(opts.now ? { now: opts.now } : {}) });
@@ -168,21 +164,28 @@ describe('AgentRegistry v2', () => {
     expect(routed.decision.factors.join(' ')).toContain('effort not applied');
   });
 
-  it('puts a rate-limited provider on a temporary cooldown', async () => {
-    let now = new Date('2026-08-23T00:00:00.000Z');
+  // A recorded rate limit is DIAGNOSTIC, not a routing lock. Its predecessor
+  // subtracted a cooldown from `available`, which is what made Resume
+  // impossible after the user had already switched Claude account or the
+  // provider had already recovered: one reported reset timestamp, believed for
+  // ten minutes, on a machine where nothing was actually wrong any more.
+  it('records a rate limit without making the provider unroutable', async () => {
+    const now = new Date('2026-08-23T00:00:00.000Z');
     const router = registry([new FakeProvider('claude'), new FakeProvider('codex')], {
       now: () => now,
-      cooldownMs: 60_000,
     });
     router.recordResult('claude', {
       status: 'failed',
-      error: "You've hit your monthly spend limit; your session limit resets later",
+      error: "You've hit your monthly spend limit; your session limit resets at 2026-08-23T05:00Z",
     });
-    expect((await router.route('implementer')).provider?.id).toBe('codex');
-    expect(
-      (await router.capabilities()).find((c) => c.id === 'claude')?.cooldownUntil,
-    ).toBeTruthy();
-    now = new Date('2026-08-23T00:01:01.000Z');
+
+    const claude = (await router.capabilities()).find((c) => c.id === 'claude');
+    expect(claude?.available).toBe(true);
+    expect(claude?.lastFailureKind).toBe('quota');
+    expect(claude?.lastFailureReset).toBe('2026-08-23T05:00:00.000Z');
+    expect(router.lastFailure('claude')?.kind).toBe('quota');
+    // The very next routing decision may reach it again: only the CLI's own
+    // answer decides availability, and by now the account may simply work.
     expect((await router.route('implementer')).provider?.id).toBe('claude');
   });
 

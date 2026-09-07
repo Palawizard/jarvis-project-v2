@@ -20,7 +20,10 @@ export const ChatActionSchema = z.discriminatedUnion('action', [
       action: z.literal('create_job'),
       /** Project name, alias or id. Omit to use the conversation's project. */
       project: ref.optional(),
-      request: z.string().min(3).max(4000),
+      // Matches what a Job actually stores and what a compiled brief echoes.
+      // The old 4,000 was the tool audit PREVIEW budget leaking into a domain
+      // limit, and it refused legitimate multi-part requests.
+      request: z.string().min(3).max(20_000),
       acceptance: z.array(z.string().min(1).max(400)).max(10).optional(),
     })
     .strict(),

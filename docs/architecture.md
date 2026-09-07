@@ -76,6 +76,6 @@ PostgreSQL migration is possible at the repository layer. Domain records use por
 
 ## Implemented versus planned
 
-Implemented: persistent multi-conversation chat with a dedicated non-editing chat agent path, structured intent/action routing, deterministic project resolution from natural language, project registration/detection, durable jobs/events, Claude/Codex CLI adapters, inspectable routing/cooldowns/model profiles, Git worktrees, deterministic checks, independent code and image review, isolated candidate runtime, explicit approval, FF-only application, and supervised self-upgrade foundations.
+Implemented: persistent multi-conversation chat with a dedicated non-editing chat agent path, structured intent/action routing, deterministic project resolution from natural language, project registration/detection, durable jobs/events, Claude/Codex CLI adapters, inspectable routing/provider-health/model profiles, Git worktrees, deterministic checks, independent code and image review, isolated candidate runtime, explicit approval, FF-only application, and supervised self-upgrade foundations.
 
 Planned: voice, wake word, screen understanding, desktop control, Gmail/Calendar, learned procedure capture, richer automation triggers, PostgreSQL deployment, and broader trusted policies.

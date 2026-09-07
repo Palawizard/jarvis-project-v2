@@ -20,9 +20,23 @@ import type {
   RoutingDecision,
 } from './types.js';
 
+/**
+ * What this process has observed about a provider. Every field is
+ * INFORMATIONAL: nothing here can make a provider unroutable.
+ *
+ * The predecessor kept a `cooldownUntil` and subtracted it from `available`,
+ * which turned one reported usage limit into a hard routing lock that outlived
+ * the condition it described. It survived the user switching Claude account,
+ * the provider recovering early, and a reset timestamp the provider had simply
+ * guessed — and every one of those made Resume impossible for a Job that had
+ * nothing wrong with it. Availability is now what the installed CLI answers
+ * right now, so a later Resume always gets to ask again.
+ */
 interface HealthState {
-  cooldownUntil?: string;
   lastFailureAt?: string;
+  lastFailureKind?: AgentFailureKind;
+  /** The reset moment the provider itself named, when it named one. */
+  lastFailureReset?: string;
   lastSuccessAt?: string;
 }
 
@@ -172,27 +186,43 @@ export class AgentRegistry {
     return provider;
   }
 
+  /**
+   * What each provider can do RIGHT NOW.
+   *
+   * `available` comes from the provider's own probe of the installed CLI and
+   * nothing else. Recorded failures ride along beside it so the UI and the
+   * routing reason can explain a previous outage, but they never subtract from
+   * it — see `HealthState`.
+   */
   async capabilities(): Promise<ProviderCapabilities[]> {
-    const now = this.now().getTime();
     return Promise.all(
       [...this.providers.values()].map(async (provider) => {
         const capability = await provider.capabilities();
         const health = this.health.get(provider.id);
-        const cooling = health?.cooldownUntil && Date.parse(health.cooldownUntil) > now;
         return {
           ...capability,
-          available: capability.available && !cooling,
-          ...(cooling
-            ? {
-                reason: `temporary cooldown until ${health.cooldownUntil}`,
-                cooldownUntil: health.cooldownUntil,
-              }
-            : {}),
           ...(health?.lastFailureAt ? { lastFailureAt: health.lastFailureAt } : {}),
+          ...(health?.lastFailureKind ? { lastFailureKind: health.lastFailureKind } : {}),
+          ...(health?.lastFailureReset ? { lastFailureReset: health.lastFailureReset } : {}),
           ...(health?.lastSuccessAt ? { lastSuccessAt: health.lastSuccessAt } : {}),
         };
       }),
     );
+  }
+
+  /** The last failure recorded for a provider in this process. Informational. */
+  lastFailure(provider: ProviderId): {
+    at: string;
+    kind: AgentFailureKind;
+    reset?: string;
+  } | null {
+    const health = this.health.get(provider);
+    if (!health?.lastFailureAt || !health.lastFailureKind) return null;
+    return {
+      at: health.lastFailureAt,
+      kind: health.lastFailureKind,
+      ...(health.lastFailureReset ? { reset: health.lastFailureReset } : {}),
+    };
   }
 
   async route(
@@ -221,6 +251,17 @@ export class AgentRegistry {
       // Independence is preferred, not fabricated: the avoided provider remains
       // a last resort when it is the only healthy option, always in fresh context.
       if (opts.prefer) order.push(opts.prefer);
+      order.push(opts.avoid);
+    } else if (opts.avoid) {
+      // `avoid` now means something for every role, not just the two reviewers:
+      // "this provider already failed THIS logical action, try the other one".
+      // That used to be a side effect of the persistent cooldown -- the failed
+      // provider became unavailable, so the next attempt landed elsewhere. With
+      // the cooldown gone, the retry would otherwise route straight back to the
+      // provider that had just refused. It stays a last resort rather than an
+      // exclusion, so a single-provider machine can still make progress.
+      if (opts.prefer && opts.prefer !== opts.avoid) order.push(opts.prefer);
+      order.push(...usable.map((capability) => capability.id).filter((id) => id !== opts.avoid));
       order.push(opts.avoid);
     } else if (opts.prefer) {
       order.push(opts.prefer);
@@ -266,7 +307,7 @@ export class AgentRegistry {
         provider: cap.id,
         available: cap.available,
         ...(cap.reason ? { reason: cap.reason } : {}),
-        ...(cap.cooldownUntil ? { cooldownUntil: cap.cooldownUntil } : {}),
+        ...(cap.lastFailureKind ? { lastFailureKind: cap.lastFailureKind } : {}),
       })),
       signals: { ...opts.signals },
       createdAt: nowIso(),
@@ -276,36 +317,43 @@ export class AgentRegistry {
     return { provider: this.get(selectedId), capabilities: capability, decision };
   }
 
+  /**
+   * Record what a run did, for diagnostics and the UI. Never a routing gate.
+   *
+   * A failure here is remembered and announced; it is not punished. The next
+   * caller — including a Resume the user pressed one second later — routes on
+   * what the CLI answers then, not on what it answered before.
+   */
   recordResult(
     provider: ProviderId,
     result: Pick<AgentRunResult, 'status' | 'error'>,
-    opts: { resumed?: boolean } = {},
+    _opts: { resumed?: boolean } = {},
   ): void {
     const at = this.now();
     if (result.status === 'completed') {
       this.health.set(provider, { lastSuccessAt: at.toISOString() });
       return;
     }
-    const next: HealthState = {
+    const kind = classifyAgentFailure(result);
+    const reset = kind === 'quota' ? parseQuotaReset(result.error) : null;
+    this.health.set(provider, {
       ...this.health.get(provider),
       lastFailureAt: at.toISOString(),
-    };
-    const kind = classifyAgentFailure(result);
-    // A broken persisted session says nothing about the provider's health, so it
-    // must not put an otherwise usable provider into cooldown. A protocol failure
-    // while resuming is the same story: the observed Codex case answered a fresh
-    // invocation perfectly and only failed on the resumed thread. Cooling the
-    // provider down there would make the one legitimate recovery unroutable, so
-    // the fresh-context attempt decides whether the provider is really unhealthy.
-    const sessionScoped = kind === 'session_invalid' || (kind === 'protocol' && opts.resumed);
-    if (!sessionScoped && ['quota', 'unavailable', 'timeout', 'protocol'].includes(kind)) {
-      next.cooldownUntil = new Date(at.getTime() + this.config.agents.cooldownMs).toISOString();
+      lastFailureKind: kind,
+      ...(reset ? { lastFailureReset: reset } : {}),
+    });
+    if (INFRASTRUCTURE_FAILURE_KINDS.includes(kind)) {
       this.deps.bus?.emit({
         type: kind === 'quota' ? 'agent.rate_limited' : 'agent.provider_unhealthy',
-        payload: { provider, kind, cooldownUntil: next.cooldownUntil },
+        payload: {
+          provider,
+          kind,
+          ...(reset ? { reportedReset: reset } : {}),
+          // Said out loud because the previous behaviour was the opposite.
+          routingBlocked: false,
+        },
       });
     }
-    this.health.set(provider, next);
   }
 
   decisions(jobId: string): RoutingDecision[] {
@@ -393,6 +441,12 @@ function routingReason(
     selected !== opts.avoid
   ) {
     return `independent cross-provider ${role}; ${model}`;
+  }
+  if (opts.avoid && selected !== opts.avoid) {
+    return `${opts.avoid} failed this action; alternate provider; ${model}`;
+  }
+  if (opts.avoid === selected) {
+    return `no healthy alternative to ${selected}; fresh attempt; ${model}`;
   }
   if ((role === 'reviewer' || role === 'visual_reviewer') && opts.avoid === selected) {
     return `no healthy alternative; fresh ${selected} context; ${model}`;

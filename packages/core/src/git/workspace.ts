@@ -461,6 +461,13 @@ export class GitWorkspace {
     repoRoot: string;
     worktreePath: string;
     baseRef: string;
+    /**
+     * The commit this worktree is expected to be on. `null` skips the
+     * comparison entirely — used by the caller that needs to CLASSIFY a
+     * mismatch (adopt, restore, abandon) rather than be stopped by one. Every
+     * other check below is unconditional: repository identity, base ancestry
+     * and the dirty gate are not recoverable by picking a different commit.
+     */
     expectedHead?: string | null;
     allowDirty?: boolean;
   }): Promise<RepoStatus> {
@@ -480,12 +487,14 @@ export class GitWorkspace {
       );
     }
     await requireAncestor(opts.worktreePath, opts.baseRef, status.head, 'recovery_base_mismatch');
-    const expectedHead = opts.expectedHead ?? opts.baseRef;
-    if (status.head !== expectedHead) {
-      throw new GitError(
-        `recovery HEAD changed (${expectedHead} -> ${status.head})`,
-        'recovery_head_mismatch',
-      );
+    if (opts.expectedHead !== null) {
+      const expectedHead = opts.expectedHead ?? opts.baseRef;
+      if (status.head !== expectedHead) {
+        throw new GitError(
+          `recovery HEAD changed (${expectedHead} -> ${status.head})`,
+          'recovery_head_mismatch',
+        );
+      }
     }
     if (status.dirty && !opts.allowDirty) {
       throw new GitError(
@@ -781,6 +790,26 @@ async function rejectSharedAttributes(repo: string): Promise<void> {
 async function repositoryIdentity(dir: string): Promise<string> {
   const common = await git(dir, ['rev-parse', '--git-common-dir']);
   return canonicalPath(path.isAbsolute(common) ? common : path.resolve(dir, common));
+}
+
+/**
+ * Is `descendant` reachable from `ancestor`? Read-only and never throws.
+ *
+ * Used where a mismatch is a decision rather than an error: recording the
+ * commit an authorised agent produced, and judging whether a HEAD Jarvis did
+ * not create still sits on top of the Job's own base.
+ */
+export async function isAncestor(
+  cwd: string,
+  ancestor: string,
+  descendant: string,
+): Promise<boolean> {
+  try {
+    await git(cwd, ['merge-base', '--is-ancestor', ancestor, descendant]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function requireAncestor(

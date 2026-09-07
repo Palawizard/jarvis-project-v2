@@ -10,7 +10,7 @@
 - Playwright screenshot evidence and manual human acceptance boundary.
 - Explicit candidate approval plus persisted clean-target FF-only application.
 - Isolated dynamic candidate runtimes, deterministic interaction scripts, and real subscription-backed image-review adapters.
-- Deterministic provider/model routing with health, cooldowns, explanations, and opt-in real-provider smoke tests.
+- Deterministic provider/model routing with health, explanations, and opt-in real-provider smoke tests.
 - External supervisor activation protocol, health endpoint, rollback ref, and temporary-repository rollback tests.
 - Deterministic EN/FR memory classification and fail-closed ambiguous forget.
 - Central risk-classified tool permission policy, persisted audit, user-only standing permissions, atomic approval expiry, cooperative timeout cancellation, and restart recovery.
@@ -27,7 +27,7 @@
 - Supervisor activation requires Jarvis to have been launched under the external supervisor, which `pnpm dev` now does by default; `pnpm dev:unsupervised`, candidate runtimes, and any other unsupervised process can prepare but not activate.
 - The running supervisor is never hot-replaced: activating a candidate that changes `scripts/supervisor.mjs`, `scripts/dev.mjs`, or the Windows job runner flags `supervisorRestartRequired` in the signed evidence and takes effect only at the next `pnpm dev`.
 - Runtime port reservation has an unavoidable narrow handoff race for arbitrary frameworks; Jarvis self-candidates close it with a per-launch nonce and commit check, while generic projects rely on their configured health contract.
-- Provider cooldowns are runtime-local; restarting Jarvis clears them. Within a run, recoverable provider failures are recorded and rerouted with a bounded stage budget.
+- Provider failures are recorded for the UI, diagnostics and the routing reason, and are never a routing lock: there is no cooldown gate a later Resume has to wait out. Within one logical action, recoverable provider failures reroute once to a healthy alternate and then pause.
 - Route/interaction configuration is deterministic and deliberately small, not a browser agent.
 - Restart recovery pauses running development jobs with their worktree checkpoint and marks running agent calls interrupted. Candidate application/supervisor crash recovery remains separately conservative.
 - Tool Registry contains only tools needed for the bootstrap slice; the permission layer is built ahead of the modules that will need it, so `sensitive` and `destructive` are exercised by tests rather than by shipped tools.

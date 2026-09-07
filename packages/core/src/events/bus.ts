@@ -20,6 +20,23 @@ export type JarvisEventType =
   | 'job.brief.compilation.started'
   | 'job.brief.compilation.completed'
   | 'job.brief.compilation.failed'
+  // The Execution Advisor: how much model one Job needs, for a Job created with
+  // no compiled brief to read it from. Payloads hold the bounded recommendation
+  // and its reasons, never the request.
+  | 'job.execution_advice.started'
+  | 'job.execution_advice.completed'
+  | 'job.execution_advice.failed'
+  // HEAD-bound evidence. `reused` says an expensive stage was SKIPPED because
+  // its result already describes this exact commit; `invalidated` says the
+  // candidate moved and which statements stopped describing it. Between them
+  // they are the audit trail for every stage that did not run.
+  | 'job.evidence.reused'
+  | 'job.evidence.invalidated'
+  // What Resume actually decided to do, and why. Emitted before the transition
+  // runs, so a Job that paused with nothing useful to do says so on the record.
+  | 'job.transition.planned'
+  // A human adopted a candidate HEAD that Jarvis did not create.
+  | 'job.head.adopted'
   | 'candidate.approved'
   | 'candidate.apply.started'
   | 'candidate.apply.completed'

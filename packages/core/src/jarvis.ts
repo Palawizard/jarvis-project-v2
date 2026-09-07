@@ -149,6 +149,7 @@ export class Jarvis {
         defaultTimeoutMs: config.tools.defaultTimeoutMs,
         approvalTtlMs: config.tools.approvalTtlMs,
         maxRecordChars: config.tools.maxRecordChars,
+        maxInputChars: config.tools.maxInputChars,
       },
     );
     this.chat = new ChatService({

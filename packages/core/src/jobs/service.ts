@@ -10,6 +10,8 @@ import type { VisualReviewFinding } from '../visualqa/engine.js';
 import { redactSecrets } from '../memory/secrets.js';
 import { createLogger } from '../logger.js';
 import { parseStoredBrief, type CompiledJobBrief } from './brief.js';
+import { parseExecutionRecommendation, type ExecutionRecommendation } from '../agents/policy.js';
+import type { AgentFailureKind } from '../agents/registry.js';
 
 const log = createLogger('jobs');
 
@@ -82,8 +84,60 @@ export interface Job {
   repairCheckpoint: RepairCheckpoint | null;
   lastProvider: ProviderId | null;
   resumeSessionId: string | null;
+  /**
+   * HEAD-BOUND EVIDENCE. Each of these names the exact candidate commit a
+   * stage's result describes. Evidence is valid while its head equals
+   * `headRef`, and goes stale the moment the candidate moves — nothing is
+   * deleted, it simply stops matching. Null means the stage has no evidence
+   * for any commit, which is also what a Job created before schema 17 reads
+   * back as, so the conservative answer there is always "run it".
+   */
+  /** Deterministic verification PASSED on this commit. */
+  verifiedHead: string | null;
+  /** A successful review APPROVED this commit. */
   reviewedHead: string | null;
+  /**
+   * A review ran successfully on this commit and returned blocking findings.
+   *
+   * The distinction from `reviewedHead` is what stops Resume from paying for a
+   * second reviewer that can only reach the same verdict: reviewing an
+   * unchanged candidate again cannot change what is in it. A reviewer that
+   * failed on quota, capacity or protocol sets NEITHER — no review happened.
+   */
+  reviewBlockedHead: string | null;
+  /** Interactive Visual QA passed on this commit. */
   visualHead: string | null;
+  /**
+   * Visual QA reached A conclusion on this commit, whatever the conclusion was
+   * — passed, product defect, skipped, inconclusive or infrastructure error.
+   *
+   * Separate from `visualHead` because approval means "passed" and must keep
+   * meaning exactly that, while Resume needs the weaker fact: a browser has
+   * already been driven against this exact candidate, so driving it again buys
+   * nothing until the candidate changes.
+   */
+  visualAttemptHead: string | null;
+  /** The closing `kind: 'final'` verification gate passed on this commit. */
+  finalGateHead: string | null;
+  /**
+   * Fingerprint of the deterministic failures the last full verification found.
+   * Compared before a second verification fixer is allowed to run: an identical
+   * signature means the previous fixer changed nothing that matters, and a
+   * third look at the same failure is quota spent on a loop.
+   */
+  verificationSignature: string | null;
+  /**
+   * Why the current pause happened, classified. `null` for a product pause
+   * (failing checks, real review findings); an infrastructure kind means no
+   * product budget was spent and Resume may simply try again.
+   */
+  pauseFailureKind: AgentFailureKind | null;
+  /**
+   * The semantic execution recommendation for this Job's implementer, when it
+   * did not come from a compiled brief. Persisted so Resume reuses it instead
+   * of paying for the Execution Advisor again. See `jobs/advisor.ts`.
+   */
+  executionRecommendation: ExecutionRecommendation | null;
   candidateBaseSha: string | null;
   candidateSourceSha: string | null;
   validationOnly: boolean;
@@ -163,8 +217,16 @@ function rowToJob(row: Row): Job {
     repairCheckpoint: parseJson(row.repair_checkpoint as string, null as RepairCheckpoint | null),
     lastProvider: (row.last_provider as ProviderId) ?? null,
     resumeSessionId: (row.resume_session_id as string) ?? null,
+    verifiedHead: (row.verified_head as string) ?? null,
     reviewedHead: (row.reviewed_head as string) ?? null,
+    reviewBlockedHead: (row.review_blocked_head as string) ?? null,
     visualHead: (row.visual_head as string) ?? null,
+    visualAttemptHead: (row.visual_attempt_head as string) ?? null,
+    finalGateHead: (row.final_gate_head as string) ?? null,
+    verificationSignature: (row.verification_signature as string) ?? null,
+    pauseFailureKind: (row.pause_failure_kind as AgentFailureKind) ?? null,
+    executionRecommendation:
+      parseExecutionRecommendation(parseJson(row.execution_recommendation as string, null)) ?? null,
     candidateBaseSha: (row.candidate_base_sha as string) ?? null,
     candidateSourceSha: (row.candidate_source_sha as string) ?? null,
     validationOnly: Number(row.validation_only) === 1,
@@ -307,8 +369,15 @@ export class JobService {
       repairCheckpoint: null,
       lastProvider: null,
       resumeSessionId: null,
+      verifiedHead: null,
       reviewedHead: null,
+      reviewBlockedHead: null,
       visualHead: null,
+      visualAttemptHead: null,
+      finalGateHead: null,
+      verificationSignature: null,
+      pauseFailureKind: null,
+      executionRecommendation: null,
       candidateBaseSha: input.candidateSource?.baseSha ?? null,
       candidateSourceSha: input.candidateSource?.sourceSha ?? null,
       validationOnly: input.validationOnly ?? false,
@@ -456,7 +525,9 @@ export class JobService {
         `UPDATE jobs SET stage=?, status=?, error=?, branch=?, worktree_path=?, base_ref=?, head_ref=?,
           fix_cycles=?, review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?,
           restart_reason=?, repair_kind=?, repair_checkpoint=?, last_provider=?, resume_session_id=?,
-          reviewed_head=?, visual_head=?, candidate_base_sha=?,
+          verified_head=?, reviewed_head=?, review_blocked_head=?, visual_head=?,
+          visual_attempt_head=?, final_gate_head=?, verification_signature=?, pause_failure_kind=?,
+          execution_recommendation=?, candidate_base_sha=?,
           candidate_source_sha=?, validation_only=?, visual_qa_config=?,
           visual_qa_plan=CASE WHEN ? THEN ? ELSE visual_qa_plan END,
           visual_qa_status=?, episode_id=?, goal=?,
@@ -480,8 +551,15 @@ export class JobService {
         next.repairCheckpoint ? JSON.stringify(next.repairCheckpoint) : null,
         next.lastProvider,
         next.resumeSessionId,
+        next.verifiedHead,
         next.reviewedHead,
+        next.reviewBlockedHead,
         next.visualHead,
+        next.visualAttemptHead,
+        next.finalGateHead,
+        next.verificationSignature,
+        next.pauseFailureKind,
+        next.executionRecommendation ? JSON.stringify(next.executionRecommendation) : null,
         next.candidateBaseSha,
         next.candidateSourceSha,
         next.validationOnly ? 1 : 0,
@@ -519,8 +597,10 @@ export class JobService {
       .prepare(
         `UPDATE jobs SET error=?, branch=?, worktree_path=?, base_ref=?, head_ref=?, fix_cycles=?,
           review_fix_cycles=?, visual_fix_cycles=?, resume_stage=?, pause_reason=?, last_provider=?,
-          restart_reason=?, repair_kind=?, repair_checkpoint=?, resume_session_id=?, reviewed_head=?,
-          visual_head=?, candidate_base_sha=?,
+          restart_reason=?, repair_kind=?, repair_checkpoint=?, resume_session_id=?,
+          verified_head=?, reviewed_head=?, review_blocked_head=?, visual_head=?,
+          visual_attempt_head=?, final_gate_head=?, verification_signature=?, pause_failure_kind=?,
+          execution_recommendation=?, candidate_base_sha=?,
           candidate_source_sha=?, validation_only=?, visual_qa_config=?,
           visual_qa_plan=CASE WHEN ? THEN ? ELSE visual_qa_plan END,
           visual_qa_status=?, episode_id=?, goal=?,
@@ -542,8 +622,15 @@ export class JobService {
         next.repairKind,
         next.repairCheckpoint ? JSON.stringify(next.repairCheckpoint) : null,
         next.resumeSessionId,
+        next.verifiedHead,
         next.reviewedHead,
+        next.reviewBlockedHead,
         next.visualHead,
+        next.visualAttemptHead,
+        next.finalGateHead,
+        next.verificationSignature,
+        next.pauseFailureKind,
+        next.executionRecommendation ? JSON.stringify(next.executionRecommendation) : null,
         next.candidateBaseSha,
         next.candidateSourceSha,
         next.validationOnly ? 1 : 0,

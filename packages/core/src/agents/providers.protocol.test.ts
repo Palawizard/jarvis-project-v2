@@ -120,7 +120,6 @@ function config() {
       reviewerProvider: undefined,
       claudePermissionMode: 'acceptEdits',
       runTimeoutMs: 90_000,
-      cooldownMs: 1000,
     },
   });
 }

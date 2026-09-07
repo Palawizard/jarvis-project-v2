@@ -200,11 +200,23 @@ export interface ToolRegistryOptions {
   /** How long an unanswered approval request stays actionable. */
   approvalTtlMs?: number;
   /**
-   * Ceiling on the JSON kept per input/result. Results above it are truncated;
-   * arguments above it are refused, because a truncated payload must never be
-   * replayed by an approval.
+   * Ceiling on the audit/UI PREVIEW kept for a result or an error. DISPLAY
+   * ONLY: it never decides whether a tool may run.
    */
   maxRecordChars?: number;
+  /**
+   * Storage safety bound on the canonical arguments of one call.
+   *
+   * These were one number, and that was the bug: a 4,000-character budget
+   * chosen so an audit row would stay readable also decided whether a call
+   * could execute, so a legitimate 4,644-character structured request was
+   * refused outright with "exceeds the 4000 character limit". A preview budget
+   * has no business being a correctness gate. Arguments are still REFUSED
+   * rather than truncated when they exceed this one, because a truncated
+   * payload must never be executed, approved or replayed — but the bound is now
+   * a real storage limit rather than a display convenience.
+   */
+  maxInputChars?: number;
 }
 
 type Row = Record<string, unknown>;
@@ -229,6 +241,7 @@ export class ToolRegistry {
   readonly #defaultTimeoutMs: number;
   readonly #approvalTtlMs: number;
   readonly #maxRecordChars: number;
+  readonly #maxInputChars: number;
 
   constructor(options: ToolRegistryOptions) {
     this.#db = options.db;
@@ -236,6 +249,7 @@ export class ToolRegistry {
     this.#defaultTimeoutMs = options.defaultTimeoutMs ?? 60_000;
     this.#approvalTtlMs = options.approvalTtlMs ?? 24 * 60 * 60_000;
     this.#maxRecordChars = options.maxRecordChars ?? 4000;
+    this.#maxInputChars = options.maxInputChars ?? 256_000;
   }
 
   // ------------------------------------------------------------------ catalog
@@ -384,11 +398,11 @@ export class ToolRegistry {
           `(${secrets.matches.join(', ')})`,
       );
     }
-    if (serialized.length > this.#maxRecordChars) {
+    if (serialized.length > this.#maxInputChars) {
       return refuse(
         'input_too_large',
         `refused: ${serialized.length} characters of arguments exceeds ` +
-          `the ${this.#maxRecordChars} character limit`,
+          `the ${this.#maxInputChars} character storage limit`,
       );
     }
 
@@ -453,7 +467,7 @@ export class ToolRegistry {
     const parsed = (tool.input as z.ZodType).safeParse(rawInput);
     if (!parsed.success) return refused();
     const serialized = safeJson(parsed.data);
-    if (serialized === null || serialized.length > this.#maxRecordChars) return refused();
+    if (serialized === null || serialized.length > this.#maxInputChars) return refused();
     const canonicalInput = JSON.parse(serialized) as unknown;
     if (
       !isDeepStrictEqual(parsed.data, canonicalInput) ||
@@ -1115,8 +1129,12 @@ export class ToolRegistry {
   }
 
   /**
-   * Serialise for the audit log: redacted and bounded. A tool result can echo
-   * text that matches a credential pattern, and the log is long-lived.
+   * Serialise a RESULT for the audit log: redacted and bounded. A tool result
+   * can echo text that matches a credential pattern, and the log is long-lived.
+   *
+   * Truncation here is a display decision and touches nothing else: the stored
+   * execution payload, the canonical hash an approval is bound to and the
+   * arguments a replay uses are all the full value, held separately.
    */
   #record(value: unknown): string {
     const redacted = redactSecrets(safeJson(value) ?? '"[unserialisable]"');

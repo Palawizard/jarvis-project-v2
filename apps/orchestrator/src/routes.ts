@@ -902,6 +902,15 @@ export function createRoutes(jarvis: Jarvis): Hono {
       // Resuming a candidate whose target has moved on is the failure mode this
       // surfaces before the button is ever pressed.
       staleness: job.stage === 'paused' ? await jarvis.lifecycle.staleness(job.id) : null,
+      // What Resume would actually DO. Computed by the same planner the
+      // pipeline runs, so the paused view can say which stages will be reused,
+      // which will run, and when nothing useful can happen at all — instead of
+      // offering a button that spends quota to arrive back where it started.
+      resumePlan: job.stage === 'paused' ? await jarvis.pipeline.resumePlan(job.id) : null,
+      providerHealth: (['claude', 'codex'] as const).map((provider) => ({
+        provider,
+        lastFailure: jarvis.agents.lastFailure(provider),
+      })),
       deletionPlan: jarvis.lifecycle.deletionPlan(job.id),
     });
   });
@@ -942,6 +951,23 @@ export function createRoutes(jarvis: Jarvis): Hono {
     if (!job) return fail('job not found', 404);
     if (job.stage !== 'paused') return fail(`job is ${job.stage}, not paused`, 409);
     const outcome = await jarvis.tools.execute('job.resume', { id }, { actor: 'user', jobId: id });
+    return settled(outcome);
+  });
+
+  /**
+   * Adopt the commit sitting in a paused Job's worktree that Jarvis did not
+   * create. `sensitive`, so it always confirms and no agent can reach it.
+   */
+  app.post('/api/jobs/:id/adopt-head', async (c) => {
+    const id = c.req.param('id');
+    const job = jarvis.jobs.get(id);
+    if (!job) return fail('job not found', 404);
+    if (job.stage !== 'paused') return fail(`job is ${job.stage}, not paused`, 409);
+    const outcome = await jarvis.tools.execute(
+      'job.adoptHead',
+      { id },
+      { actor: 'user', jobId: id },
+    );
     return settled(outcome);
   });
 

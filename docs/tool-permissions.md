@@ -89,6 +89,26 @@ An approval is bound to three persisted integrity values: the reviewed risk, the
 Tool *results* are always redacted and bounded; a result is never re-executed,
 so redaction there is lossless.
 
+### Two limits, and only one of them is a gate
+
+`JARVIS_TOOL_MAX_RECORD_CHARS` (default 4,000) bounds the audit/UI **preview**
+of a result or an error. It is a display budget and it decides nothing about
+whether a call may run.
+
+It used to decide both, and that was a real execution bug: a legitimate
+4,644-character structured request was refused outright with *"4644 characters
+of arguments exceeds the 4000 character limit"* — a payload rejected because
+somebody had once chosen a comfortable width for an audit row. The two questions
+are now separate.
+
+Canonical arguments are gated by a large fixed storage bound (256,000
+characters) with **no environment override**, because the only interesting
+direction to move it is up, and up is the denial-of-service direction. Arguments
+above it are still refused rather than truncated — a truncated payload must
+never be executed, approved or replayed — but a normal structured request in
+the tens of thousands of characters now executes, is stored in full, is hashed
+in full, and is replayed in full, whatever a preview elsewhere shows.
+
 ## Long actions and recovery
 
 - Every invocation has a timeout (`JARVIS_TOOL_TIMEOUT_MS`, default 60s, or the

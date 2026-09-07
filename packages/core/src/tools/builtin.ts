@@ -575,6 +575,24 @@ export function registerBuiltinTools(
   });
 
   registry.register({
+    name: 'job.adoptHead',
+    revision: '1',
+    description:
+      'Adopt the commit currently checked out in a paused Job’s candidate worktree as its ' +
+      'candidate, when Jarvis did not create it. Evidence bound to the previous commit ' +
+      'becomes stale and the required stages run again.',
+    // `sensitive`, so no agent can reach it and a human always confirms: this is
+    // the one operation that promotes a commit nothing has reviewed into the
+    // candidate position. Exact HEAD binding is not weakened by it — the
+    // adoption is recorded, audited, and invalidates the old evidence.
+    risk: 'sensitive',
+    input: z.object({ id: z.string() }).strict(),
+    async execute(input) {
+      return deps.pipeline.adoptCandidateHead(input.id);
+    },
+  });
+
+  registry.register({
     name: 'job.retry',
     revision: '1',
     description:

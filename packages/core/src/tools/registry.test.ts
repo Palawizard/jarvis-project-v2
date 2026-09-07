@@ -29,7 +29,9 @@ afterEach(() => {
   for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true });
 });
 
-function registry(overrides: { approvalTtlMs?: number; maxRecordChars?: number } = {}) {
+function registry(
+  overrides: { approvalTtlMs?: number; maxRecordChars?: number; maxInputChars?: number } = {},
+) {
   return new ToolRegistry({ db, bus, defaultTimeoutMs: 500, ...overrides });
 }
 
@@ -196,13 +198,77 @@ describe('tool execution and gating', () => {
   });
 
   it('refuses arguments too large to store faithfully instead of truncating them', async () => {
-    const reg = registry({ maxRecordChars: 64 });
+    const reg = registry({ maxInputChars: 64 });
     const { tool, calls } = counter('demo.big');
     reg.register(tool);
     const outcome = await reg.execute('demo.big', { text: 'x'.repeat(200) }, { actor: 'user' });
     expect(outcome.status).toBe('denied');
     expect(calls).toEqual([]);
     expect(reg.executions({ status: 'denied' })[0]?.reason).toBe('input_too_large');
+  });
+
+  // THE 4,000-CHARACTER BUG. An audit/UI preview budget also decided whether a
+  // call could execute, so a legitimate 4,644-character structured request was
+  // refused outright: "4644 characters of arguments exceeds the 4000 character
+  // limit". The preview budget still exists and is still small; it just has no
+  // say in whether a tool may run.
+  it('executes, stores and replays a payload far larger than the audit preview budget', async () => {
+    const reg = registry({ maxRecordChars: 4000 });
+    const { tool, calls } = counter('demo.large');
+    reg.register(tool);
+    const text = 'requirement '.repeat(2_000);
+    expect(text.length).toBeGreaterThan(16_000);
+
+    const outcome = await reg.execute('demo.large', { text }, { actor: 'user' });
+
+    expect(outcome.status).toBe('succeeded');
+    // The tool saw the WHOLE payload, not a preview of it.
+    expect(calls).toEqual([{ text }]);
+    const [row] = reg.executions({ status: 'succeeded' });
+    expect((row?.input as { text: string }).text).toBe(text);
+    expect(row?.inputValidated).toBe(true);
+    expect(row?.inputHash).toBeTruthy();
+  });
+
+  // An approval that outlives the process replays exactly what it approved. The
+  // binding is to the FULL arguments, whatever a preview elsewhere shows.
+  it('binds an approval and its replay to the full arguments of a large payload', async () => {
+    const reg = registry({ maxRecordChars: 200 });
+    const { tool, calls } = counter('mail.large', 'sensitive');
+    reg.register(tool);
+    const text = 'a'.repeat(20_000);
+
+    const requested = await reg.execute('mail.large', { text }, { actor: 'user' });
+    if (requested.status !== 'pending_approval') throw new Error('expected a pending request');
+    expect((requested.execution.input as { text: string }).text).toBe(text);
+    const hash = requested.execution.inputHash;
+
+    const approved = await reg.approve(requested.execution.id);
+
+    expect(approved.status).toBe('succeeded');
+    expect(calls).toEqual([{ text }]);
+    // Same canonical identity before and after: the approval a human gave is
+    // still bound to the exact bytes that ran.
+    expect(approved.execution.inputHash).toBe(hash);
+    expect((approved.execution.input as { text: string }).text).toBe(text);
+    expect(approved.execution.input).toEqual(requested.execution.input);
+  });
+
+  // The preview budget keeps doing its (display) job on the way out.
+  it('still truncates a large RESULT for the audit log', async () => {
+    const reg = registry({ maxRecordChars: 200 });
+    reg.register({
+      name: 'demo.verbose',
+      revision: '1',
+      description: 'returns a lot',
+      risk: 'observe',
+      input: z.object({}),
+      execute: async () => 'y'.repeat(5_000),
+    });
+    const outcome = await reg.execute('demo.verbose', {}, { actor: 'user' });
+
+    expect(outcome.status).toBe('succeeded');
+    expect(JSON.stringify(outcome.execution.result)).toContain('truncated');
   });
 
   it('redacts a credential a tool returns before storing it', async () => {

@@ -17,7 +17,7 @@ import { openDb, type Db } from '../db/index.js';
 import { EventBus } from '../events/bus.js';
 import { GitWorkspace } from '../git/workspace.js';
 import { JOB_BRIEF_SCHEMA_VERSION, type CompiledJobBrief } from './brief.js';
-import { JobService } from './service.js';
+import { JobService, type Job } from './service.js';
 import { ProjectService, type Project, type ProjectCommands } from '../projects/service.js';
 import type { Review, ReviewFinding, ReviewOptions } from '../review/engine.js';
 import { VerificationEngine, type VerificationReport } from '../verification/engine.js';
@@ -26,6 +26,7 @@ import { nowIso } from '../ids.js';
 import type { VisualQaShot } from '../visualqa/engine.js';
 import type { InteractiveVisualQaResult, VisualQaBrief } from '../visualqa/agent.js';
 import type { JobStage } from './machine.js';
+import type { ExecutionRecommendation } from '../agents/policy.js';
 
 const roots: string[] = [];
 
@@ -71,6 +72,13 @@ const success = (result = 'done', sessionId?: string): AgentRunResult => ({
   status: 'completed',
   result,
   ...(sessionId ? { sessionId } : {}),
+  memoryProposals: [],
+});
+
+const failure = (error: string): AgentRunResult => ({
+  status: 'failed',
+  result: '',
+  error,
   memoryProposals: [],
 });
 
@@ -183,9 +191,11 @@ async function harness(options: {
   verification?: VerificationReport[];
   realVerification?: boolean;
   verificationInfraRetries?: number;
-  agentStageRetries?: number;
+  providerAttempts?: number;
   commands?: ProjectCommands;
   packageManifestForInstall?: boolean;
+  maxFixCycles?: number;
+  advisor?: { advise: (input: unknown) => Promise<ExecutionRecommendation | null> };
 }): Promise<Harness> {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-pipeline-'));
   roots.push(home);
@@ -209,9 +219,10 @@ async function harness(options: {
     home,
     pipeline: {
       ...baseConfig.pipeline,
+      maxFixCycles: options.maxFixCycles ?? baseConfig.pipeline.maxFixCycles,
       maxReviewFixCycles: options.maxReviewFixCycles ?? 2,
       maxVisualFixCycles: 2,
-      agentStageRetries: options.agentStageRetries ?? 1,
+      providerAttempts: options.providerAttempts ?? 2,
       verificationInfraRetries:
         options.verificationInfraRetries ?? baseConfig.pipeline.verificationInfraRetries,
     },
@@ -258,38 +269,74 @@ async function harness(options: {
     async run(input: Parameters<VerificationEngine['run']>[0]): Promise<VerificationReport> {
       verificationCalls.push(input.cycle ?? 0);
       if (options.realVerification) return realVerification.run(input);
-      const configured = options.verification?.[verificationCalls.length - 1];
-      if (configured) {
-        return {
-          ...configured,
-          results: configured.results.map((result) => ({ ...result, cycle: input.cycle })),
-        };
-      }
-      return {
-        passed: true,
-        ran: 1,
-        failureSummary: '',
-        failureKind: 'none',
-        results: [
-          {
-            id: `ver-${verificationCalls.length}`,
-            name: 'fixture',
-            command: 'fixture',
-            status: 'passed',
-            exitCode: 0,
-            output: '',
-            outputPath: null,
-            durationMs: 1,
-            cycle: input.cycle,
-            kind: 'check',
-            required: true,
+      const call = verificationCalls.length;
+      const configured = options.verification?.[call - 1];
+      const report: VerificationReport = configured
+        ? {
+            ...configured,
+            results: configured.results.map((result, index) => ({
+              ...result,
+              id: `${result.id}-c${call}-${index}`,
+              cycle: input.cycle ?? 0,
+            })),
+          }
+        : {
+            passed: true,
+            ran: 1,
+            failureSummary: '',
             failureKind: 'none',
-          },
-        ],
-      };
+            results: [
+              {
+                id: `ver-${call}`,
+                name: 'fixture',
+                command: 'fixture',
+                status: 'passed',
+                exitCode: 0,
+                output: '',
+                outputPath: null,
+                durationMs: 1,
+                cycle: input.cycle ?? 0,
+                kind: 'check',
+                required: true,
+                failureKind: 'none',
+              },
+            ],
+          };
+      // Persisted like the real engine does, so the HEAD-bound reuse path reads
+      // real rows rather than a stub that always answers "passed".
+      for (const result of report.results) {
+        db.prepare(
+          `INSERT INTO verifications
+            (id,job_id,cycle,name,command,cwd,exit_code,status,output,duration_ms,kind,required,
+             failure_kind,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ).run(
+          result.id,
+          input.jobId,
+          result.cycle,
+          result.name,
+          result.command,
+          input.cwd,
+          result.exitCode,
+          result.status,
+          result.output,
+          result.durationMs,
+          result.kind,
+          result.required ? 1 : 0,
+          result.failureKind,
+          nowIso(),
+        );
+      }
+      return report;
     },
     latestReport(jobId: string): VerificationReport {
       return options.realVerification ? realVerification.latestReport(jobId) : passedVerification();
+    },
+    // Reads the rows the fake `run` above did NOT write, so the reuse path is
+    // exercised against real persisted evidence rather than a stub that always
+    // says "passed".
+    latestRepairableReport(jobId: string): VerificationReport {
+      return realVerification.latestRepairableReport(jobId);
     },
     reportForResults(jobId: string, resultIds: string[], failureSummary: string) {
       return realVerification.reportForResults(jobId, resultIds, failureSummary);
@@ -326,6 +373,24 @@ async function harness(options: {
       );
       return row;
     },
+    list(jobId: string): Review[] {
+      return (
+        db
+          .prepare('SELECT * FROM reviews WHERE job_id = ? ORDER BY created_at ASC, rowid ASC')
+          .all(jobId) as Array<Record<string, unknown>>
+      ).map((row) => ({
+        id: row.id as string,
+        jobId: row.job_id as string,
+        runId: (row.run_id as string) ?? null,
+        provider: row.provider as string,
+        verdict: row.verdict as Review['verdict'],
+        summary: row.summary as string,
+        findings: JSON.parse((row.findings as string) || '[]') as ReviewFinding[],
+        headRef: (row.head_ref as string) ?? '',
+        blocking: Number(row.blocking) === 1,
+        createdAt: row.created_at as string,
+      }));
+    },
   };
   const pipeline = new JobPipeline({
     db,
@@ -344,6 +409,7 @@ async function harness(options: {
     agents,
     verification: verification as never,
     review: review as never,
+    ...(options.advisor ? { advisor: options.advisor as never } : {}),
   });
   const visualHeads: string[] = [];
   const visualBriefs: VisualQaBrief[] = [];
@@ -1629,7 +1695,7 @@ describe('job repair pipeline', () => {
     });
     expect(job.stage).toBe('paused');
     expect(job.pauseReason).toContain('Resume refused');
-    expect(job.pauseReason).toContain('dirty');
+    expect(job.pauseReason).toContain('uncommitted changes Jarvis did not make');
     expect(h.verificationCalls).toHaveLength(0);
     expect(h.reviewHeads).toHaveLength(0);
     h.db.close();
@@ -1676,13 +1742,6 @@ describe('provider-scoped session recovery', () => {
     headRef: opts.headRef,
     blocking: false,
   });
-  const failure = (error: string): AgentRunResult => ({
-    status: 'failed',
-    result: '',
-    error,
-    memoryProposals: [],
-  });
-
   async function runStage(
     h: Harness,
     provider: ProviderId,
@@ -1754,7 +1813,7 @@ describe('provider-scoped session recovery', () => {
       failure(`${preferredId} exited without a terminal structured event`),
     );
     const fallback = new FakeProvider(fallbackId, () => success('fallback completed'));
-    const h = await harness({ review, providers: [preferred, fallback], agentStageRetries: 2 });
+    const h = await harness({ review, providers: [preferred, fallback], providerAttempts: 3 });
     const { result } = await runStage(h, preferredId, `${preferredId}-session`);
     const preferredResumeIds = preferred.calls.map((call) => call.resumeSessionId);
     const fallbackResumeId = fallback.calls[0]?.resumeSessionId;
@@ -1810,7 +1869,7 @@ describe('provider-scoped session recovery', () => {
     const h = await harness({
       review,
       providers: [codex, claude],
-      agentStageRetries: 2,
+      providerAttempts: 3,
     });
     const { result } = await runStage(h, 'codex', 'codex-broken');
 
@@ -1821,15 +1880,600 @@ describe('provider-scoped session recovery', () => {
     h.db.close();
   });
 
-  it('does not exceed a zero-retry budget for a broken resumed session', async () => {
+  it('does not exceed a single-attempt budget for a broken resumed session', async () => {
     const codex = new FakeProvider('codex', () =>
       failure('Codex exited without a terminal structured event'),
     );
-    const h = await harness({ review, providers: [codex], agentStageRetries: 0 });
+    const h = await harness({ review, providers: [codex], providerAttempts: 1 });
     const { result } = await runStage(h, 'codex', 'codex-broken');
 
     expect(result.status).toBe('failed');
     expect(codex.calls.map((call) => call.resumeSessionId)).toEqual(['codex-broken']);
+    h.db.close();
+  });
+});
+
+// ===========================================================================
+// JOB PIPELINE v2 — the production failures this redesign exists to remove.
+//
+// Every case below is something that really happened and really cost quota:
+// a Resume that re-ran a whole verification suite on a commit it had already
+// verified, a second reviewer sent at an unchanged candidate, a provider outage
+// that consumed a product repair budget, a paused Job that could not be
+// recovered because an authorised agent had committed.
+// ===========================================================================
+
+describe('HEAD-bound evidence', () => {
+  /**
+   * Drive a Job to `awaiting_user`, then push it back to `paused` at a chosen
+   * stage WITHOUT touching the worktree. That is the shape of every real
+   * "paused after the expensive work was already done" case: the commit is
+   * unchanged, so every recorded piece of evidence still describes it.
+   */
+  async function pausedOnVerifiedCandidate(
+    h: Harness,
+    resumeStage: JobStage,
+    patch: Partial<Job> = {},
+  ) {
+    const finished = await runToRest(h);
+    expect(finished.stage).toBe('awaiting_user');
+    h.jobs.transition(finished.id, 'fixing');
+    h.jobs.transition(finished.id, 'paused', {
+      resumeStage,
+      pauseReason: 'fixture: provider unavailable',
+      ...patch,
+    });
+    return h.jobs.get(finished.id) as Job;
+  }
+
+  async function resumeToRest(h: Harness, jobId: string) {
+    h.pipeline.resume(jobId);
+    const deadline = Date.now() + 20_000;
+    while (h.pipeline.isRunning(jobId) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (h.pipeline.isRunning(jobId)) throw new Error('resume fixture timed out');
+    return h.jobs.get(jobId) as Job;
+  }
+
+  // A. Verification passed on X. The Job later paused during review. Resuming
+  // used to re-run the entire deterministic suite on X before it was allowed to
+  // try the reviewer again — minutes of CI to re-derive an answer on disk.
+  it('reuses verification evidence for an unchanged candidate instead of re-running it', async () => {
+    const h = await harness({ review: APPROVES.review });
+    const job = await pausedOnVerifiedCandidate(h, 'reviewing', { reviewedHead: null });
+    expect(job.verifiedHead).toBe(job.headRef);
+    const verificationsBefore = h.verificationCalls.length;
+    const reviewsBefore = h.reviewHeads.length;
+
+    const resumed = await resumeToRest(h, job.id);
+
+    expect(resumed.stage).toBe('awaiting_user');
+    expect(h.verificationCalls).toHaveLength(verificationsBefore);
+    expect(h.reviewHeads).toHaveLength(reviewsBefore + 1);
+    expect(h.reviewHeads.at(-1)).toBe(job.headRef);
+    expect(
+      h.bus
+        .list({ jobId: job.id, limit: 200 })
+        .some(
+          (event) => event.type === 'job.evidence.reused' && event.payload.stage === 'verification',
+        ),
+    ).toBe(true);
+    h.db.close();
+  });
+
+  // C. A successful review already exists for X. Nothing changed. A second
+  // equivalent reviewer can only re-derive the same verdict, at full cost.
+  it('never launches a second automatic review for an unchanged reviewed candidate', async () => {
+    const h = await harness({ review: APPROVES.review });
+    const job = await pausedOnVerifiedCandidate(h, 'reviewing');
+    expect(job.reviewedHead).toBe(job.headRef);
+    const reviewsBefore = h.reviewHeads.length;
+
+    const resumed = await resumeToRest(h, job.id);
+
+    expect(resumed.stage).toBe('awaiting_user');
+    expect(h.reviewHeads).toHaveLength(reviewsBefore);
+    expect(h.verificationCalls).toHaveLength(1);
+    h.db.close();
+  });
+
+  // B. The reviewer asked for changes, the batch fixer already ran, and nothing
+  // about the candidate has changed since. Verifying it again and reviewing it
+  // again both cost real quota to arrive back at exactly this state.
+  it('pauses with actionable state when the review repair budget is spent on an unchanged candidate', async () => {
+    const h = await harness({
+      maxReviewFixCycles: 1,
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'request_changes' as const,
+        summary: 'blocking',
+        findings: [highFinding()],
+        headRef: opts.headRef,
+        blocking: true,
+      }),
+    });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('paused');
+    expect(job.reviewFixCycles).toBe(1);
+    expect(job.reviewBlockedHead).toBe(job.headRef);
+    const verificationsBefore = h.verificationCalls.length;
+    const reviewsBefore = h.reviewHeads.length;
+
+    const resumed = await resumeToRest(h, job.id);
+
+    expect(resumed.stage).toBe('paused');
+    expect(h.verificationCalls).toHaveLength(verificationsBefore);
+    expect(h.reviewHeads).toHaveLength(reviewsBefore);
+    expect(resumed.pauseReason).toContain('review repair budget');
+    expect(resumed.pauseReason).toContain('continuation');
+
+    const plan = await h.pipeline.resumePlan(job.id);
+    expect(plan?.plan.kind).toBe('none');
+    expect(plan?.plan.reusing.join(' ')).toContain('verification');
+    h.db.close();
+  });
+
+  // The final gate is expensive by construction — it is the self-upgrade gate.
+  it('does not re-run a final gate that already passed on the same candidate', async () => {
+    const h = await harness({
+      realVerification: true,
+      commands: { test: 'node -e "process.exit(0)"' },
+      review: APPROVES.review,
+    });
+    h.projects.update(h.project.id, {
+      config: {
+        verification: {
+          steps: [
+            { name: 'test', command: 'node -e "process.exit(0)"', kind: 'check', required: true },
+            {
+              name: 'catalog',
+              command: 'node -e "process.exit(0)"',
+              kind: 'final',
+              required: true,
+            },
+          ],
+        },
+      },
+    });
+    const job = await pausedOnVerifiedCandidate(h, 'verifying');
+    expect(job.finalGateHead).toBe(job.headRef);
+    const before = h.verificationCalls.length;
+
+    const resumed = await resumeToRest(h, job.id);
+
+    expect(resumed.stage).toBe('awaiting_user');
+    expect(h.verificationCalls).toHaveLength(before);
+    h.db.close();
+  });
+});
+
+describe('product budgets versus provider attempts', () => {
+  // D. Quota is not a code problem. Charging a repair budget for it means a
+  // provider outage silently eats the fixer a real failure would have needed.
+  it('does not consume a review repair cycle when every reviewer provider fails', async () => {
+    const h = await harness({
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'none',
+        verdict: 'error' as const,
+        summary: 'No reviewer available: claude: usage limit reached',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: true,
+      }),
+    });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('paused');
+    expect(job.reviewFixCycles).toBe(0);
+    expect(job.reviewedHead).toBeNull();
+    expect(job.reviewBlockedHead).toBeNull();
+    // Verification evidence survives: a reviewer that could not run says
+    // nothing about whether the checks passed.
+    expect(job.verifiedHead).toBe(job.headRef);
+    expect(job.pauseFailureKind).toBe('quota');
+    h.db.close();
+  });
+
+  it('does not consume a verification repair cycle when the fixer provider is unavailable', async () => {
+    const provider = new FakeProvider('claude', (call) => {
+      if (call.role === 'implementer') {
+        fs.writeFileSync(path.join(call.cwd, 'change.txt'), 'first\n');
+        return success('implemented');
+      }
+      return failure("You've hit your usage limit for this session");
+    });
+    const h = await harness({
+      provider,
+      verification: [failedVerification('product'), passedVerification()],
+      review: APPROVES.review,
+    });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('paused');
+    expect(job.fixCycles).toBe(0);
+    expect(job.pauseFailureKind).toBe('quota');
+    expect(job.pauseReason).toContain('usage limit');
+    h.db.close();
+  });
+
+  // E. Two attempts, then stop. Never a chain that walks back and forth.
+  it('stops after two provider attempts for one logical action', async () => {
+    const claude = new FakeProvider('claude', () => failure('Claude usage limit reached'));
+    const codex = new FakeProvider('codex', () => failure('Codex capacity unavailable'));
+    const h = await harness({ providers: [claude, codex], review: APPROVES.review });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('paused');
+    expect(claude.calls.length + codex.calls.length).toBe(2);
+    expect(claude.calls).toHaveLength(1);
+    expect(codex.calls).toHaveLength(1);
+    h.db.close();
+  });
+});
+
+describe('progress-aware verification repair', () => {
+  const failing = (
+    id: string,
+    steps: Array<[string, 'passed' | 'failed']>,
+  ): VerificationReport => ({
+    passed: steps.every(([, status]) => status === 'passed'),
+    ran: steps.length,
+    failureSummary: steps
+      .filter(([, status]) => status === 'failed')
+      .map(([name]) => `${name} failed`)
+      .join('\n'),
+    failureKind: steps.every(([, status]) => status === 'passed') ? 'none' : 'product',
+    results: steps.map(([name, status], index) => ({
+      id: `${id}-${index}`,
+      name,
+      command: name,
+      status,
+      exitCode: status === 'passed' ? 0 : 1,
+      output: `${name}: ${status}`,
+      outputPath: null,
+      durationMs: 1,
+      cycle: 0,
+      kind: 'check' as const,
+      required: true,
+      failureKind: status === 'passed' ? ('none' as const) : ('product' as const),
+    })),
+  });
+
+  // G. unit+integration failing -> integration green, unit down to a residual.
+  // That is real progress and the second fixer finishes the job. A bare counter
+  // paused here and handed a nearly-finished candidate back to the human.
+  it('allows a second fixer when the failure signature actually moved', async () => {
+    const h = await harness({
+      maxFixCycles: 2,
+      verification: [
+        failing('c0', [
+          ['unit', 'failed'],
+          ['integration', 'failed'],
+        ]),
+        failing('c1', [
+          ['unit', 'failed'],
+          ['integration', 'passed'],
+        ]),
+        failing('c2', [
+          ['unit', 'passed'],
+          ['integration', 'passed'],
+        ]),
+      ],
+      review: APPROVES.review,
+    });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('awaiting_user');
+    expect(job.fixCycles).toBe(2);
+    expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(2);
+    h.db.close();
+  });
+
+  // H. The identical failure, twice. A third look cannot help and the budget
+  // says nothing useful — the signature does.
+  it('stops after one fixer when the failure signature did not move', async () => {
+    const identical = () => failing('same', [['unit', 'failed']]);
+    const h = await harness({
+      maxFixCycles: 2,
+      verification: [identical(), identical(), identical()],
+      review: APPROVES.review,
+    });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('paused');
+    expect(job.fixCycles).toBe(1);
+    expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(1);
+    expect(job.pauseReason).toContain('identical failure signature');
+    h.db.close();
+  });
+});
+
+describe('candidate HEAD recovery', () => {
+  // I. The agent committed and THEN the run failed on quota. `headRef` used to
+  // still name the commit from before the run, so the recovery check refused
+  // the mismatch forever and thirty minutes of committed work was unreachable.
+  it('records a commit an authorised agent produced even when its run then failed', async () => {
+    const provider = new FakeProvider('claude', (call) => {
+      if (call.role !== 'implementer') return failure('quota');
+      fs.writeFileSync(path.join(call.cwd, 'change.txt'), 'agent work\n');
+      execFileSync('git', ['add', '-A'], { cwd: call.cwd });
+      execFileSync(
+        'git',
+        ['-c', 'user.name=A', '-c', 'user.email=a@b', 'commit', '-qm', 'agent commit'],
+        { cwd: call.cwd },
+      );
+      return failure("You've hit your usage limit");
+    });
+    const h = await harness({ provider, review: APPROVES.review });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('paused');
+    expect(job.headRef).not.toBe(job.baseRef);
+    const worktreeHead = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: job.worktreePath as string,
+      encoding: 'utf8',
+    }).trim();
+    expect(job.headRef).toBe(worktreeHead);
+
+    // And the Job is recoverable rather than stranded.
+    const plan = await h.pipeline.resumePlan(job.id);
+    expect(plan?.recovery).toBeNull();
+    expect(plan?.plan.kind).toBe('verify');
+    h.db.close();
+  });
+
+  // B. An orchestrator restart gets no chance to record the commit an
+  // authorised run had already made. Refusing that mismatch is what used to
+  // discard half an hour of committed agent work behind "recovery HEAD
+  // changed" — with no way back short of editing the database.
+  it('recovers a commit an interrupted authorised run had already made', async () => {
+    const h = await harness({ review: APPROVES.review });
+    const job = h.jobs.create({ projectId: h.project.id, request: 'Interrupted implementation.' });
+    h.jobs.transition(job.id, 'planning');
+    h.jobs.transition(job.id, 'implementing');
+    const workspace = new GitWorkspace(h.config.worktreesDir);
+    const worktree = await workspace.createWorktree({ repoRoot: h.repo, jobId: job.id });
+    h.jobs.patch(job.id, {
+      worktreePath: worktree.path,
+      branch: worktree.branch,
+      baseRef: worktree.baseRef,
+      // Still the base: the run was killed before anything recorded its commit.
+      headRef: worktree.baseRef,
+    });
+    fs.writeFileSync(path.join(worktree.path, 'change.txt'), 'thirty minutes of work\n');
+    const committed = (await workspace.commitPending(worktree.path, 'agent commit')) as string;
+    expect(h.jobs.recoverInterrupted().jobs).toBe(1);
+
+    const plan = await h.pipeline.resumePlan(job.id);
+    expect(plan?.recovery).toBeNull();
+    expect(plan?.candidateHead).toBe(committed);
+
+    h.pipeline.resume(job.id);
+    const deadline = Date.now() + 20_000;
+    while (h.pipeline.isRunning(job.id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const resumed = h.jobs.get(job.id) as Job;
+    expect(resumed.headRef).toBe(committed);
+    expect(resumed.stage).toBe('awaiting_user');
+    expect(
+      h.bus
+        .list({ jobId: job.id, limit: 200 })
+        .some((event) => event.payload?.reason === 'interrupted_agent_commit'),
+    ).toBe(true);
+    h.db.close();
+  });
+
+  // J. A commit Jarvis did not create. Never adopted silently; adopting is an
+  // explicit human operation, and it invalidates the old evidence.
+  it('refuses an external HEAD change, then adopts it on an explicit request', async () => {
+    const h = await harness({ review: APPROVES.review });
+    const job = await runToRest(h);
+    expect(job.stage).toBe('awaiting_user');
+    const recorded = job.headRef as string;
+
+    h.jobs.transition(job.id, 'fixing');
+    h.jobs.transition(job.id, 'paused', { resumeStage: 'reviewing' });
+    const cwd = job.worktreePath as string;
+    fs.appendFileSync(path.join(cwd, 'change.txt'), 'human edit\n');
+    execFileSync('git', ['add', '-A'], { cwd });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=H', '-c', 'user.email=h@b', 'commit', '-qm', 'human commit'],
+      { cwd },
+    );
+    const external = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+
+    const before = await h.pipeline.resumePlan(job.id);
+    expect(before?.recovery?.kind).toBe('external_head_change');
+    expect(
+      before?.recovery?.options.some((option) => option.startsWith('Adopt current HEAD')),
+    ).toBe(true);
+
+    h.pipeline.resume(job.id);
+    const deadline = Date.now() + 20_000;
+    while (h.pipeline.isRunning(job.id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const refused = h.jobs.get(job.id) as Job;
+    expect(refused.stage).toBe('paused');
+    expect(refused.headRef).toBe(recorded);
+    expect(refused.pauseReason).toContain('Jarvis did not create');
+    expect(h.verificationCalls).toHaveLength(1);
+
+    await h.pipeline.adoptCandidateHead(job.id);
+    const adopted = h.jobs.get(job.id) as Job;
+    expect(adopted.headRef).toBe(external);
+    expect(adopted.verifiedHead).toBeNull();
+    expect(adopted.reviewedHead).toBeNull();
+    expect(
+      h.bus.list({ jobId: job.id, limit: 200 }).some((event) => event.type === 'job.head.adopted'),
+    ).toBe(true);
+
+    const after = await h.pipeline.resumePlan(job.id);
+    expect(after?.recovery).toBeNull();
+    expect(after?.plan.kind).toBe('verify');
+    h.db.close();
+  });
+});
+
+describe('semantic execution advice', () => {
+  const advice: ExecutionRecommendation = {
+    capabilityTier: 'strong',
+    effort: 'high',
+    reasons: ['self-development touching the permission boundary'],
+  };
+
+  // K. A Job created directly has no brief and must not compile one just to
+  // choose a model. It used to fall through to "long request" / "very long
+  // request", which is a proxy for typing rather than for difficulty.
+  it('asks the Execution Advisor once for a direct Job and maps the answer to an exact model', async () => {
+    const calls: unknown[] = [];
+    const h = await harness({
+      review: APPROVES.review,
+      advisor: {
+        advise: async (input) => {
+          calls.push(input);
+          return advice;
+        },
+      },
+    });
+    const job = await runToRest(h);
+
+    expect(calls).toHaveLength(1);
+    expect(job.executionRecommendation).toEqual(advice);
+    const implementer = h.provider.calls.find((call) => call.role === 'implementer');
+    expect(implementer?.model).toBe('opus');
+    expect(implementer?.effort).toBe('high');
+    h.db.close();
+  });
+
+  // L. The chat path already answers this question inside a call it was making
+  // anyway. Adding a second one there would be pure waste.
+  it('does not invoke the Execution Advisor when a compiled brief carries the recommendation', async () => {
+    const calls: unknown[] = [];
+    const h = await harness({
+      review: APPROVES.review,
+      advisor: {
+        advise: async (input) => {
+          calls.push(input);
+          return advice;
+        },
+      },
+    });
+    const job = await runToRest(h, {
+      projectId: '',
+      request: 'Add OAuth login.',
+      brief: { ...fixtureBrief(), executionRecommendation: advice },
+    });
+
+    expect(calls).toHaveLength(0);
+    expect(job.executionRecommendation).toBeNull();
+    const implementer = h.provider.calls.find((call) => call.role === 'implementer');
+    expect(implementer?.model).toBe('opus');
+    h.db.close();
+  });
+
+  it('reuses a persisted recommendation instead of asking again on Resume', async () => {
+    let calls = 0;
+    const h = await harness({
+      review: APPROVES.review,
+      advisor: {
+        advise: async () => {
+          calls++;
+          return advice;
+        },
+      },
+    });
+    const job = await runToRest(h);
+    expect(calls).toBe(1);
+
+    h.jobs.transition(job.id, 'fixing');
+    h.jobs.transition(job.id, 'paused', { resumeStage: 'reviewing', reviewedHead: null });
+    h.pipeline.resume(job.id);
+    const deadline = Date.now() + 20_000;
+    while (h.pipeline.isRunning(job.id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    expect(calls).toBe(1);
+    h.db.close();
+  });
+
+  // M. A short continuation command in front of a large, risky diff.
+  it('sends trusted continuation facts, not the length of the sentence', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const h = await harness({
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve' as const,
+        summary: 'approved',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+      advisor: {
+        advise: async (input) => {
+          seen.push(input as Record<string, unknown>);
+          return advice;
+        },
+      },
+    });
+    const first = await runToRest(h);
+    h.db
+      .prepare(
+        `INSERT INTO reviews (id,job_id,run_id,provider,verdict,summary,findings,head_ref,blocking,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        'rev-blocking',
+        first.id,
+        null,
+        'codex',
+        'request_changes',
+        'blocking findings remain',
+        JSON.stringify([highFinding()]),
+        first.headRef,
+        1,
+        nowIso(),
+      );
+
+    const continuation = h.jobs.create({
+      projectId: h.project.id,
+      request: 'continue',
+      predecessorJobId: first.id,
+    });
+    h.pipeline.start(continuation.id);
+    const deadline = Date.now() + 20_000;
+    while (h.pipeline.isRunning(continuation.id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    const facts = seen.at(-1)?.continuation as Record<string, unknown> | undefined;
+    expect(facts).toBeDefined();
+    expect(facts?.sourceHead).toBe(first.headRef);
+    expect(facts?.highSeverityFindings).toBe(1);
+    expect(facts?.filesChanged).toBeGreaterThan(0);
+    const implementer = h.provider.calls.filter((call) => call.role === 'implementer').at(-1);
+    expect(implementer?.model).toBe('opus');
+    expect(implementer?.effort).toBe('high');
+    h.db.close();
+  });
+
+  it('falls back to the deterministic policy when the advisor returns nothing', async () => {
+    const h = await harness({
+      review: APPROVES.review,
+      advisor: { advise: async () => null },
+    });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('awaiting_user');
+    expect(job.executionRecommendation).toBeNull();
+    expect(h.provider.calls.find((call) => call.role === 'implementer')?.model).toBe('sonnet');
     h.db.close();
   });
 });

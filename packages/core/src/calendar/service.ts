@@ -3,6 +3,7 @@ import type { EventBus } from '../events/bus.js';
 import type { JarvisConfig } from '../config.js';
 import { newId, nowIso } from '../ids.js';
 import { createLogger } from '../logger.js';
+import { addCalendarDays, calendarDate, localIso } from './dates.js';
 import { GoogleCalendarClient } from './google.js';
 import { CalDavClient } from './caldav.js';
 import {
@@ -66,6 +67,8 @@ export interface CalendarServiceDeps {
 export class CalendarService {
   #timer: ReturnType<typeof setInterval> | null = null;
   #syncing = false;
+  /** Serialises every sync, so a mandatory refresh can queue instead of drop. */
+  #queue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly deps: CalendarServiceDeps) {}
 
@@ -132,6 +135,9 @@ export class CalendarService {
       calendarId: chosen.id,
       calendarName: chosen.name,
       status: 'active',
+      // A shared or subscribed collection stays visible, but it is never
+      // presented as editable -- see `#writable`.
+      readOnly: chosen.writable === false,
       error: null,
       lastSyncAt: null,
       createdAt: now,
@@ -140,8 +146,8 @@ export class CalendarService {
     this.deps.db
       .prepare(
         `INSERT INTO calendar_accounts (id, provider, label, credentials, calendar_id, calendar_name,
-           status, error, last_sync_at, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+           status, read_only, error, last_sync_at, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         account.id,
@@ -151,6 +157,7 @@ export class CalendarService {
         account.calendarId,
         account.calendarName,
         account.status,
+        account.readOnly ? 1 : 0,
         null,
         null,
         now,
@@ -189,13 +196,23 @@ export class CalendarService {
     const params: (string | number)[] = [];
     // Overlap, not containment: a conference that started yesterday is still
     // what is happening today.
+    //
+    // Timed events overlap as INSTANTS; all-day events overlap as CALENDAR
+    // DATES. Comparing an all-day event as an instant is what made the 10th
+    // show up on the 9th for a caller in UTC-11 and on the 11th for one in
+    // UTC+14. The bounds keep both readings because the caller's own lexical
+    // date survives all the way here -- see `localIso`.
     if (query.to) {
-      where.push('e.starts_at < ?');
-      params.push(utcInstant(query.to));
+      where.push(
+        `(CASE WHEN e.all_day = 1 THEN substr(e.starts_at, 1, 10) < ? ELSE e.starts_at < ? END)`,
+      );
+      params.push(calendarDate(query.to), utcInstant(query.to));
     }
     if (query.from) {
-      where.push('e.ends_at > ?');
-      params.push(utcInstant(query.from));
+      where.push(
+        `(CASE WHEN e.all_day = 1 THEN substr(e.ends_at, 1, 10) > ? ELSE e.ends_at > ? END)`,
+      );
+      params.push(calendarDate(query.from), utcInstant(query.from));
     }
     if (query.accountId) {
       where.push('e.account_id = ?');
@@ -242,8 +259,10 @@ export class CalendarService {
    */
   renderUpcoming(limit = 12, now: Date = new Date()): string {
     if (!this.accounts().length) return '';
-    const from = now.toISOString();
-    const to = new Date(now.getTime() + 14 * 86_400_000).toISOString();
+    // Local, offset-bearing bounds: an all-day event on the user's own today
+    // must not be filtered out because UTC has already moved on.
+    const from = localIso(now);
+    const to = localIso(new Date(now.getTime() + 14 * 86_400_000));
     const events = this.events({ from, to, limit });
     if (!events.length) return 'Nothing scheduled in the next 14 days.';
     return events.map((event) => `- ${describeEvent(event)}`).join('\n');
@@ -280,15 +299,42 @@ export class CalendarService {
    * in the window and anything it did not return is removed. That is how an
    * event deleted or moved in Google or iCloud disappears here too, with no
    * sync-token bookkeeping to get wrong.
+   *
+   * Opportunistic: a timer tick that arrives while a sync is running simply
+   * skips, because it has no reason to queue behind another timer. A refresh
+   * that MUST happen goes through `#mustSync` instead.
    */
   async sync(accountId?: string): Promise<CalendarSyncReport[]> {
+    if (this.#syncing) return [];
+    return this.#mustSync(accountId);
+  }
+
+  /**
+   * A sync that is not allowed to be dropped: it waits its turn.
+   *
+   * A post-write mirror repair is mandatory -- skipping it leaves sibling
+   * occurrences of a shared CalDAV series holding an ETag the provider no
+   * longer accepts, so the next write on any of them fails until a background
+   * sync happens to run. Queued and coalesced on one chain, so it still never
+   * overlaps another window replace.
+   */
+  #mustSync(accountId?: string): Promise<CalendarSyncReport[]> {
+    const next = this.#queue.then(
+      () => this.#syncNow(accountId),
+      () => this.#syncNow(accountId),
+    );
+    this.#queue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  async #syncNow(accountId?: string): Promise<CalendarSyncReport[]> {
     const accounts = accountId
       ? [this.account(accountId)].filter((account): account is CalendarAccount => account !== null)
       : this.accounts();
     if (!accounts.length) return [];
-    // One sync at a time. Two overlapping window replaces would race on the
-    // same rows, and a five-minute timer has no reason to overlap itself.
-    if (this.#syncing) return [];
     this.#syncing = true;
     try {
       const reports: CalendarSyncReport[] = [];
@@ -398,7 +444,7 @@ export class CalendarService {
     accountId: string;
     draft: CalendarEventDraft;
   }): Promise<CalendarEvent> {
-    const account = this.#require(input.accountId);
+    const account = this.#writable(input.accountId);
     const draft = normaliseDraft(input.draft);
     const created = await this.#withClient(account, this.#credentials(account.id), (client) =>
       client.create(draft),
@@ -447,8 +493,10 @@ export class CalendarService {
    * A `series` write changes the master's own properties, and only a resync
    * can correctly reflect that everywhere -- Jarvis does not evaluate RRULE
    * locally -- so this triggers one instead of guessing the touched row's new
-   * fields. An `occurrence` write changes exactly the row that was asked
+   * fields. A Google `occurrence` write changes exactly the row that was asked
    * about, which is already known precisely: the draft that was sent.
+   *
+   * A CalDAV occurrence write is the exception -- see `mustRefresh`.
    */
   async updateEvent(
     id: string,
@@ -457,7 +505,7 @@ export class CalendarService {
   ): Promise<CalendarEvent> {
     const existing = this.event(id);
     if (!existing) throw new Error('event not found');
-    const account = this.#require(existing.accountId);
+    const account = this.#writable(existing.accountId);
     const draft = normaliseDraft({
       title: patch.title ?? existing.title,
       startsAt: patch.startsAt ?? existing.startsAt,
@@ -492,8 +540,8 @@ export class CalendarService {
         changed,
       ),
     );
-    if (existing.recurring && effectiveScope === 'series') {
-      await this.sync(account.id);
+    if (existing.recurring && mustRefresh(account.provider, effectiveScope)) {
+      await this.#mustSync(account.id);
       const stored = this.event(id) ?? this.#byRemote(account.id, existing.remoteId);
       if (!stored)
         throw new Error('the series was updated but this occurrence could not be read back');
@@ -541,7 +589,7 @@ export class CalendarService {
   ): Promise<{ deleted: boolean; title: string }> {
     const existing = this.event(id);
     if (!existing) throw new Error('event not found');
-    const account = this.#require(existing.accountId);
+    const account = this.#writable(existing.accountId);
     const row = this.deps.db
       .prepare('SELECT etag, raw FROM calendar_events WHERE id = ?')
       .get(id) as Row | undefined;
@@ -562,7 +610,9 @@ export class CalendarService {
       ),
     );
     this.deps.db.prepare('DELETE FROM calendar_events WHERE id = ?').run(id);
-    if (existing.recurring && effectiveScope === 'series') await this.sync(account.id);
+    if (existing.recurring && mustRefresh(account.provider, effectiveScope)) {
+      await this.#mustSync(account.id);
+    }
     this.deps.bus.emit({
       type: 'calendar.synced',
       payload: { accountId: account.id, deleted: id },
@@ -575,6 +625,23 @@ export class CalendarService {
   #require(accountId: string): CalendarAccount {
     const account = this.account(accountId);
     if (!account) throw new Error('calendar account not found');
+    return account;
+  }
+
+  /**
+   * The account a mutation is allowed to touch.
+   *
+   * A read-only collection is refused HERE, before a provider is asked, so
+   * Jarvis never claims a write it cannot make and never sends a doomed PUT.
+   * Every calendar mutation -- UI, tool or chat -- routes through this.
+   */
+  #writable(accountId: string): CalendarAccount {
+    const account = this.#require(accountId);
+    if (account.readOnly) {
+      throw new CalendarProviderError(
+        `${account.label} is connected read-only; Jarvis cannot change events in it`,
+      );
+    }
     return account;
   }
 
@@ -737,35 +804,32 @@ export function parseCredentials(provider: CalendarProviderId, raw: unknown): Ca
 }
 
 /**
+ * Must the whole account be refreshed before this write reports success?
+ *
+ * A `series` write changes the master's own properties, and Jarvis does not
+ * evaluate RRULE locally, so only a resync can reflect it everywhere.
+ *
+ * A CalDAV `occurrence` write needs it just as much, for a different reason:
+ * every occurrence of a CalDAV series lives in ONE shared resource, so writing
+ * one instance changes the provider ETag for all of them and returns the whole
+ * multi-VEVENT body rather than that occurrence's own. Without the refresh the
+ * siblings keep a stale ETag -- and the edited row keeps an undifferentiated
+ * series resource where occurrence-specific state belongs -- so the next write
+ * on any of them fails `If-Match` until a background sync happens to run.
+ * Google addresses each instance as its own resource with its own ETag, so it
+ * needs nothing here.
+ */
+function mustRefresh(provider: CalendarProviderId, scope: RecurrenceScope): boolean {
+  return scope === 'series' || provider === 'icloud';
+}
+
+/**
  * Bounds are compared as text against UTC columns, so an offset like `+02:00`
  * would sort wrong. Anything unparseable is left alone for SQLite to reject.
  */
 function utcInstant(value: string): string {
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
-}
-
-/**
- * The calendar date (`YYYY-MM-DD`) a lexical date/instant string names.
- *
- * All-day bounds are calendar dates, not instants: `2026-09-10T00:00:00+02:00`
- * means the 10th, everywhere, forever — not whatever day that instant happens
- * to fall on in UTC. Reading the date straight off the front of the string
- * (rather than through `new Date(...).toISOString()`) is what keeps a
- * positive or negative offset from rolling the date to its neighbour.
- */
-function calendarDate(value: string): string {
-  const lexical = /^(\d{4}-\d{2}-\d{2})/.exec(value.trim());
-  if (lexical) return lexical[1] as string;
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) throw new Error(`invalid date: ${value}`);
-  return parsed.toISOString().slice(0, 10);
-}
-
-/** One calendar date after `date`, computed from its components so no zone can shift it. */
-function addCalendarDays(date: string, days: number): string {
-  const [year, month, day] = date.split('-').map(Number) as [number, number, number];
-  return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
 }
 
 /** Refuse a draft that could not be placed on a timeline. */
@@ -816,6 +880,7 @@ function rowToAccount(row: Row): CalendarAccount {
     calendarId: row.calendar_id as string,
     calendarName: (row.calendar_name as string | null) ?? null,
     status: (row.status as 'active' | 'error') ?? 'active',
+    readOnly: Number(row.read_only ?? 0) === 1,
     error: (row.error as string | null) ?? null,
     lastSyncAt: (row.last_sync_at as string | null) ?? null,
     createdAt: row.created_at as string,

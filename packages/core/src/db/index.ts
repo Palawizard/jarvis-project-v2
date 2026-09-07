@@ -9,7 +9,7 @@ const log = createLogger('db');
 
 export type Db = DatabaseSync;
 
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 /**
  * A LIKE pattern for a term a human typed.
@@ -359,6 +359,18 @@ export const MIGRATIONS = new Map<number, string>([
     // reads back with series_id NULL, exactly what a non-recurring event
     // already had no other way to express.
     `ALTER TABLE calendar_events ADD COLUMN series_id TEXT;`,
+  ],
+  [
+    16,
+    // Whether the connected principal may write to the calendar. CalDAV can
+    // hand out read-only shared or subscribed collections, and connecting one
+    // as though it were fully editable turns every later edit into a provider
+    // rejection.
+    //
+    // Additive with a default: every account that existed before this
+    // migration keeps exactly the editable behaviour it already had, and the
+    // next discovery/connect is what can narrow it.
+    `ALTER TABLE calendar_accounts ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;`,
   ],
 ]);
 

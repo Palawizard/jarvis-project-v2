@@ -94,6 +94,23 @@ function toExdateLine(line: string): string {
 }
 
 /**
+ * Whether the connected principal may write to a discovered collection.
+ *
+ * RFC 3744's `current-user-privilege-set` is the only thing that distinguishes
+ * an own calendar from a shared or subscribed one that will refuse the PUT.
+ * A server that does not report the property at all leaves the question
+ * unanswered, and the honest default there is the behaviour that already
+ * worked: assume writable, and let the provider's own error speak. Read-only
+ * is claimed ONLY when the server actually listed its privileges and write was
+ * not among them.
+ */
+function isWritable(block: string): boolean {
+  const privileges = firstElement(block, 'current-user-privilege-set');
+  if (privileges === null) return true;
+  return ['all', 'write', 'write-content'].some((name) => hasElement(privileges, name));
+}
+
+/**
  * iCloud (and any other CalDAV server) over plain HTTP verbs.
  *
  * There is no CalDAV client dependency here because the protocol surface Jarvis
@@ -131,7 +148,8 @@ export class CalDavClient implements CalendarClient {
       depth: '1',
       body:
         '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">' +
-        '<d:prop><d:resourcetype/><d:displayname/><c:supported-calendar-component-set/></d:prop>' +
+        '<d:prop><d:resourcetype/><d:displayname/><c:supported-calendar-component-set/>' +
+        '<d:current-user-privilege-set/></d:prop>' +
         '</d:propfind>',
     });
     const calendars: RemoteCalendar[] = [];
@@ -143,10 +161,11 @@ export class CalDavClient implements CalendarClient {
       calendars.push({
         id: resolve(href, response.url),
         name: decodeXml(firstElement(block, 'displayname')?.trim() ?? '').trim() || 'Calendar',
+        writable: isWritable(block),
       });
     }
     if (!calendars.length) {
-      throw new CalendarProviderError('no writable iCloud calendar was found for this Apple ID');
+      throw new CalendarProviderError('no iCloud calendar was found for this Apple ID');
     }
     return calendars;
   }

@@ -581,6 +581,8 @@ export interface CalendarAccount {
   calendarId: string;
   calendarName: string | null;
   status: 'active' | 'error';
+  /** Connected as read-only: mutation controls are disabled for this account. */
+  readOnly: boolean;
   error: string | null;
   lastSyncAt: string | null;
   createdAt: string;
@@ -611,6 +613,7 @@ export interface CalendarEvent extends CalendarEventDraft {
 export interface RemoteCalendar {
   id: string;
   name: string;
+  writable: boolean;
 }
 
 export interface CalendarSyncReport {
@@ -790,6 +793,9 @@ export const api = {
   /** The calendars a just-completed Google OAuth round trip can reach. */
   googleConnectionCalendars: () =>
     request<{ calendars: RemoteCalendar[] }>('/api/calendar/google/connection'),
+  /** Abandons that round trip, dropping the server-side credential immediately. */
+  cancelGoogleConnection: () =>
+    request<{ cancelled: boolean }>('/api/calendar/google/connection', { method: 'DELETE' }),
   /** Finishes that OAuth round trip by connecting the calendar the human picked. */
   connectGoogleConnection: (calendarId: string, label?: string) =>
     request<CalendarAccount>('/api/calendar/google/connection', {

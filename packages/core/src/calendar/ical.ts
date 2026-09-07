@@ -8,6 +8,8 @@
  * recurrence rules that this code has no model for.
  */
 
+import { isCalendarDate } from './dates.js';
+
 export interface ParsedEvent {
   uid: string | null;
   summary: string;
@@ -155,15 +157,25 @@ export function zonedToUtc(
   }
 }
 
-/** Parse a DATE or DATE-TIME value into an ISO-8601 UTC instant. */
+/**
+ * Parse a DATE or DATE-TIME value into an ISO-8601 UTC instant.
+ *
+ * Null for anything that is not a real Gregorian date or clock time. A server
+ * (or a shared calendar) can send `20260230`, and letting `Date` normalise it
+ * to the 2nd of March would silently mirror an event onto a day it was never
+ * on -- refusing the value is the only honest answer.
+ */
 export function parseIcsDate(value: string, params: Record<string, string> = {}): string | null {
   const date = /^(\d{4})(\d{2})(\d{2})$/.exec(value.trim());
   if (date) {
+    if (!isCalendarDate(`${date[1]}-${date[2]}-${date[3]}`)) return null;
     return new Date(Date.UTC(Number(date[1]), Number(date[2]) - 1, Number(date[3]))).toISOString();
   }
   const stamp = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z)?$/.exec(value.trim());
   if (!stamp) return null;
   const [, y, mo, d, h, mi, s, utc] = stamp;
+  if (!isCalendarDate(`${y}-${mo}-${d}`)) return null;
+  if (Number(h) > 23 || Number(mi) > 59 || Number(s) > 60) return null;
   const parts = [Number(y), Number(mo), Number(d), Number(h), Number(mi), Number(s)] as const;
   if (utc || !params.TZID) {
     // No zone at all is a floating time. Reading it as UTC is a choice, not a

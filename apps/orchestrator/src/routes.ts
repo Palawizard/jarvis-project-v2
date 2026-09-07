@@ -83,6 +83,48 @@ export function createRoutes(jarvis: Jarvis): Hono {
     { credentials: GoogleCredentials; calendars: RemoteCalendar[]; expiresAt: number }
   >();
 
+  /**
+   * Hold a bounded, single-use entry and really drop it when it expires.
+   *
+   * Both maps hold OAuth secrets (a client secret, then the exchanged refresh
+   * token). An expiry stamp alone only makes an abandoned flow *look* expired:
+   * the entry stays strongly referenced until the process exits. The unref'd
+   * timer enforces the declared lifetime in real time without holding the
+   * process open, and `takePending` removes anything already stale that a
+   * request happens to reach first.
+   */
+  const holdPending = <V extends { expiresAt: number }>(
+    map: Map<string, V>,
+    key: string,
+    entry: V,
+  ): void => {
+    map.set(key, entry);
+    const timer = setTimeout(() => map.delete(key), Math.max(entry.expiresAt - Date.now(), 0));
+    timer.unref?.();
+  };
+  const readPending = <V extends { expiresAt: number }>(
+    map: Map<string, V>,
+    key: string | null | undefined,
+  ): V | null => {
+    if (!key) return null;
+    const entry = map.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      map.delete(key);
+      return null;
+    }
+    return entry;
+  };
+  /** Single use: reading it consumes it, so a replayed state cannot be reused. */
+  const takePending = <V extends { expiresAt: number }>(
+    map: Map<string, V>,
+    key: string | null | undefined,
+  ): V | null => {
+    const entry = readPending(map, key);
+    if (key) map.delete(key);
+    return entry;
+  };
+
   const fail = (message: string, status = 400) => Response.json({ error: message }, { status });
   /**
    * Answer with an outcome that really succeeded, or say plainly that it did not.
@@ -1158,11 +1200,8 @@ export function createRoutes(jarvis: Jarvis): Hono {
     ) {
       return fail('OAuth URLs must use an allowed Jarvis origin', 403);
     }
-    for (const [key, pending] of pendingGoogle) {
-      if (pending.expiresAt < Date.now()) pendingGoogle.delete(key);
-    }
     const state = randomUUID();
-    pendingGoogle.set(state, {
+    holdPending(pendingGoogle, state, {
       clientId: body.clientId.trim(),
       clientSecret: body.clientSecret.trim(),
       redirectUri: redirect.toString(),
@@ -1184,11 +1223,8 @@ export function createRoutes(jarvis: Jarvis): Hono {
   });
 
   app.get('/api/calendar/google/callback', async (c) => {
-    const state = c.req.query('state') ?? '';
-    const pending = pendingGoogle.get(state);
-    pendingGoogle.delete(state);
-    if (!pending || pending.expiresAt < Date.now())
-      return fail('Google authorization expired', 400);
+    const pending = takePending(pendingGoogle, c.req.query('state') ?? '');
+    if (!pending) return fail('Google authorization expired', 400);
     const redirect = (status: 'error' | 'choose', params: Record<string, string> = {}) => {
       const url = new URL('/calendar', pending.returnTo);
       url.searchParams.set('google', status);
@@ -1212,11 +1248,8 @@ export function createRoutes(jarvis: Jarvis): Hono {
       // this process: the browser only ever sees the calendar list, not the
       // refresh token that produced it.
       const calendars = await jarvis.calendar.discover({ provider: 'google', credentials });
-      for (const [key, entry] of pendingGoogleConnections) {
-        if (entry.expiresAt < Date.now()) pendingGoogleConnections.delete(key);
-      }
       const connection = randomUUID();
-      pendingGoogleConnections.set(connection, {
+      holdPending(pendingGoogleConnections, connection, {
         credentials,
         calendars,
         expiresAt: Date.now() + 10 * 60_000,
@@ -1243,19 +1276,26 @@ export function createRoutes(jarvis: Jarvis): Hono {
   // so it stays the easy default without being the only option.
   app.get('/api/calendar/google/connection', (c) => {
     const token = googleConnection(c.req.header('cookie'));
-    const pending = token ? pendingGoogleConnections.get(token) : null;
-    if (!pending || pending.expiresAt < Date.now()) {
-      return fail('this Google connection has expired; reconnect', 400);
-    }
+    const pending = readPending(pendingGoogleConnections, token);
+    if (!pending) return fail('this Google connection has expired; reconnect', 400);
     return c.json({ calendars: pending.calendars });
+  });
+
+  // Abandoning the chooser must not leave an exchanged refresh token sitting
+  // in memory for the rest of its ten minutes.
+  app.delete('/api/calendar/google/connection', (c) => {
+    const cancelled = Boolean(
+      takePending(pendingGoogleConnections, googleConnection(c.req.header('cookie'))),
+    );
+    const response = c.json({ cancelled });
+    response.headers.set('set-cookie', clearGoogleConnectionCookie);
+    return response;
   });
 
   app.post('/api/calendar/google/connection', async (c) => {
     const token = googleConnection(c.req.header('cookie'));
-    const pending = token ? pendingGoogleConnections.get(token) : null;
-    if (!pending || pending.expiresAt < Date.now()) {
-      return fail('this Google connection has expired; reconnect', 400);
-    }
+    const pending = readPending(pendingGoogleConnections, token);
+    if (!pending) return fail('this Google connection has expired; reconnect', 400);
     const body = (await c.req.json().catch(() => ({}))) as {
       calendarId?: unknown;
       label?: unknown;
@@ -1338,8 +1378,12 @@ export function createRoutes(jarvis: Jarvis): Hono {
     }
     return c.json(
       jarvis.calendar.events({
-        ...(from ? { from: new Date(from).toISOString() } : {}),
-        ...(to ? { to: new Date(to).toISOString() } : {}),
+        // Passed through verbatim, not normalised to UTC: an all-day event is
+        // filtered by the CALENDAR DATE the caller asked about, and
+        // `toISOString()` would already have rolled that date to its
+        // neighbour for anyone outside UTC.
+        ...(from ? { from } : {}),
+        ...(to ? { to } : {}),
         ...(c.req.query('accountId') ? { accountId: c.req.query('accountId') } : {}),
         ...(c.req.query('search') ? { search: c.req.query('search') } : {}),
         limit: Number.isFinite(limit) ? limit : 200,

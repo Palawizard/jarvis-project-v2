@@ -4,7 +4,8 @@ import { openDb } from '../db/index.js';
 import { EventBus } from '../events/bus.js';
 import { CalDavClient } from './caldav.js';
 import { GoogleCalendarClient } from './google.js';
-import { buildIcs, parseVEvents, patchIcs } from './ical.js';
+import { addCalendarDays, isCalendarDate } from './dates.js';
+import { buildIcs, parseIcsDate, parseVEvents, patchIcs } from './ical.js';
 import { CalendarService, normaliseDraft } from './service.js';
 import { registerBuiltinTools } from '../tools/builtin.js';
 import type {
@@ -19,7 +20,7 @@ import type {
 function stubClient(): CalendarClient {
   return {
     async calendars() {
-      return [{ id: 'primary', name: 'Personal' }];
+      return [{ id: 'primary', name: 'Personal', writable: true }];
     },
     async events() {
       return [];
@@ -65,7 +66,7 @@ describe('calendar mirror', () => {
     ];
     const client: CalendarClient = {
       async calendars() {
-        return [{ id: 'primary', name: 'Personal' }];
+        return [{ id: 'primary', name: 'Personal', writable: true }];
       },
       async events() {
         return remote.map((event) => ({ ...event }));
@@ -287,7 +288,11 @@ describe('calendar mirror', () => {
     try {
       const client = new CalDavClient({ appleId: 'a@b.c', appPassword: 'pw' }, '');
       expect(await client.calendars()).toEqual([
-        { id: 'https://p42-caldav.icloud.com/123456/calendars/work/', name: 'Work' },
+        {
+          id: 'https://p42-caldav.icloud.com/123456/calendars/work/',
+          name: 'Work',
+          writable: true,
+        },
       ]);
       expect(seen[2]).toBe('https://p42-caldav.icloud.com/123456/calendars/');
     } finally {
@@ -676,5 +681,551 @@ describe('calendar mirror', () => {
     // Deleting it excludes the instance and, again, keeps the rule.
     expect(puts[1]?.body).toContain('EXDATE;TZID=Europe/Paris:20260910T090000');
     expect(puts[1]?.body).toContain('RRULE:FREQ=DAILY;COUNT=3');
+  });
+
+  it('returns an all-day event on exactly its calendar date, in every offset', async () => {
+    const db = openDb(loadConfig({ dbPath: ':memory:' }));
+    const allDay = (remoteId: string, from: string, to: string, title: string): RemoteEvent => ({
+      title,
+      startsAt: `${from}T00:00:00.000Z`,
+      endsAt: `${to}T00:00:00.000Z`,
+      allDay: true,
+      description: null,
+      location: null,
+      remoteId,
+      etag: 'v1',
+      raw: null,
+      recurring: false,
+      seriesId: null,
+    });
+    const remote: RemoteEvent[] = [
+      allDay('one', '2026-09-10', '2026-09-11', 'One day'),
+      // Exclusive end: the 14th, 15th and 16th, and nothing on the 17th.
+      allDay('many', '2026-09-14', '2026-09-17', 'Three days'),
+      { ...draft, remoteId: 'timed', etag: 'v1', raw: null, recurring: false, seriesId: null },
+    ];
+    const service = new CalendarService({
+      db,
+      bus: new EventBus(db),
+      config: loadConfig({ dbPath: ':memory:' }),
+      createClient: () => ({
+        ...stubClient(),
+        async events() {
+          return remote.map((event) => ({ ...event }));
+        },
+      }),
+    });
+    await service.connect({
+      provider: 'google',
+      credentials: { clientId: 'client', clientSecret: 'secret', refreshToken: 'refresh' },
+    });
+
+    // The caller's own calendar day, as the browser, a tool and chat all send
+    // it: a local wall clock carrying its offset.
+    const onDay = (date: string, offset: string) =>
+      service
+        .events({
+          from: `${date}T00:00:00.000${offset}`,
+          to: `${addCalendarDays(date, 1)}T00:00:00.000${offset}`,
+        })
+        .filter((event) => event.allDay)
+        .map((event) => event.title);
+
+    for (const offset of ['Z', '+02:00', '-05:00', '+14:00', '-11:00']) {
+      expect([offset, onDay('2026-09-09', offset)]).toEqual([offset, []]);
+      expect([offset, onDay('2026-09-10', offset)]).toEqual([offset, ['One day']]);
+      expect([offset, onDay('2026-09-11', offset)]).toEqual([offset, []]);
+
+      expect([offset, onDay('2026-09-13', offset)]).toEqual([offset, []]);
+      for (const date of ['2026-09-14', '2026-09-15', '2026-09-16']) {
+        expect([offset, date, onDay(date, offset)]).toEqual([offset, date, ['Three days']]);
+      }
+      expect([offset, onDay('2026-09-17', offset)]).toEqual([offset, []]);
+    }
+
+    // Timed events keep instant semantics: 08:00Z is the 10th in UTC and still
+    // the 9th for a caller at UTC-11.
+    const timed = (date: string, offset: string) =>
+      service
+        .events({
+          from: `${date}T00:00:00.000${offset}`,
+          to: `${addCalendarDays(date, 1)}T00:00:00.000${offset}`,
+        })
+        .filter((event) => !event.allDay)
+        .map((event) => event.title);
+    expect(timed('2026-09-10', 'Z')).toEqual(['Planning']);
+    expect(timed('2026-09-10', '-11:00')).toEqual([]);
+    expect(timed('2026-09-09', '-11:00')).toEqual(['Planning']);
+    db.close();
+  });
+
+  it('rebases a series across an all-day conversion by calendar date, not elapsed millis', async () => {
+    // Europe/Paris leaves CEST on 2026-10-25: the master runs at UTC+2 and the
+    // selected occurrence at UTC+1.
+    const timedOccurrence = {
+      startsAt: '2026-10-26T08:00:00.000Z',
+      endsAt: '2026-10-26T09:00:00.000Z',
+      allDay: false,
+    };
+    const asAllDay = {
+      ...draft,
+      startsAt: '2026-10-26T00:00:00.000Z',
+      endsAt: '2026-10-27T00:00:00.000Z',
+      allDay: true,
+    };
+    const allDayOccurrence = {
+      startsAt: '2026-10-26T00:00:00.000Z',
+      endsAt: '2026-10-27T00:00:00.000Z',
+      allDay: true,
+    };
+    const asTimed = {
+      ...draft,
+      startsAt: '2026-10-26T09:00:00.000Z',
+      endsAt: '2026-10-26T10:00:00.000Z',
+      allDay: false,
+    };
+    // Exactly the keys a "move this occurrence" edit names.
+    const patchOf = (value: { startsAt: string; endsAt: string; allDay: boolean }) => ({
+      startsAt: value.startsAt,
+      endsAt: value.endsAt,
+      allDay: value.allDay,
+    });
+
+    // ---------------------------------------------------------------- Google --
+    const googlePatch = async (
+      master: Record<string, unknown>,
+      occurrence: { startsAt: string; endsAt: string; allDay: boolean },
+      updated: CalendarEventDraft,
+    ) => {
+      let sent: Record<string, unknown> = {};
+      const original = globalThis.fetch;
+      globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+        const target = String(url);
+        if (target.includes('/token')) {
+          return Response.json({ access_token: 'test-token', expires_in: 3600 });
+        }
+        if ((init?.method ?? 'GET') === 'GET') return Response.json(master);
+        sent = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        return Response.json({ id: 'series', ...master });
+      }) as typeof fetch;
+      try {
+        await new GoogleCalendarClient(
+          { clientId: 'client', clientSecret: 'secret', refreshToken: 'refresh' },
+          'primary',
+        ).update(
+          {
+            remoteId: 'series_20261026',
+            etag: 'occ',
+            raw: null,
+            recurring: true,
+            seriesId: 'series',
+            ...occurrence,
+          },
+          updated,
+          'series',
+          patchOf(updated),
+        );
+      } finally {
+        globalThis.fetch = original;
+      }
+      return sent;
+    };
+
+    // TIMED -> ALL-DAY. Elapsed-instant arithmetic would move the 09:00 (UTC+2)
+    // master back to 23:00 on 2026-10-23; the calendar date it is on is the 24th.
+    expect(
+      await googlePatch(
+        {
+          id: 'series',
+          etag: 'master',
+          start: { dateTime: '2026-10-24T09:00:00+02:00' },
+          end: { dateTime: '2026-10-24T10:00:00+02:00' },
+        },
+        timedOccurrence,
+        asAllDay,
+      ),
+    ).toMatchObject({ start: { date: '2026-10-24' }, end: { date: '2026-10-25' } });
+
+    // ALL-DAY -> TIMED: the master keeps its own date and takes the chosen clock.
+    expect(
+      await googlePatch(
+        {
+          id: 'series',
+          etag: 'master',
+          start: { date: '2026-10-24' },
+          end: { date: '2026-10-25' },
+        },
+        allDayOccurrence,
+        asTimed,
+      ),
+    ).toMatchObject({
+      start: { dateTime: '2026-10-24T09:00:00.000Z' },
+      end: { dateTime: '2026-10-24T10:00:00.000Z' },
+    });
+
+    // ---------------------------------------------------------------- CalDAV --
+    const davPut = async (
+      master: string[],
+      occurrence: { startsAt: string; endsAt: string; allDay: boolean },
+      updated: CalendarEventDraft,
+    ) => {
+      const stored = [
+        'BEGIN:VCALENDAR',
+        'BEGIN:VEVENT',
+        ...master,
+        'END:VEVENT',
+        'END:VCALENDAR',
+      ].join('\r\n');
+      let body = '';
+      const original = globalThis.fetch;
+      globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+        if ((init?.method ?? 'GET') === 'GET') return new Response(stored);
+        body = String(init?.body ?? '');
+        return new Response('', { headers: { etag: '"v2"' } });
+      }) as typeof fetch;
+      try {
+        await new CalDavClient(
+          { appleId: 'a@b.c', appPassword: 'pw' },
+          'https://cal.example/work/',
+        ).update(
+          {
+            remoteId: 'https://cal.example/work/series.ics#20261026T090000',
+            etag: 'v1',
+            raw: null,
+            recurring: true,
+            seriesId: 'https://cal.example/work/series.ics',
+            ...occurrence,
+          },
+          updated,
+          'series',
+          patchOf(updated),
+        );
+      } finally {
+        globalThis.fetch = original;
+      }
+      return body;
+    };
+
+    const timedToAllDay = await davPut(
+      [
+        'UID:series@example',
+        'DTSTART;TZID=Europe/Paris:20261024T090000',
+        'DTEND;TZID=Europe/Paris:20261024T100000',
+        'RRULE:FREQ=DAILY;COUNT=5',
+        'SUMMARY:Standup',
+      ],
+      timedOccurrence,
+      asAllDay,
+    );
+    expect(timedToAllDay).toContain('DTSTART;VALUE=DATE:20261024');
+    expect(timedToAllDay).toContain('DTEND;VALUE=DATE:20261025');
+    expect(timedToAllDay).not.toContain('20261023');
+    expect(timedToAllDay).toContain('RRULE:FREQ=DAILY;COUNT=5');
+
+    const allDayToTimed = await davPut(
+      [
+        'UID:series@example',
+        'DTSTART;VALUE=DATE:20261024',
+        'DTEND;VALUE=DATE:20261025',
+        'RRULE:FREQ=DAILY;COUNT=5',
+        'SUMMARY:Standup',
+      ],
+      allDayOccurrence,
+      asTimed,
+    );
+    expect(allDayToTimed).toContain('DTSTART:20261024T090000');
+    expect(allDayToTimed).toContain('DTEND:20261024T100000');
+    expect(allDayToTimed).toContain('RRULE:FREQ=DAILY;COUNT=5');
+  });
+
+  it('refreshes every CalDAV sibling occurrence onto the new ETag before reporting success', async () => {
+    const calendarUrl = 'https://cal.example/work/';
+    const seriesUrl = `${calendarUrl}series.ics`;
+    const occurrence = (day: string, summary: string) => [
+      'BEGIN:VEVENT',
+      'UID:series@example',
+      `RECURRENCE-ID;TZID=Europe/Paris:2026${day}T090000`,
+      `DTSTART;TZID=Europe/Paris:2026${day}T090000`,
+      `DTEND;TZID=Europe/Paris:2026${day}T100000`,
+      `SUMMARY:${summary}`,
+      'END:VEVENT',
+    ];
+    const server = {
+      text: [
+        'BEGIN:VCALENDAR',
+        'BEGIN:VEVENT',
+        'UID:series@example',
+        'DTSTART;TZID=Europe/Paris:20261019T090000',
+        'DTEND;TZID=Europe/Paris:20261019T100000',
+        'RRULE:FREQ=DAILY;COUNT=3',
+        'SUMMARY:Standup',
+        'END:VEVENT',
+        ...occurrence('1020', 'Standup B'),
+        ...occurrence('1021', 'Standup C'),
+        'END:VCALENDAR',
+      ].join('\r\n'),
+      etag: 'e1',
+      version: 1,
+    };
+    // Every If-Match a write actually sent, and every one the server refused.
+    const ifMatch: string[] = [];
+    const refused: string[] = [];
+    const multistatus = (body: string) =>
+      new Response(`<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">${body}</d:multistatus>`, {
+        status: 207,
+        headers: { 'content-type': 'application/xml' },
+      });
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const method = init?.method ?? 'GET';
+      const body = String(init?.body ?? '');
+      if (method === 'PROPFIND' && body.includes('current-user-principal')) {
+        return multistatus(
+          '<d:response><d:current-user-principal><d:href>/p/</d:href>' +
+            '</d:current-user-principal></d:response>',
+        );
+      }
+      if (method === 'PROPFIND' && body.includes('calendar-home-set')) {
+        return multistatus(
+          '<d:response><c:calendar-home-set xmlns:c="urn:ietf:params:xml:ns:caldav">' +
+            '<d:href>https://cal.example/home/</d:href></c:calendar-home-set></d:response>',
+        );
+      }
+      if (method === 'PROPFIND') {
+        return multistatus(
+          `<d:response><d:href>${calendarUrl}</d:href><d:resourcetype><d:collection/>` +
+            '<c:calendar xmlns:c="urn:ietf:params:xml:ns:caldav"/></d:resourcetype>' +
+            '<d:displayname>Work</d:displayname>' +
+            '<c:supported-calendar-component-set xmlns:c="urn:ietf:params:xml:ns:caldav">' +
+            '<c:comp name="VEVENT"/></c:supported-calendar-component-set>' +
+            '<d:current-user-privilege-set><d:privilege><d:read/></d:privilege>' +
+            '<d:privilege><d:write/></d:privilege></d:current-user-privilege-set></d:response>',
+        );
+      }
+      if (method === 'REPORT') {
+        return multistatus(
+          `<d:response><d:href>${seriesUrl}</d:href><d:getetag>"${server.etag}"</d:getetag>` +
+            '<c:calendar-data xmlns:c="urn:ietf:params:xml:ns:caldav">' +
+            `<![CDATA[${server.text}]]></c:calendar-data></d:response>`,
+        );
+      }
+      if (method === 'GET') {
+        return new Response(server.text, { headers: { etag: `"${server.etag}"` } });
+      }
+      if (method === 'PUT') {
+        const sent = new Headers(init?.headers).get('if-match');
+        ifMatch.push(sent ?? 'none');
+        // A real server refuses a stale If-Match, which is exactly what the
+        // sibling occurrences used to send until a background sync ran.
+        if (sent !== `"${server.etag}"`) {
+          refused.push(sent ?? 'none');
+          return new Response('', { status: 412 });
+        }
+        server.text = body;
+        server.etag = `e${++server.version}`;
+        return new Response('', { headers: { etag: `"${server.etag}"` } });
+      }
+      throw new Error(`unexpected ${method}`);
+    }) as typeof fetch;
+
+    const db = openDb(loadConfig({ dbPath: ':memory:' }));
+    try {
+      const service = new CalendarService({
+        db,
+        bus: new EventBus(db),
+        config: loadConfig({ dbPath: ':memory:' }),
+      });
+      await service.connect({
+        provider: 'icloud',
+        credentials: { appleId: 'a@b.c', appPassword: 'pw' },
+        calendarId: calendarUrl,
+      });
+      const etags = () =>
+        (
+          db.prepare('SELECT remote_id, etag FROM calendar_events ORDER BY starts_at').all() as {
+            remote_id: string;
+            etag: string;
+          }[]
+        ).map((row) => row.etag);
+      const byRecurrenceId = (day: string) =>
+        service.events().find((event) => event.remoteId === `${seriesUrl}#2026${day}T090000`);
+
+      expect(service.events()).toHaveLength(3);
+      expect(etags()).toEqual(['e1', 'e1', 'e1']);
+
+      // Edit occurrence B while a background sync is already running: the
+      // mandatory post-write refresh must QUEUE, never be dropped by the
+      // "already syncing" guard.
+      const inFlight = service.sync();
+      const b = byRecurrenceId('1020') as CalendarEvent;
+      await service.updateEvent(b.id, { title: 'B moved' }, 'occurrence');
+      await inFlight;
+      expect(etags()).toEqual(['e2', 'e2', 'e2']);
+      // Each row still holds its OWN occurrence, not the whole series resource.
+      const bRaw = db.prepare('SELECT raw FROM calendar_events WHERE id = ?').get(b.id) as {
+        raw: string;
+      };
+      expect(bRaw.raw).toContain('RECURRENCE-ID;TZID=Europe/Paris:20261020T090000');
+      expect(bRaw.raw).not.toContain('RRULE');
+      expect(bRaw.raw).not.toContain('Standup C');
+
+      // Immediately delete a sibling: it must already carry the new ETag.
+      const c = byRecurrenceId('1021') as CalendarEvent;
+      await service.deleteEvent(c.id, 'occurrence');
+      expect(service.events()).toHaveLength(2);
+      expect(etags()).toEqual(['e3', 'e3']);
+
+      // ...and editing after that delete works the same way round.
+      const again = byRecurrenceId('1020') as CalendarEvent;
+      await service.updateEvent(again.id, { title: 'B moved again' }, 'occurrence');
+      expect(etags()).toEqual(['e4', 'e4']);
+      expect(server.text).toContain('SUMMARY:B moved again');
+
+      expect(ifMatch).toEqual(['"e1"', '"e2"', '"e3"']);
+      expect(refused).toEqual([]);
+    } finally {
+      globalThis.fetch = original;
+      db.close();
+    }
+  });
+
+  it('reports CalDAV writability and refuses to mutate a read-only calendar', async () => {
+    const privileges = (writable: boolean) =>
+      '<d:current-user-privilege-set><d:privilege><d:read/></d:privilege>' +
+      (writable ? '<d:privilege><d:write/></d:privilege>' : '') +
+      '</d:current-user-privilege-set>';
+    const collection = (href: string, name: string, writable: boolean) =>
+      `<d:response><d:href>${href}</d:href><d:resourcetype><d:collection/>` +
+      '<c:calendar xmlns:c="urn:ietf:params:xml:ns:caldav"/></d:resourcetype>' +
+      `<d:displayname>${name}</d:displayname>` +
+      '<c:supported-calendar-component-set xmlns:c="urn:ietf:params:xml:ns:caldav">' +
+      `<c:comp name="VEVENT"/></c:supported-calendar-component-set>${privileges(writable)}` +
+      '</d:response>';
+    const multistatus = (body: string) =>
+      new Response(`<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">${body}</d:multistatus>`, {
+        status: 207,
+        headers: { 'content-type': 'application/xml' },
+      });
+    const original = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      if (calls === 1) {
+        return multistatus(
+          '<d:response><d:current-user-principal><d:href>/p/</d:href>' +
+            '</d:current-user-principal></d:response>',
+        );
+      }
+      if (calls === 2) {
+        return multistatus(
+          '<d:response><c:calendar-home-set xmlns:c="urn:ietf:params:xml:ns:caldav">' +
+            '<d:href>https://cal.example/home/</d:href></c:calendar-home-set></d:response>',
+        );
+      }
+      return multistatus(
+        collection('https://cal.example/home/work/', 'Work', true) +
+          collection('https://cal.example/home/shared/', 'Team (shared)', false),
+      );
+    }) as typeof fetch;
+    try {
+      expect(
+        await new CalDavClient({ appleId: 'a@b.c', appPassword: 'pw' }, '').calendars(),
+      ).toEqual([
+        { id: 'https://cal.example/home/work/', name: 'Work', writable: true },
+        { id: 'https://cal.example/home/shared/', name: 'Team (shared)', writable: false },
+      ]);
+    } finally {
+      globalThis.fetch = original;
+    }
+
+    // Connected read-only, every mutation is refused HERE -- the provider is
+    // never asked, and no tool can claim otherwise.
+    const db = openDb(loadConfig({ dbPath: ':memory:' }));
+    let reached = 0;
+    const service = new CalendarService({
+      db,
+      bus: new EventBus(db),
+      config: loadConfig({ dbPath: ':memory:' }),
+      createClient: () => ({
+        ...stubClient(),
+        async calendars() {
+          return [{ id: 'shared', name: 'Team (shared)', writable: false }];
+        },
+        async create(value) {
+          reached += 1;
+          return {
+            ...value,
+            remoteId: 'remote-1',
+            etag: 'v1',
+            raw: null,
+            recurring: false,
+            seriesId: null,
+          };
+        },
+      }),
+    });
+    const tools = registerBuiltinTools({ calendar: service } as never, {
+      db,
+      bus: new EventBus(db),
+      defaultTimeoutMs: 500,
+    });
+    const account = await service.connect({
+      provider: 'icloud',
+      credentials: { appleId: 'a@b.c', appPassword: 'pw' },
+    });
+    expect(account.readOnly).toBe(true);
+    expect(service.accounts()[0]?.readOnly).toBe(true);
+
+    tools.grant({ toolName: 'calendar.create', actor: 'user' });
+    const created = await tools.execute(
+      'calendar.create',
+      { accountId: account.id, draft: { ...draft } },
+      { actor: 'user' },
+    );
+    expect(created.status).toBe('failed');
+    expect(reached).toBe(0);
+    await expect(service.createEvent({ accountId: account.id, draft })).rejects.toThrow(
+      /read-only/,
+    );
+    db.close();
+  });
+
+  it('refuses impossible calendar dates instead of letting Date normalise them', () => {
+    for (const valid of ['2024-02-29', '2026-01-31', '2026-04-30', '2026-12-31', '2000-02-29']) {
+      expect([valid, isCalendarDate(valid)]).toEqual([valid, true]);
+    }
+    for (const invalid of [
+      '2025-02-29',
+      '2026-02-30',
+      '2026-00-10',
+      '2026-13-01',
+      '2026-01-00',
+      '2026-04-31',
+      '1900-02-29',
+      '2026-1-01',
+      '20260101',
+      '2026-01-01T00:00:00Z',
+    ]) {
+      expect([invalid, isCalendarDate(invalid)]).toEqual([invalid, false]);
+    }
+
+    // Provider input goes through the same gate: an impossible date is refused,
+    // never silently mirrored onto the day `Date` would have normalised it to.
+    expect(parseIcsDate('20260230')).toBeNull();
+    expect(parseIcsDate('20261301')).toBeNull();
+    expect(parseIcsDate('20260229')).toBeNull();
+    expect(parseIcsDate('20240229')).toBe('2024-02-29T00:00:00.000Z');
+    expect(parseIcsDate('20260230T090000Z')).toBeNull();
+    expect(
+      parseVEvents(['BEGIN:VEVENT', 'DTSTART;VALUE=DATE:20260230', 'END:VEVENT'].join('\r\n')),
+    ).toEqual([]);
+
+    // A user draft is refused the same way.
+    expect(() =>
+      normaliseDraft({ ...draft, startsAt: '2026-02-30', endsAt: '2026-03-01', allDay: true }),
+    ).toThrow();
+    expect(
+      normaliseDraft({ ...draft, startsAt: '2024-02-29', endsAt: '2024-03-01', allDay: true }),
+    ).toMatchObject({ startsAt: '2024-02-29T00:00:00.000Z', endsAt: '2024-03-01T00:00:00.000Z' });
   });
 });

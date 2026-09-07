@@ -19,14 +19,20 @@ export function CalendarView({ lastEvent }: { lastEvent: JarvisEvent | null }) {
   const [month, setMonth] = useState(() => monthStart(new Date()));
   const range = useMemo(() => monthGrid(month), [month]);
   const accounts = useAsync<CalendarAccount[]>(() => api.calendarAccounts(), []);
+  // Local wall-clock bounds, not `toISOString()`: the server filters all-day
+  // events by the CALENDAR DATE asked about, and a UTC conversion would have
+  // already rolled that date to its neighbour outside UTC.
   const events = useAsync<CalendarEvent[]>(
-    () => api.calendarEvents({ from: range.start.toISOString(), to: range.end.toISOString() }),
-    [range.start.toISOString(), range.end.toISOString()],
+    () => api.calendarEvents({ from: localBound(range.start), to: localBound(range.end) }),
+    [localBound(range.start), localBound(range.end)],
   );
   const [editing, setEditing] = useState<EventForm | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [googleChoice, setGoogleChoice] = useState<RemoteCalendar[] | null>(null);
+  // A read-only calendar is visible but never editable: every control that
+  // would mutate it is disabled here, before any tool or provider is reached.
+  const writable = (accounts.data ?? []).filter((account) => !account.readOnly);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -85,8 +91,8 @@ export function CalendarView({ lastEvent }: { lastEvent: JarvisEvent | null }) {
           </button>
           <button
             className="btn primary"
-            disabled={!accounts.data?.length}
-            onClick={() => setEditing(newEvent(accounts.data?.[0]?.id ?? ''))}
+            disabled={!writable.length}
+            onClick={() => setEditing(newEvent(writable[0]?.id ?? ''))}
           >
             ＋ Event
           </button>
@@ -110,6 +116,11 @@ export function CalendarView({ lastEvent }: { lastEvent: JarvisEvent | null }) {
                     {account.provider}
                   </Badge>
                 </div>
+                {account.readOnly && (
+                  <div className="tiny faint" data-testid={`calendar-read-only-${account.id}`}>
+                    Read-only — Jarvis can show this calendar but not change it.
+                  </div>
+                )}
                 <div className="tiny faint">
                   {account.lastSyncAt
                     ? `Synced ${new Date(account.lastSyncAt).toLocaleString()}`
@@ -179,8 +190,8 @@ export function CalendarView({ lastEvent }: { lastEvent: JarvisEvent | null }) {
                 >
                   <button
                     className="calendar-day-number"
-                    disabled={!accounts.data?.length}
-                    onClick={() => setEditing(newEvent(accounts.data?.[0]?.id ?? '', day))}
+                    disabled={!writable.length}
+                    onClick={() => setEditing(newEvent(writable[0]?.id ?? '', day))}
                     aria-label={`Create event on ${day.toLocaleDateString()}`}
                   >
                     <span className="calendar-mobile-date">
@@ -219,6 +230,9 @@ export function CalendarView({ lastEvent }: { lastEvent: JarvisEvent | null }) {
         <EventDialog
           value={editing}
           accounts={accounts.data ?? []}
+          readOnly={Boolean(
+            (accounts.data ?? []).find((account) => account.id === editing.accountId)?.readOnly,
+          )}
           busy={busy}
           error={error}
           onCancel={() => {
@@ -275,6 +289,9 @@ export function CalendarView({ lastEvent }: { lastEvent: JarvisEvent | null }) {
           onCancel={() => {
             setGoogleChoice(null);
             setError(null);
+            // Drop the exchanged credential server-side now rather than
+            // leaving it to expire.
+            void api.cancelGoogleConnection().catch(() => undefined);
           }}
           onConnect={(calendarId, label) =>
             void act(async () => {
@@ -482,6 +499,7 @@ function ConnectCalendar({
                 {found.map((calendar) => (
                   <option key={calendar.id} value={calendar.id}>
                     {calendar.name}
+                    {calendar.writable ? '' : ' (read-only)'}
                   </option>
                 ))}
               </select>
@@ -537,6 +555,7 @@ function SecretField({
 function EventDialog({
   value,
   accounts,
+  readOnly,
   busy,
   error,
   onCancel,
@@ -545,6 +564,7 @@ function EventDialog({
 }: {
   value: EventForm;
   accounts: CalendarAccount[];
+  readOnly: boolean;
   busy: boolean;
   error: string | null;
   onCancel: () => void;
@@ -572,11 +592,14 @@ function EventDialog({
             value={form.accountId}
             onChange={(e) => patch({ accountId: e.target.value })}
           >
-            {accounts.map((account) => (
-              <option value={account.id} key={account.id}>
-                {account.label}
-              </option>
-            ))}
+            {accounts
+              .filter((account) => !account.readOnly || account.id === form.accountId)
+              .map((account) => (
+                <option value={account.id} key={account.id}>
+                  {account.label}
+                  {account.readOnly ? ' (read-only)' : ''}
+                </option>
+              ))}
           </select>
         </label>
         <label>
@@ -665,10 +688,19 @@ function EventDialog({
           {error}
         </div>
       )}
+      {readOnly && (
+        <div className="api-error" role="status" data-testid="event-read-only">
+          This calendar is connected read-only. Jarvis cannot change its events.
+        </div>
+      )}
       <div className="spread dialog-actions">
         <div>
           {onDelete && (
-            <button className="btn danger" disabled={busy} onClick={() => onDelete(scope)}>
+            <button
+              className="btn danger"
+              disabled={busy || readOnly}
+              onClick={() => onDelete(scope)}
+            >
               Delete
             </button>
           )}
@@ -679,7 +711,7 @@ function EventDialog({
           </button>
           <button
             className="btn primary"
-            disabled={busy || !valid}
+            disabled={busy || !valid || readOnly}
             onClick={() => onSave(form, scope)}
           >
             {busy ? 'Saving…' : 'Save'}
@@ -783,6 +815,10 @@ function sameDay(a: Date, b: Date): boolean {
 }
 function time(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+/** A local wall-clock bound whose lexical `YYYY-MM-DD` is the day the human sees. */
+function localBound(date: Date): string {
+  return `${localInput(date)}:00`;
 }
 function localInput(date: Date): string {
   const offset = date.getTimezoneOffset() * 60_000;

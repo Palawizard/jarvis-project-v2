@@ -27,6 +27,7 @@ import {
   sanitizeCalendarText,
   type CalendarService,
 } from '../calendar/service.js';
+import { localIso } from '../calendar/dates.js';
 import type { CalendarAccount, CalendarEvent } from '../calendar/types.js';
 import {
   ACTION_TOOLS,
@@ -1402,8 +1403,10 @@ export class ChatService {
       case 'list_calendar_events': {
         const account = action.calendar ? calendarAccount(action.calendar) : null;
         if (account && 'problem' in account) return account;
-        const from = action.from ?? new Date().toISOString();
-        const to = action.to ?? new Date(new Date(from).getTime() + 14 * 86_400_000).toISOString();
+        // The model's own bounds pass through verbatim -- their lexical date is
+        // the day it asked about -- and the default window is the local one.
+        const from = action.from ?? localIso(new Date());
+        const to = action.to ?? localIso(new Date(new Date(from).getTime() + 14 * 86_400_000));
         return {
           input: {
             from,
@@ -1582,9 +1585,11 @@ export class ChatService {
 
     const calendarAccounts = this.deps.calendar.accounts();
     const now = new Date();
+    // Local, offset-bearing bounds so an all-day event on the user's own today
+    // is filtered by that calendar date, not by whatever day UTC is on.
     const calendarEvents = this.deps.calendar.events({
-      from: now.toISOString(),
-      to: new Date(now.getTime() + 14 * 86_400_000).toISOString(),
+      from: localIso(now),
+      to: localIso(new Date(now.getTime() + 14 * 86_400_000)),
       limit: 12,
     });
     // Provider text is inserted only as escaped JSON between fixed markers.

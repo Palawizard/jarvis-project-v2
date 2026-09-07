@@ -9,6 +9,8 @@
  * reconciled, because a local edit that the provider refused never happened.
  */
 
+import { addCalendarDays, calendarDate, diffCalendarDays } from './dates.js';
+
 export type CalendarProviderId = 'google' | 'icloud';
 
 /**
@@ -50,6 +52,13 @@ export interface CalendarAccount {
   calendarId: string;
   calendarName: string | null;
   status: 'active' | 'error';
+  /**
+   * The connected principal may only READ this calendar (a shared or
+   * subscribed CalDAV collection). Mutations are refused before a provider is
+   * ever asked, and the UI shows it as read-only rather than claiming an
+   * editability that would fail at the PUT.
+   */
+  readOnly: boolean;
   error: string | null;
   lastSyncAt: string | null;
   createdAt: string;
@@ -101,7 +110,17 @@ export interface CalendarEventDraft {
 const hasOwn = (value: object, key: keyof CalendarEventDraft): boolean =>
   Object.prototype.hasOwnProperty.call(value, key);
 
-/** Apply an occurrence edit to the series master's own recurrence anchor. */
+/**
+ * Apply an occurrence edit to the series master's own recurrence anchor.
+ *
+ * Capability follows semantics, not milliseconds. A timed edit of a timed
+ * series is an elapsed-instant shift, which is what the master's TZID-anchored
+ * wall clock already expects. The moment either side is all-day the question
+ * becomes "which calendar date?", and elapsed UTC arithmetic answers it wrong:
+ * a 09:00 master at UTC+2 rebased from an occurrence at UTC+1 lands at 23:00
+ * on the previous date. So anything touching an all-day side counts whole
+ * calendar days between validated `YYYY-MM-DD` components instead.
+ */
 export function rebaseSeriesPatch(
   master: Pick<CalendarEventDraft, 'startsAt'>,
   occurrence: Pick<CalendarEventDraft, 'startsAt' | 'endsAt' | 'allDay'>,
@@ -116,13 +135,40 @@ export function rebaseSeriesPatch(
   if (
     ['startsAt', 'endsAt', 'allDay'].some((key) => hasOwn(patch, key as keyof CalendarEventDraft))
   ) {
-    const masterStart = new Date(master.startsAt).getTime();
-    const occurrenceStart = new Date(occurrence.startsAt).getTime();
-    const updatedStart = new Date(updated.startsAt).getTime();
-    const updatedEnd = new Date(updated.endsAt).getTime();
-    const rebasedStart = masterStart + updatedStart - occurrenceStart;
-    result.startsAt = new Date(rebasedStart).toISOString();
-    result.endsAt = new Date(rebasedStart + updatedEnd - updatedStart).toISOString();
+    const durationMs = new Date(updated.endsAt).getTime() - new Date(updated.startsAt).getTime();
+    if (!occurrence.allDay && !updated.allDay) {
+      // TIMED -> TIMED: the instant/wall-time behaviour the architecture already
+      // relies on, so a DST-crossing series keeps its TZID wall clock.
+      const rebasedStart =
+        new Date(master.startsAt).getTime() +
+        new Date(updated.startsAt).getTime() -
+        new Date(occurrence.startsAt).getTime();
+      result.startsAt = new Date(rebasedStart).toISOString();
+      result.endsAt = new Date(rebasedStart + durationMs).toISOString();
+    } else {
+      // The master moves by the same number of CALENDAR DAYS the occurrence
+      // moved -- never by the difference between two UTC timestamps.
+      const shift = diffCalendarDays(
+        calendarDate(updated.startsAt),
+        calendarDate(occurrence.startsAt),
+      );
+      const anchor = addCalendarDays(calendarDate(master.startsAt), shift);
+      if (updated.allDay) {
+        // -> ALL-DAY: exclusive end dates, so a one-day event is anchor + 1.
+        const length = Math.max(
+          diffCalendarDays(calendarDate(updated.endsAt), calendarDate(updated.startsAt)),
+          1,
+        );
+        result.startsAt = `${anchor}T00:00:00.000Z`;
+        result.endsAt = `${addCalendarDays(anchor, length)}T00:00:00.000Z`;
+      } else {
+        // ALL-DAY -> TIMED: the master keeps the shifted date and takes the
+        // wall clock the human just chose for the occurrence.
+        const start = new Date(`${anchor}T${updated.startsAt.slice(11)}`);
+        result.startsAt = start.toISOString();
+        result.endsAt = new Date(start.getTime() + durationMs).toISOString();
+      }
+    }
     result.allDay = updated.allDay;
   }
   return result;
@@ -158,6 +204,12 @@ export interface RemoteEventRef {
 export interface RemoteCalendar {
   id: string;
   name: string;
+  /**
+   * The connected principal can write to this calendar. CalDAV reports it from
+   * `current-user-privilege-set`; Google only lists calendars the credential
+   * already has writer access to.
+   */
+  writable: boolean;
 }
 
 /**

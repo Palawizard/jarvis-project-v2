@@ -1,3 +1,4 @@
+import { assertCalendarDate, isCalendarDate } from './dates.js';
 import {
   CalendarProviderError,
   rebaseSeriesPatch,
@@ -100,12 +101,16 @@ export class GoogleCalendarClient implements CalendarClient {
     }>('GET', `${API}/users/me/calendarList?maxResults=100&minAccessRole=writer`);
     const items = body.items ?? [];
     // Primary first: it is what "my calendar" means to the person connecting.
-    return items
-      .filter((item): item is { id: string; summary?: string; primary?: boolean } =>
-        Boolean(item.id),
-      )
-      .sort((a, b) => Number(Boolean(b.primary)) - Number(Boolean(a.primary)))
-      .map((item) => ({ id: item.id, name: item.summary ?? item.id }));
+    return (
+      items
+        .filter((item): item is { id: string; summary?: string; primary?: boolean } =>
+          Boolean(item.id),
+        )
+        .sort((a, b) => Number(Boolean(b.primary)) - Number(Boolean(a.primary)))
+        // `minAccessRole=writer` already excluded everything this credential
+        // cannot edit, so anything listed here is writable by construction.
+        .map((item) => ({ id: item.id, name: item.summary ?? item.id, writable: true }))
+    );
   }
 
   async events(range: { from: string; to: string }): Promise<RemoteEvent[]> {
@@ -338,7 +343,9 @@ function toGooglePatch(patch: Partial<CalendarEventDraft>): Record<string, unkno
 }
 
 function toGoogleTime(iso: string, allDay: boolean): GoogleTime {
-  return allDay ? { date: iso.slice(0, 10) } : { dateTime: new Date(iso).toISOString() };
+  return allDay
+    ? { date: assertCalendarDate(iso.slice(0, 10), 'all-day date') }
+    : { dateTime: new Date(iso).toISOString() };
 }
 
 /** Null for anything Jarvis cannot place on a timeline, including cancellations. */
@@ -364,6 +371,9 @@ function toRemoteEvent(event: GoogleEvent): RemoteEvent | null {
 }
 
 function fromGoogleTime(time: GoogleTime | undefined): string | null {
+  // An all-day `date` is a calendar date, and an impossible one must be
+  // refused rather than normalised onto a day the event was never on.
+  if (time?.date !== undefined && !isCalendarDate(time.date)) return null;
   const raw = time?.dateTime ?? (time?.date ? `${time.date}T00:00:00.000Z` : null);
   if (!raw) return null;
   const parsed = new Date(raw);

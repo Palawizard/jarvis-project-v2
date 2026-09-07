@@ -97,6 +97,10 @@ export const REVIEW_OUTPUT_SCHEMA = {
     verdict: { type: 'string', enum: ['approve', 'request_changes'] },
     summary: {
       type: 'string',
+      // The trusted schema is `z.string().trim().min(1)`; a constrained channel
+      // that accepts "" manufactures a protocol failure out of an answer the
+      // provider believed was valid.
+      minLength: 1,
       maxLength: 4000,
       description: '2-4 sentences on what changed and whether it meets the request.',
     },
@@ -121,7 +125,9 @@ export const REVIEW_OUTPUT_SCHEMA = {
             type: 'string',
             enum: ['correctness', 'security', 'design', 'tests', 'performance', 'style'],
           },
-          file: { type: 'string', maxLength: 500 },
+          // Optional, but never empty when present -- same bound as the
+          // trusted `z.string().trim().min(1).optional()`.
+          file: { type: 'string', minLength: 1, maxLength: 500 },
           line: { type: 'integer', minimum: 1 },
           description: { type: 'string', minLength: 1, maxLength: 4000 },
           // `checkReviewValue` refuses a blocking finding with an empty

@@ -1701,6 +1701,34 @@ describe('job repair pipeline', () => {
     h.db.close();
   });
 
+  it('reports the planning transition Resume actually performs, with no worktree yet', async () => {
+    const h = await harness({ review: APPROVES.review });
+    const job = h.jobs.create({ projectId: h.project.id, request: 'Resume planning.' });
+    h.jobs.transition(job.id, 'planning');
+    h.jobs.transition(job.id, 'paused', {
+      resumeStage: 'planning',
+      pauseReason: 'orchestrator_restart',
+    });
+
+    // The view and the pipeline read the same planner. Reporting "no automatic
+    // transition can make progress" here told the user to restart a Job that
+    // Resume recovers.
+    const plan = await h.pipeline.resumePlan(job.id);
+    expect(plan?.plan.kind).toBe('plan');
+    expect(plan?.recovery).toBeNull();
+    expect(plan?.plan.recovery).toEqual([]);
+
+    h.pipeline.resume(job.id);
+    const deadline = Date.now() + 20_000;
+    while (h.pipeline.isRunning(job.id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const resumed = h.jobs.get(job.id) as Job;
+    expect(resumed.stage).toBe('awaiting_user');
+    expect(resumed.worktreePath).toBeTruthy();
+    h.db.close();
+  });
+
   it('resumes an interrupted planning stage without creating a recovery job', async () => {
     const h = await harness({
       review: (_call, opts) => ({
@@ -2260,10 +2288,80 @@ describe('candidate HEAD recovery', () => {
     }).trim();
     expect(job.headRef).toBe(worktreeHead);
 
-    // And the Job is recoverable rather than stranded.
+    // And the Job is recoverable rather than stranded -- by CONTINUING the
+    // interrupted implementation on top of its own commit, not by verifying it.
+    // `resumeStage === 'implementing'` means implementation did not finish, so
+    // there is nothing here worth reviewing yet.
     const plan = await h.pipeline.resumePlan(job.id);
     expect(plan?.recovery).toBeNull();
-    expect(plan?.plan.kind).toBe('verify');
+    expect(plan?.plan.kind).toBe('resume_agent');
+    expect(plan?.candidateHead).toBe(worktreeHead);
+    h.db.close();
+  });
+
+  // The MEDIUM this pass repairs, end to end: an authorised implementer that
+  // commits real partial work and THEN exhausts its quota must resume the
+  // implementation, not have that half-written candidate promoted into
+  // verification, review and Visual QA.
+  it('resumes an interrupted implementer on top of the commit it already made', async () => {
+    let attempt = 0;
+    const provider = new FakeProvider('claude', (call) => {
+      if (call.role !== 'implementer') return success(`${call.role} completed`);
+      attempt += 1;
+      const commit = (message: string) => {
+        execFileSync('git', ['add', '-A'], { cwd: call.cwd });
+        execFileSync(
+          'git',
+          ['-c', 'user.name=A', '-c', 'user.email=a@b', 'commit', '-qm', message],
+          { cwd: call.cwd },
+        );
+        return execFileSync('git', ['rev-parse', 'HEAD'], {
+          cwd: call.cwd,
+          encoding: 'utf8',
+        }).trim();
+      };
+      if (attempt === 1) {
+        fs.writeFileSync(path.join(call.cwd, 'change.txt'), 'half the work\n');
+        commit('partial implementation');
+        return failure("You've hit your usage limit for this session");
+      }
+      fs.appendFileSync(path.join(call.cwd, 'change.txt'), 'the rest\n');
+      return success('implementation finished');
+    });
+    // One attempt per logical action, so the first run really does pause.
+    const h = await harness({ provider, review: APPROVES.review, providerAttempts: 1 });
+    const paused = await runToRest(h);
+
+    // The partial commit is the candidate, and nothing expensive has run on it.
+    expect(paused.stage).toBe('paused');
+    expect(paused.resumeStage).toBe('implementing');
+    const partial = paused.headRef as string;
+    expect(partial).not.toBe(paused.baseRef);
+    expect(h.verificationCalls).toHaveLength(0);
+    expect(h.reviewHeads).toHaveLength(0);
+    // Quota is provider state, so no product repair budget was spent.
+    expect(paused.pauseFailureKind).toBe('quota');
+    expect(paused.fixCycles).toBe(0);
+
+    h.pipeline.resume(paused.id);
+    const deadline = Date.now() + 20_000;
+    while (h.pipeline.isRunning(paused.id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const resumed = h.jobs.get(paused.id) as Job;
+
+    // The implementer ran again, on top of its own commit rather than the base.
+    const implementers = provider.calls.filter((call) => call.role === 'implementer');
+    expect(implementers).toHaveLength(2);
+    expect(resumed.stage).toBe('awaiting_user');
+    expect(
+      fs.readFileSync(path.join(resumed.worktreePath as string, 'change.txt'), 'utf8'),
+    ).toContain('half the work');
+    // Verification only ran once implementation was actually complete, and on
+    // the finished candidate rather than the partial one.
+    expect(h.verificationCalls).toHaveLength(1);
+    expect(h.reviewHeads).toHaveLength(1);
+    expect(h.reviewHeads[0]).not.toBe(partial);
     h.db.close();
   });
 
@@ -2299,8 +2397,18 @@ describe('candidate HEAD recovery', () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     const resumed = h.jobs.get(job.id) as Job;
-    expect(resumed.headRef).toBe(committed);
     expect(resumed.stage).toBe('awaiting_user');
+    // The recovered commit was BUILT ON, not discarded and not treated as
+    // finished work: `resumeStage === 'implementing'` means the implementation
+    // never completed, so Resume continues it and the final candidate descends
+    // from the commit the interrupted run had already made.
+    // Throws when it is not an ancestor, which is the assertion: the recovered
+    // commit is still in the candidate's history rather than having been reset
+    // away. (Whether its file contents survive is up to what the resumed agent
+    // chose to write; this fixture's implementer rewrites the file.)
+    execFileSync('git', ['merge-base', '--is-ancestor', committed, resumed.headRef as string], {
+      cwd: resumed.worktreePath as string,
+    });
     expect(
       h.bus
         .list({ jobId: job.id, limit: 200 })

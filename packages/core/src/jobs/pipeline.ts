@@ -1403,7 +1403,19 @@ export class JobPipeline {
       return;
     }
     if (implResult.status !== 'completed') {
-      this.pause(jobId, 'implementing', agentStagePauseReason(implResult, 'Implementer failed'));
+      // The same classified pause every other agent stage uses. The initial
+      // implementer was the last one still taking the product path, so a
+      // quota-exhausted implementer left `pauseFailureKind` null -- which the
+      // Job row documents, and the paused panel renders, as "the candidate is
+      // why this stopped". Any commit the run had already produced is preserved
+      // by `recordAgentHead` inside `runAgentStage`, and Resume continues the
+      // implementation from it on a fresh bounded provider attempt.
+      this.pauseInfrastructure(
+        jobId,
+        'implementing',
+        implResult.failureKind,
+        agentStagePauseReason(implResult, 'Implementer failed'),
+      );
       return;
     }
     await this.git.commitPending(worktree.path, `jarvis: ${job.goal}`);
@@ -2069,6 +2081,21 @@ export class JobPipeline {
     if (!job) return null;
     const project = this.deps.projects.get(job.projectId);
     if (!project) return null;
+    // Mirror `execute`'s OWN order of decisions. A Job checkpointed before it
+    // ever had a worktree is recovered by re-entering planning, and `execute`
+    // settles that above any candidate assessment -- so assessing first
+    // reported "no recoverable worktree checkpoint" and offered "restart it as
+    // a new Job" for a Job that Resume actually recovers. The planner already
+    // agrees with `execute` here; only this method disagreed with both.
+    if (!job.worktreePath || !job.baseRef) {
+      if ((job.resumeStage ?? 'verifying') === 'planning') {
+        return {
+          candidateHead: null,
+          recovery: null,
+          plan: await this.planFor(job, project, job.headRef ?? ''),
+        };
+      }
+    }
     const assessment = await this.assessCandidate(job, project);
     if (!assessment.ok) {
       return {

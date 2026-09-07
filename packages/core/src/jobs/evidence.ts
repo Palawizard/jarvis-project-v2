@@ -265,15 +265,31 @@ export function planNextTransition(input: TransitionInput): NextTransition {
       recovery: [],
     };
   }
-  if (
-    job.stage === 'paused' &&
-    job.resumeStage === 'implementing' &&
-    candidateHead === job.baseRef &&
-    !job.validationOnly
-  ) {
+  // `resumeStage === 'implementing'` is only ever written when implementation
+  // did NOT finish: the implementer's own failure pause, or crash recovery
+  // checkpointing a Job that was running that stage. So it always means "this
+  // implementation is incomplete", and the candidate commit is irrelevant to
+  // that question.
+  //
+  // It used to also require `candidateHead === job.baseRef`, which silently
+  // excluded the most common shape of the problem: the agent commits real
+  // partial work, THEN hits quota or is interrupted. `recordAgentHead` records
+  // that commit — on the exhausted path too — so the candidate had already
+  // moved off the base and the planner fell through to `verify`, promoting a
+  // half-written implementation into verification, review and Visual QA while
+  // the live resumable session went unused.
+  //
+  // The commit is kept, not reset: the interrupted agent resumes on top of its
+  // own work. Trust is unaffected — `assessCandidate` runs before this planner
+  // and is what decides whether the commit sitting in the worktree is one
+  // Jarvis produced or one a human must explicitly adopt.
+  if (job.stage === 'paused' && job.resumeStage === 'implementing' && !job.validationOnly) {
     return {
       kind: 'resume_agent',
-      reason: 'the implementer was interrupted before it produced a commit',
+      reason:
+        candidateHead === job.baseRef
+          ? 'the implementer was interrupted before it produced a commit'
+          : `the implementer was interrupted after committing ${short(candidateHead)}`,
       reusing,
       recovery: [],
     };

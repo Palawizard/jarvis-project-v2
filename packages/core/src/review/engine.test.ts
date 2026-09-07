@@ -14,7 +14,12 @@ import { loadConfig } from '../config.js';
 import { openDb } from '../db/index.js';
 import { EventBus } from '../events/bus.js';
 import { JobService } from '../jobs/service.js';
-import { checkReviewValue, parseReviewOutput, ReviewEngine } from './engine.js';
+import {
+  checkReviewValue,
+  parseReviewOutput,
+  ReviewEngine,
+  REVIEW_OUTPUT_SCHEMA,
+} from './engine.js';
 
 /** The prose shape a CLI can still fall back to. */
 const FENCED_APPROVE =
@@ -277,6 +282,48 @@ describe('reviewer structured-output framing', () => {
     expect(h.jobs.runs(result.jobId).at(-1)?.status).toBe('failed');
     expect(h.jobs.runs(result.jobId).at(-1)?.error).toContain('protocol failure');
     h.db.close();
+  });
+
+  // The constrained channel and the trusted validator must agree on what is
+  // acceptable. Where the JSON schema is looser, a provider emits an answer it
+  // believes is valid and Jarvis turns it into a protocol error — an
+  // infrastructure pause manufactured out of nothing, which is the failure this
+  // whole change exists to remove.
+  it('bounds every field the trusted validator requires to be non-empty', () => {
+    const properties = REVIEW_OUTPUT_SCHEMA.properties;
+    expect(properties.summary.minLength).toBe(1);
+    const finding = properties.findings.items.properties;
+    expect(finding.description.minLength).toBe(1);
+    expect(finding.recommendation.minLength).toBe(1);
+    expect(finding.file.minLength).toBe(1);
+    // `file` and `line` stay OPTIONAL, because the trusted schema makes them
+    // optional; requiring them would manufacture the mirror-image failure.
+    expect(REVIEW_OUTPUT_SCHEMA.properties.findings.items.required).not.toContain('file');
+    expect(REVIEW_OUTPUT_SCHEMA.properties.findings.items.required).not.toContain('line');
+  });
+
+  it.each([
+    ['an empty summary', { verdict: 'approve', summary: '', findings: [] }],
+    [
+      'an empty file on a finding',
+      {
+        verdict: 'approve',
+        summary: 'Clean change.',
+        findings: [
+          {
+            severity: 'low',
+            category: 'style',
+            file: '',
+            description: 'nit',
+            recommendation: 'rename it',
+          },
+        ],
+      },
+    ],
+  ])('still fails closed on %s', (_label, value) => {
+    // Rejected by BOTH: the schema above stops the provider producing it, and
+    // the trusted validator refuses it if one does anyway. Nothing is loosened.
+    expect(checkReviewValue(value).verdict).toBe('error');
   });
 
   it('refuses a claimed approve that hides a critical finding, through either channel', async () => {

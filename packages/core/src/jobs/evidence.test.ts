@@ -225,6 +225,35 @@ describe('the transition planner', () => {
     expect(next.kind).toBe('resume_agent');
   });
 
+  // `resumeStage === 'implementing'` always means implementation did not
+  // finish. Whether the interrupted agent had already committed changes only
+  // WHERE it resumes from, never WHETHER it resumes — requiring the candidate
+  // to still equal the base excluded the commonest shape (commit, then quota)
+  // and promoted half-written work into verification and review.
+  it('continues an interrupted implementer that had already committed', () => {
+    const next = plan({ resumeStage: 'implementing', headRef: X });
+    expect(next.kind).toBe('resume_agent');
+    expect(next.reason).toContain(X.slice(0, 8));
+  });
+
+  it('continues an interrupted implementer that committed nothing', () => {
+    const next = planNextTransition({
+      job: job({ resumeStage: 'implementing', headRef: 'base' }),
+      candidateHead: 'base',
+      visualExpected: false,
+      finalGateConfigured: false,
+      maxVisualRepairs: 1,
+      config,
+    });
+    expect(next.kind).toBe('resume_agent');
+    expect(next.reason).toContain('before it produced a commit');
+  });
+
+  // A validation-only Job pins an immutable candidate and has no implementer.
+  it('never resumes an implementer for a validation-only Job', () => {
+    expect(plan({ resumeStage: 'implementing', validationOnly: true }).kind).toBe('verify');
+  });
+
   // CASE 1 from the redesign: verified on X, the reviewer's provider was
   // unavailable. Verification must not run again.
   it('goes straight to review when verification already passed on this commit', () => {

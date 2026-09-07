@@ -963,12 +963,15 @@ export function createRoutes(jarvis: Jarvis): Hono {
     const job = jarvis.jobs.get(id);
     if (!job) return fail('job not found', 404);
     if (job.stage !== 'paused') return fail(`job is ${job.stage}, not paused`, 409);
-    const outcome = await jarvis.tools.execute(
-      'job.adoptHead',
-      { id },
-      { actor: 'user', jobId: id },
+    // NOT `settled()`. `job.adoptHead` is `sensitive`, so the policy always
+    // turns it into a confirmation and `tools.execute` answers
+    // `pending_approval` -- which `settled` would report to the browser as a
+    // 409 failure, making the only advertised recovery for an external HEAD
+    // change impossible to complete. Same contract as cancel and delete: 200
+    // with the pending outcome, and the client approves it.
+    return c.json(
+      await jarvis.tools.execute('job.adoptHead', { id }, { actor: 'user', jobId: id }),
     );
-    return settled(outcome);
   });
 
   /** Why a paused Job may or may not be resumable right now. Read-only. */

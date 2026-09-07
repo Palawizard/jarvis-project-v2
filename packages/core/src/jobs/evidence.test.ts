@@ -110,6 +110,7 @@ const plan = (patch: Partial<Job>, extra: Partial<Parameters<typeof planNextTran
     candidateHead: X,
     visualExpected: false,
     finalGateConfigured: false,
+    maxVisualRepairs: 1,
     config,
     ...extra,
   });
@@ -280,6 +281,31 @@ describe('the transition planner', () => {
     expect(next.kind).toBe('none');
   });
 
+  // The gate clamps the visual repair budget by the interactive agent's own
+  // hard budget, so the planner has to be told the SAME number. Promising a
+  // repair the gate then refuses is a useless Resume loop.
+  it('never promises more visual repairs than the gate will run', () => {
+    const next = planNextTransition({
+      job: job({
+        verifiedHead: X,
+        reviewedHead: X,
+        visualAttemptHead: X,
+        visualQaStatus: 'product_defect',
+        visualFixCycles: 1,
+      }),
+      candidateHead: X,
+      visualExpected: true,
+      finalGateConfigured: false,
+      // Configured higher, clamped lower by the caller.
+      maxVisualRepairs: 1,
+      config: {
+        ...config,
+        pipeline: { ...config.pipeline, maxVisualFixCycles: 5 },
+      },
+    });
+    expect(next.kind).toBe('none');
+  });
+
   it('runs the final gate once and then finishes', () => {
     expect(plan({ verifiedHead: X, reviewedHead: X }, { finalGateConfigured: true }).kind).toBe(
       'final_gate',
@@ -298,6 +324,7 @@ describe('the transition planner', () => {
       candidateHead: Y,
       visualExpected: false,
       finalGateConfigured: false,
+      maxVisualRepairs: 1,
       config,
     });
     expect(moved.kind).toBe('verify');

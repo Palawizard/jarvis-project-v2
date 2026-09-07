@@ -2049,6 +2049,48 @@ describe('HEAD-bound evidence', () => {
   });
 });
 
+// A fixer is allowed to conclude that nothing should change — the visual
+// fixer prompt says so in as many words. When it did, `commitPending` was a
+// no-op on the clean tree, the candidate was still the verified commit, and
+// the verification-evidence reuse branch broke out of the loop with the Job
+// still in `fixing`. `fixing -> reviewing` is not a legal transition, so the
+// pipeline threw and the Job paused showing an internal error as its state,
+// with a repair cycle already charged.
+it('survives a review fixer that completes without changing anything', async () => {
+  const provider = new FakeProvider('claude', (call) => {
+    if (call.role === 'implementer') {
+      fs.writeFileSync(path.join(call.cwd, 'change.txt'), 'first\n');
+    }
+    // A fixer that deliberately writes nothing.
+    return success(`${call.role} completed`);
+  });
+  const h = await harness({
+    provider,
+    maxReviewFixCycles: 1,
+    review: (_call, opts) => ({
+      runId: null,
+      provider: 'codex',
+      verdict: 'request_changes' as const,
+      summary: 'blocking',
+      findings: [highFinding()],
+      headRef: opts.headRef,
+      blocking: true,
+    }),
+  });
+  const job = await runToRest(h);
+
+  expect(job.stage).toBe('paused');
+  expect(job.pauseReason).not.toContain('illegal job transition');
+  expect(job.pauseReason).toContain('Code review repair budget exhausted');
+  // The candidate never moved, so the verification evidence is still valid
+  // and was reused rather than re-derived.
+  expect(job.verifiedHead).toBe(job.headRef);
+  expect(h.verificationCalls).toHaveLength(1);
+  // The reviewer is not asked again about a candidate it already judged.
+  expect(h.reviewHeads).toHaveLength(1);
+  h.db.close();
+});
+
 describe('product budgets versus provider attempts', () => {
   // D. Quota is not a code problem. Charging a repair budget for it means a
   // provider outage silently eats the fixer a real failure would have needed.

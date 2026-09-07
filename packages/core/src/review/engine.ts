@@ -106,7 +106,12 @@ export const REVIEW_OUTPUT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['severity', 'category', 'file', 'line', 'description', 'recommendation'],
+        // `file` and `line` are deliberately NOT required: the trusted schema
+        // makes both optional, and requiring them here would let a provider
+        // return a schema-valid answer that Jarvis then rejects as a protocol
+        // error — manufacturing the exact infrastructure pause this change
+        // exists to remove.
+        required: ['severity', 'category', 'description', 'recommendation'],
         properties: {
           severity: {
             type: 'string',
@@ -118,8 +123,10 @@ export const REVIEW_OUTPUT_SCHEMA = {
           },
           file: { type: 'string', maxLength: 500 },
           line: { type: 'integer', minimum: 1 },
-          description: { type: 'string', maxLength: 4000 },
-          recommendation: { type: 'string', maxLength: 4000 },
+          description: { type: 'string', minLength: 1, maxLength: 4000 },
+          // `checkReviewValue` refuses a blocking finding with an empty
+          // recommendation, so the constrained channel must refuse one too.
+          recommendation: { type: 'string', minLength: 1, maxLength: 4000 },
         },
       },
     },

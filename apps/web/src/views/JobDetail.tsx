@@ -252,14 +252,15 @@ export function JobDetailView({
                 ) {
                   return;
                 }
+                // `job.adoptHead` is `sensitive`, so the policy turns it into a
+                // confirmation and the route answers with a pending outcome —
+                // exactly like Cancel and Delete. `approvePending` completes it;
+                // reading `status === 'succeeded'` directly never could.
                 void api
                   .adoptJobHead(job.id)
-                  .then((outcome) => {
-                    setActionError(
-                      outcome.status === 'succeeded'
-                        ? null
-                        : `could not adopt the current HEAD (${outcome.status})`,
-                    );
+                  .then((outcome) => approvePending(outcome))
+                  .then(() => {
+                    setActionError(null);
                     detail.reload();
                   })
                   .catch((error: unknown) =>
@@ -1201,7 +1202,16 @@ function PausedPanel({
               ? 'changes requested'
               : at(job.reviewedHead)}
         </span>
-        {job.visualAttemptHead && <span>visual QA {job.visualQaStatus ?? 'recorded'}</span>}
+        {/* Through the same head comparison as every other row: this panel
+            exists to say which evidence still describes the CURRENT candidate,
+            so a Visual QA result recorded for a commit a fixer has since
+            replaced has to read as stale rather than as a pass. */}
+        {job.visualAttemptHead && (
+          <span>
+            visual QA{' '}
+            {job.visualAttemptHead === head ? (job.visualQaStatus ?? 'recorded') : 'stale'}
+          </span>
+        )}
         <span>
           repair budgets — verification {job.fixCycles}, review {job.reviewFixCycles}, visual{' '}
           {job.visualFixCycles}

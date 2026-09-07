@@ -236,7 +236,11 @@ export class ExecutionAdvisor {
       durationMs: Date.now() - startedAt,
       capabilityTier: recommendation.capabilityTier,
       effort: recommendation.effort,
-      reasons: recommendation.reasons,
+      // The COUNT, not the text. The reasons are model-authored prose derived
+      // from the user's request; they belong on the Job row that already stores
+      // that request, not duplicated into the long-lived event log. Same rule
+      // the brief compiler follows for its own audit row.
+      reasons: recommendation.reasons.length,
       continuation: Boolean(input.continuation),
     });
     return recommendation;

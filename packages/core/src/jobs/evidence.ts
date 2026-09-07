@@ -218,6 +218,13 @@ export interface TransitionInput {
   visualExpected: boolean;
   /** Whether the project declares a closing `kind: 'final'` verification step. */
   finalGateConfigured: boolean;
+  /**
+   * The visual repair budget the GATE will actually enforce, which is the
+   * configured cycles clamped by the interactive agent's own hard budget. Passed
+   * in rather than read from config so the planner cannot promise a repair the
+   * gate refuses — the two disagreeing is a useless Resume loop.
+   */
+  maxVisualRepairs: number;
   config: Pick<JarvisConfig, 'pipeline'>;
 }
 
@@ -343,7 +350,7 @@ export function planNextTransition(input: TransitionInput): NextTransition {
         'inspect the captured screenshots',
       ]);
     }
-    if (job.visualFixCycles >= config.pipeline.maxVisualFixCycles) {
+    if (job.visualFixCycles >= input.maxVisualRepairs) {
       return blocked(
         reusing,
         `Visual QA found a product defect on ${short(candidateHead)} and the single visual ` +

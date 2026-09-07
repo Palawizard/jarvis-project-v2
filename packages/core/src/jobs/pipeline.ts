@@ -4,7 +4,7 @@ import path from 'node:path';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import type { JobService, Job } from './service.js';
+import type { JobService, Job, RepairCheckpoint } from './service.js';
 import type { ProjectService, Project } from '../projects/service.js';
 import { renderProjectProfile } from '../projects/profile.js';
 import type { SessionService } from '../sessions/service.js';
@@ -213,6 +213,30 @@ export class JobPipeline {
       let report: VerificationReport;
       let verifiedHead = '';
       for (;;) {
+        // The stage moves FIRST, before the reuse decision, because the Job is
+        // entering the verification gate either way -- whether that gate has to
+        // run commands or already has an answer for this commit.
+        //
+        // Doing it after the reuse check was a real crash: a fixer that
+        // completed without changing anything (`commitPending` is a no-op on a
+        // clean tree, and the visual fixer prompt explicitly invites "change no
+        // source") left the candidate on a commit that was still verified, so
+        // the reuse branch broke out with the Job still in `fixing` -- and
+        // `fixing -> reviewing` is not a legal transition. The Job paused with
+        // an internal error message as its user-visible state, after a repair
+        // cycle had already been charged.
+        const verificationPatch = {
+          pauseReason: null,
+          error: null,
+          restartReason: null,
+          repairKind: null,
+          repairCheckpoint: null,
+          pauseFailureKind: null,
+        };
+        if (job.stage === 'verifying') jobs.patch(jobId, verificationPatch);
+        else jobs.transition(jobId, 'verifying', verificationPatch);
+        job = jobs.get(jobId) as Job;
+
         // EVIDENCE REUSE. A verification report is a statement about one exact
         // tree. If the Job row says this commit passed and the commit has not
         // moved, running the suite again would spend minutes re-deriving an
@@ -233,17 +257,6 @@ export class JobPipeline {
           break;
         }
 
-        const verificationPatch = {
-          pauseReason: null,
-          error: null,
-          restartReason: null,
-          repairKind: null,
-          repairCheckpoint: null,
-          pauseFailureKind: null,
-        };
-        if (job.stage === 'verifying') jobs.patch(jobId, verificationPatch);
-        else jobs.transition(jobId, 'verifying', verificationPatch);
-        job = jobs.get(jobId) as Job;
         verifiedHead = await this.git.resolveCommit(input.cwd, 'HEAD');
         report = await verification.run({
           jobId,
@@ -284,8 +297,11 @@ export class JobPipeline {
         }
         if (report.passed) {
           // The evidence head is written HERE and nowhere else: at the moment a
-          // real run proved this exact commit, using the commit that was read
-          // before the run and re-asserted by `validateCandidate` after it.
+          // real run proved this exact commit, for the commit that was read
+          // immediately before the run started. If the run itself moved the
+          // source, the `headAfterVerification` check below catches it, calls
+          // `moveCandidate` -- which clears this very column -- and re-enters
+          // the loop, so the claim can never outlive the tree it describes.
           job = jobs.patch(jobId, { verifiedHead, verificationSignature: null });
           break;
         }
@@ -1263,7 +1279,12 @@ export class JobPipeline {
           return;
         }
         await this.git.commitPending(job.worktreePath, `jarvis: resume ${resumeStage}`);
+        // A resumed repair charges the same product budget an in-line one does.
+        // Charging happens after completion everywhere now, and this path used
+        // to skip it entirely -- so an interrupt followed by a Resume handed out
+        // one fixer for free and the counters under-reported what had been spent.
         this.moveCandidate(jobId, await this.git.resolveCommit(job.worktreePath, 'HEAD'), {
+          ...repairCharge(jobs.get(jobId) as Job, job.repairCheckpoint),
           repairKind: null,
           repairCheckpoint: null,
         });
@@ -1386,7 +1407,7 @@ export class JobPipeline {
       return;
     }
     await this.git.commitPending(worktree.path, `jarvis: ${job.goal}`);
-    jobs.patch(jobId, { headRef: await this.git.resolveCommit(worktree.path, 'HEAD') });
+    this.moveCandidate(jobId, await this.git.resolveCommit(worktree.path, 'HEAD'));
     await this.runCandidateGates({
       job: jobs.get(jobId) as Job,
       project,
@@ -2104,6 +2125,14 @@ export class JobPipeline {
       job,
       candidateHead,
       visualExpected,
+      // The SAME expression the gate uses, so the planner can never promise a
+      // visual repair the gate would refuse. An env override above the hard
+      // interactive budget used to make the two disagree, which is a useless
+      // Resume loop: plan says repair, gate pauses, repeat.
+      maxVisualRepairs: Math.min(
+        this.config.pipeline.maxVisualFixCycles,
+        VISUAL_QA_BUDGET.visualFixCycles,
+      ),
       finalGateConfigured: (project.config.verification?.steps ?? []).some(
         (step) => step.kind === 'final',
       ),
@@ -2163,15 +2192,19 @@ export class JobPipeline {
    * change makes stale.
    *
    * A NO-OP when the commit has not moved, and that is the whole point: every
-   * write of `headRef` in the pipeline goes through here, so a stage that
-   * changed nothing can no longer wipe the evidence of the stages before it.
+   * write of `headRef` after a stage that could have changed the source goes
+   * through here, so a stage that changed nothing can no longer wipe the
+   * evidence of the stages before it.
    * The previous code cleared `reviewedHead` and `visualHead` on every pass
    * through the loop whether or not anything had changed, which is why a Resume
    * could never reuse anything.
    *
-   * Historical rows are untouched. Each review, verification and screenshot
-   * carries the head it describes, so invalidating means "stops matching the
-   * current candidate", never "is deleted".
+   * Historical rows are untouched, and invalidating means "stops matching the
+   * current candidate", never "is deleted". Reviews and screenshots carry their
+   * own `head_ref`, so they stay individually attributable; `verifications`
+   * does not, so a reused verification report is attributable only through the
+   * Job row's `verifiedHead` -- which is why that column is written in exactly
+   * one place and cleared here on every move.
    */
   private moveCandidate(jobId: string, head: string, extra: Partial<Job> = {}): Job {
     const job = this.deps.jobs.get(jobId) as Job;
@@ -2340,6 +2373,28 @@ export function candidateRejectionReason(
   return reviewVerdict === 'approve'
     ? null
     : `Independent review did not approve the candidate (${reviewVerdict}).`;
+}
+
+/**
+ * The product repair counter a completed resumed fixer owes.
+ *
+ * Repair budgets are charged after the fixer has actually run, so the resume
+ * path has to charge the cycle the interrupted run never got to. The kind comes
+ * from the persisted checkpoint, which is the same thing that decided which
+ * prompt the resumed fixer was given.
+ */
+function repairCharge(job: Job, checkpoint: RepairCheckpoint | null): Partial<Job> {
+  switch (checkpoint?.kind) {
+    case 'verification':
+      return { fixCycles: job.fixCycles + 1 };
+    case 'code_review':
+      return { reviewFixCycles: job.reviewFixCycles + 1 };
+    case 'visual':
+      return { visualFixCycles: job.visualFixCycles + 1 };
+    default:
+      // A resumed implementer, which has no repair budget to charge.
+      return {};
+  }
 }
 
 /**

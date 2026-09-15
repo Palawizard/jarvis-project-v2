@@ -228,7 +228,9 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
       // fresh final review. Not a loop.
       maxReviewFixCycles: Math.max(0, envInt('JARVIS_MAX_REVIEW_FIX_CYCLES', 1)),
       maxVisualFixCycles: Math.max(0, envInt('JARVIS_MAX_VISUAL_FIX_CYCLES', 1)),
-      providerAttempts: Math.max(1, envInt('JARVIS_PROVIDER_ATTEMPTS', 2)),
+      // Clamped to [1, 2]: preferred, then one alternate, then pause. A larger
+      // value would only walk back to a provider that already failed this action.
+      providerAttempts: Math.min(2, Math.max(1, envInt('JARVIS_PROVIDER_ATTEMPTS', 2))),
       verificationInfraRetries: Math.max(0, envInt('JARVIS_VERIFICATION_INFRA_RETRIES', 2)),
       codeReviewBlockingSeverities: envSeverities(
         'JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES',

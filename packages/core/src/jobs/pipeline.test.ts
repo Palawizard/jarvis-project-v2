@@ -222,7 +222,7 @@ async function harness(options: {
       maxFixCycles: options.maxFixCycles ?? baseConfig.pipeline.maxFixCycles,
       maxReviewFixCycles: options.maxReviewFixCycles ?? 2,
       maxVisualFixCycles: 2,
-      providerAttempts: options.providerAttempts ?? 2,
+      providerAttempts: options.providerAttempts ?? baseConfig.pipeline.providerAttempts,
       verificationInfraRetries:
         options.verificationInfraRetries ?? baseConfig.pipeline.verificationInfraRetries,
     },
@@ -610,7 +610,13 @@ async function pausedCandidate(
     h.jobs.transition(job.id, 'reviewing');
   }
   if (resumeStage === 'visual_qa') h.jobs.transition(job.id, 'visual_qa');
-  h.jobs.transition(job.id, 'paused', { resumeStage, pauseReason: 'fixture interruption' });
+  // An orchestrator restart mid-stage: the only checkpoint that may carry
+  // uncommitted agent work into Resume.
+  h.jobs.transition(job.id, 'paused', {
+    resumeStage,
+    pauseReason: 'fixture interruption',
+    restartReason: 'orchestrator_restart',
+  });
   beforeResume?.(worktree.path);
   h.pipeline.resume(job.id);
   const deadline = Date.now() + 20_000;
@@ -2182,6 +2188,28 @@ describe('product budgets versus provider attempts', () => {
     expect(codex.calls).toHaveLength(1);
     h.db.close();
   });
+
+  it('cannot be raised above two attempts from the environment', async () => {
+    const previous = process.env.JARVIS_PROVIDER_ATTEMPTS;
+    process.env.JARVIS_PROVIDER_ATTEMPTS = '4';
+    try {
+      const claude = new FakeProvider('claude', () => failure('Claude usage limit reached'));
+      const codex = new FakeProvider('codex', () => failure('Codex capacity unavailable'));
+      // No explicit `providerAttempts`: the harness takes it from `loadConfig`.
+      const h = await harness({ providers: [claude, codex], review: APPROVES.review });
+      expect(h.config.pipeline.providerAttempts).toBe(2);
+      const job = await runToRest(h);
+
+      expect(job.stage).toBe('paused');
+      // Never A -> B -> A -> B.
+      expect(claude.calls).toHaveLength(1);
+      expect(codex.calls).toHaveLength(1);
+      h.db.close();
+    } finally {
+      if (previous === undefined) delete process.env.JARVIS_PROVIDER_ATTEMPTS;
+      else process.env.JARVIS_PROVIDER_ATTEMPTS = previous;
+    }
+  });
 });
 
 describe('progress-aware verification repair', () => {
@@ -2468,6 +2496,239 @@ describe('candidate HEAD recovery', () => {
     expect(after?.plan.kind).toBe('verify');
     h.db.close();
   });
+
+  // M. A pause the pipeline wrote itself has already recorded its agent's HEAD.
+  // Anything that moves the worktree afterwards is not agent work, however
+  // neatly it descends from the base.
+  const commitAll = (cwd: string, message: string, author = 'A'): string => {
+    execFileSync('git', ['add', '-A'], { cwd });
+    execFileSync(
+      'git',
+      ['-c', `user.name=${author}`, '-c', 'user.email=x@y', 'commit', '-qm', message],
+      { cwd },
+    );
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+  };
+  const settle = async (h: Harness, jobId: string): Promise<Job> => {
+    const deadline = Date.now() + 20_000;
+    while (h.pipeline.isRunning(jobId) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return h.jobs.get(jobId) as Job;
+  };
+  /** An implementer that commits partial work, then hits quota; completes on the next run. */
+  const partialImplementer = (commitPartial: boolean) => {
+    let attempt = 0;
+    return new FakeProvider('claude', (call) => {
+      if (call.role !== 'implementer') return success(`${call.role} completed`);
+      attempt += 1;
+      if (attempt === 1) {
+        fs.writeFileSync(path.join(call.cwd, 'change.txt'), 'half the work\n');
+        if (commitPartial) commitAll(call.cwd, 'partial implementation');
+        return failure("You've hit your usage limit for this session");
+      }
+      fs.appendFileSync(path.join(call.cwd, 'change.txt'), 'the rest\n');
+      return success('implementation finished');
+    });
+  };
+
+  it('checkpoints uncommitted work of an interrupted implementer and resumes from it', async () => {
+    const provider = partialImplementer(false);
+    const h = await harness({ provider, review: APPROVES.review, providerAttempts: 1 });
+    const paused = await runToRest(h);
+
+    expect(paused.stage).toBe('paused');
+    expect(paused.resumeStage).toBe('implementing');
+    expect(paused.restartReason).toBeNull();
+    // The agent's own uncommitted work became the recorded candidate, and the
+    // worktree it paused in is clean.
+    expect(paused.headRef).not.toBe(paused.baseRef);
+    const cwd = paused.worktreePath as string;
+    expect(execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' })).toBe('');
+    expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim()).toBe(
+      paused.headRef,
+    );
+
+    const plan = await h.pipeline.resumePlan(paused.id);
+    expect(plan?.recovery).toBeNull();
+    expect(plan?.plan.kind).toBe('resume_agent');
+    h.pipeline.resume(paused.id);
+    const resumed = await settle(h, paused.id);
+
+    expect(resumed.stage).toBe('awaiting_user');
+    expect(provider.calls.filter((call) => call.role === 'implementer')).toHaveLength(2);
+    execFileSync('git', ['merge-base', '--is-ancestor', paused.headRef as string, 'HEAD'], {
+      cwd,
+    });
+    expect(h.verificationCalls).toHaveLength(1);
+    h.db.close();
+  });
+
+  it('refuses a human commit made after a normal implementing pause until it is adopted', async () => {
+    const provider = partialImplementer(true);
+    const h = await harness({ provider, review: APPROVES.review, providerAttempts: 1 });
+    const paused = await runToRest(h);
+    expect(paused.stage).toBe('paused');
+    expect(paused.resumeStage).toBe('implementing');
+    const agentHead = paused.headRef as string;
+    const cwd = paused.worktreePath as string;
+
+    fs.appendFileSync(path.join(cwd, 'change.txt'), 'human edit\n');
+    const human = commitAll(cwd, 'human commit', 'H');
+
+    const plan = await h.pipeline.resumePlan(paused.id);
+    expect(plan?.recovery?.kind).toBe('external_head_change');
+    expect(plan?.plan.kind).toBe('none');
+
+    h.pipeline.resume(paused.id);
+    const refused = await settle(h, paused.id);
+    expect(refused.stage).toBe('paused');
+    expect(refused.headRef).toBe(agentHead);
+    expect(refused.pauseReason).toContain('Jarvis did not create');
+    // Nothing built on the human commit, and nothing expensive ran.
+    expect(provider.calls.filter((call) => call.role === 'implementer')).toHaveLength(1);
+    expect(h.verificationCalls).toHaveLength(0);
+    expect(
+      h.bus
+        .list({ jobId: paused.id, limit: 200 })
+        .some((event) => event.payload?.reason === 'interrupted_agent_commit'),
+    ).toBe(false);
+
+    // The explicit, human-authorised adoption.
+    await h.pipeline.adoptCandidateHead(paused.id);
+    const adopted = h.jobs.get(paused.id) as Job;
+    expect(adopted.headRef).toBe(human);
+    expect(adopted.verifiedHead).toBeNull();
+    expect(adopted.reviewedHead).toBeNull();
+    const after = await h.pipeline.resumePlan(paused.id);
+    expect(after?.recovery).toBeNull();
+    // Implementation is still incomplete, so it continues -- now from Y.
+    expect(after?.plan.kind).toBe('resume_agent');
+
+    h.pipeline.resume(paused.id);
+    const resumed = await settle(h, paused.id);
+    expect(resumed.stage).toBe('awaiting_user');
+    execFileSync('git', ['merge-base', '--is-ancestor', human, resumed.headRef as string], {
+      cwd,
+    });
+    expect(h.verificationCalls).toHaveLength(1);
+    h.db.close();
+  });
+
+  it('refuses a human commit made after a normal fixing pause', async () => {
+    let fixerRuns = 0;
+    const provider = new FakeProvider('claude', (call) => {
+      if (call.role === 'implementer') {
+        fs.writeFileSync(path.join(call.cwd, 'change.txt'), 'first\n');
+        return success('implemented');
+      }
+      if (call.role === 'fixer') {
+        fixerRuns += 1;
+        fs.appendFileSync(path.join(call.cwd, 'change.txt'), 'partial fix\n');
+        commitAll(call.cwd, 'partial fix');
+        return failure("You've hit your usage limit for this session");
+      }
+      return success(`${call.role} completed`);
+    });
+    const h = await harness({
+      provider,
+      verification: [failedVerification('product'), passedVerification()],
+      review: APPROVES.review,
+      providerAttempts: 1,
+    });
+    const paused = await runToRest(h);
+    expect(paused.stage).toBe('paused');
+    expect(paused.resumeStage).toBe('fixing');
+    expect(paused.fixCycles).toBe(0);
+    const agentHead = paused.headRef as string;
+    const cwd = paused.worktreePath as string;
+    expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim()).toBe(
+      agentHead,
+    );
+
+    fs.appendFileSync(path.join(cwd, 'change.txt'), 'human edit\n');
+    commitAll(cwd, 'human commit', 'H');
+
+    const plan = await h.pipeline.resumePlan(paused.id);
+    expect(plan?.recovery?.kind).toBe('external_head_change');
+    h.pipeline.resume(paused.id);
+    const refused = await settle(h, paused.id);
+    expect(refused.stage).toBe('paused');
+    expect(refused.headRef).toBe(agentHead);
+    expect(fixerRuns).toBe(1);
+    h.db.close();
+  });
+
+  it('never auto-commits human edits left in the worktree after a normal pause', async () => {
+    const provider = partialImplementer(true);
+    const h = await harness({ provider, review: APPROVES.review, providerAttempts: 1 });
+    const paused = await runToRest(h);
+    expect(paused.resumeStage).toBe('implementing');
+    const agentHead = paused.headRef as string;
+    const cwd = paused.worktreePath as string;
+
+    fs.appendFileSync(path.join(cwd, 'change.txt'), 'uncommitted human edit\n');
+
+    const plan = await h.pipeline.resumePlan(paused.id);
+    expect(plan?.recovery?.kind).toBe('dirty_worktree');
+    h.pipeline.resume(paused.id);
+    const refused = await settle(h, paused.id);
+
+    expect(refused.stage).toBe('paused');
+    expect(refused.pauseReason).toContain('uncommitted changes Jarvis did not make');
+    expect(refused.headRef).toBe(agentHead);
+    expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim()).toBe(
+      agentHead,
+    );
+    expect(execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' })).toContain(
+      'change.txt',
+    );
+    expect(provider.calls.filter((call) => call.role === 'implementer')).toHaveLength(1);
+    h.db.close();
+  });
+
+  it('does not label a generic agent failure as a provider condition', async () => {
+    const provider = new FakeProvider('claude', (call) =>
+      call.role === 'implementer'
+        ? failure('the agent gave up on the task')
+        : success(`${call.role} completed`),
+    );
+    const h = await harness({ provider, review: APPROVES.review, providerAttempts: 1 });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('paused');
+    expect(job.resumeStage).toBe('implementing');
+    expect(job.pauseFailureKind).toBeNull();
+    expect(job.pauseReason).toContain('the agent gave up on the task');
+    expect(job.fixCycles).toBe(0);
+    const paused = h.bus
+      .list({ jobId: job.id, limit: 200 })
+      .find((event) => event.payload?.reason === 'pipeline_paused');
+    expect(paused?.payload?.infrastructure).toBeUndefined();
+    h.db.close();
+  });
+
+  it('still labels a reviewer structured-output failure as infrastructure', async () => {
+    const h = await harness({
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'claude',
+        verdict: 'error' as const,
+        summary: 'Reviewer output failed strict structured validation: summary is empty',
+        findings: [],
+        headRef: opts.headRef,
+        blocking: true,
+      }),
+    });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('paused');
+    expect(job.resumeStage).toBe('reviewing');
+    expect(job.pauseFailureKind).toBe('protocol');
+    expect(job.reviewFixCycles).toBe(0);
+    expect(job.reviewedHead).toBeNull();
+    h.db.close();
+  });
 });
 
 describe('semantic execution advice', () => {
@@ -2517,6 +2778,7 @@ describe('semantic execution advice', () => {
     const job = await runToRest(h, {
       projectId: '',
       request: 'Add OAuth login.',
+      originMessageId: 'msg-chat-brief',
       brief: { ...fixtureBrief(), executionRecommendation: advice },
     });
 
@@ -2524,6 +2786,33 @@ describe('semantic execution advice', () => {
     expect(job.executionRecommendation).toBeNull();
     const implementer = h.provider.calls.find((call) => call.role === 'implementer');
     expect(implementer?.model).toBe('opus');
+    h.db.close();
+  });
+
+  // A chat Job whose Brief Compiler failed has no brief, but it is still a chat
+  // Job: the missing brief must not buy it a second selector call.
+  it('does not invoke the Execution Advisor for a chat Job whose brief failed to compile', async () => {
+    const calls: unknown[] = [];
+    const h = await harness({
+      review: APPROVES.review,
+      advisor: {
+        advise: async (input) => {
+          calls.push(input);
+          return advice;
+        },
+      },
+    });
+    const job = await runToRest(h, {
+      projectId: '',
+      request: 'Add OAuth login.',
+      originMessageId: 'msg-chat-no-brief',
+    });
+
+    expect(calls).toHaveLength(0);
+    expect(job.stage).toBe('awaiting_user');
+    expect(job.executionRecommendation).toBeNull();
+    // The deterministic trusted fallback.
+    expect(h.provider.calls.find((call) => call.role === 'implementer')?.model).toBe('sonnet');
     h.db.close();
   });
 

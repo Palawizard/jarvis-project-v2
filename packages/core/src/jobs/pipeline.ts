@@ -520,13 +520,19 @@ export class JobPipeline {
           // review repair cycle is spent, and the verification evidence above
           // stays valid -- a reviewer that could not run says nothing about
           // whether the checks passed.
+          // The summary carries the provider's own (redacted) wording, which
+          // is the only place a quota or capacity outage is distinguishable
+          // from a broken structured answer. A reviewer `error` is never a
+          // verdict on the candidate, so wording the classifier cannot place
+          // (strict structured-validation failure among it) is `protocol`.
+          const reviewFailure = classifyAgentFailure({
+            status: 'failed',
+            error: reviewResult.summary,
+          });
           this.pauseInfrastructure(
             jobId,
             'reviewing',
-            // The summary carries the provider's own (redacted) wording, which
-            // is the only place a quota or capacity outage is distinguishable
-            // from a broken structured answer.
-            classifyAgentFailure({ status: 'failed', error: reviewResult.summary }),
+            reviewFailure === 'agent_failure' ? 'protocol' : reviewFailure,
             reviewResult.summary,
           );
           return;
@@ -1645,6 +1651,23 @@ export class JobPipeline {
         },
       });
     }
+    // The run did not complete and the Job is about to pause. Checkpoint what
+    // this authorised run left uncommitted NOW, while Jarvis can still vouch
+    // for it: after the pause the candidate is a known commit on a clean
+    // worktree, so `assessCandidate` can treat anything that appears later as
+    // external instead of guessing whose edits it is looking at.
+    const worktreePath = this.deps.jobs.get(opts.jobId)?.worktreePath;
+    if (worktreePath && path.resolve(worktreePath) === path.resolve(opts.cwd)) {
+      try {
+        await this.git.commitPending(opts.cwd, `jarvis: interrupted ${opts.role} checkpoint`);
+      } catch (error) {
+        // Fail closed: left dirty, Resume refuses it as a dirty worktree.
+        log.warn('could not checkpoint an interrupted agent run', {
+          jobId: opts.jobId,
+          error: String(error),
+        });
+      }
+    }
     await this.recordAgentHead(opts.jobId, opts.cwd);
     return last as AgentStageOutcome;
   }
@@ -1821,13 +1844,24 @@ export class JobPipeline {
    *   3. the Execution Advisor — one bounded tool-free call, direct Jobs only;
    *   4. nothing, and `selectExecutionProfile` falls back to its deterministic
    *      scoring exactly as it did before any of this existed.
+   *
+   * A chat-origin Job (`originMessageId`) never reaches step 3, even when its
+   * brief failed to compile: the chat path's recommendation comes from the call
+   * it already made, and a failed brief does not buy it a second selector call.
    */
   private async ensureExecutionRecommendation(
     job: Job,
     project: Project,
     signal: AbortSignal,
   ): Promise<Job> {
-    if (job.compiledBrief || job.executionRecommendation || job.validationOnly) return job;
+    if (
+      job.compiledBrief ||
+      job.executionRecommendation ||
+      job.validationOnly ||
+      job.originMessageId
+    ) {
+      return job;
+    }
     // TOTAL, by construction. This stage produces ADVICE: the Job is created,
     // started and implemented whether or not it answers, so nothing that
     // happens inside it may become the reason a Job failed. The advisor already
@@ -1984,7 +2018,17 @@ export class JobPipeline {
     // Everything except the expected-HEAD comparison is still a hard gate: the
     // worktree must exist, be a repository, be THIS repository, and sit on top
     // of this Job's own base. None of those is recoverable by adopting a commit.
-    const allowDirty = job.resumeStage === 'implementing' || job.resumeStage === 'fixing';
+    //
+    // Only CRASH RECOVERY may attribute worktree state to an agent run. A Job
+    // the pipeline paused itself had `recordAgentHead` run and its uncommitted
+    // work checkpointed on the way out (see `runAgentStage`), so its candidate
+    // is already known and anything that changed afterwards came from outside.
+    // `restartReason` is written only by `JobService.recoverInterrupted` and
+    // cleared by every pipeline pause, so it cannot outlive the crash it names.
+    const crashCheckpoint =
+      job.restartReason === 'orchestrator_restart' &&
+      (job.resumeStage === 'implementing' || job.resumeStage === 'fixing');
+    const allowDirty = crashCheckpoint;
     let status;
     try {
       status = await this.git.validateRecoveryWorkspace({
@@ -2027,19 +2071,24 @@ export class JobPipeline {
     }
     if (job.headRef && head !== job.headRef) {
       const descends = await isAncestor(job.worktreePath, job.baseRef, head);
-      if (descends && allowDirty) {
-        // Case B. The Job was checkpointed inside an implementation or repair
+      if (descends && crashCheckpoint) {
+        // Case B. The ORCHESTRATOR RESTARTED inside an implementation or repair
         // run that JARVIS launched into this worktree, and that run committed
-        // before it was interrupted -- an orchestrator restart gets no chance
-        // to run `recordAgentHead`. Refusing here is what used to discard half
-        // an hour of committed agent work behind an unrecoverable "recovery
-        // HEAD changed". The commit descends from this Job's own base and no
-        // other process writes here, so it is the candidate. The caller records
-        // it, which audits the move and invalidates the stale evidence.
+        // before the restart -- which gave it no chance to run
+        // `recordAgentHead`. Refusing here is what used to discard half an hour
+        // of committed agent work behind an unrecoverable "recovery HEAD
+        // changed". The commit descends from this Job's own base, so it is the
+        // candidate. The caller records it, which audits the move and
+        // invalidates the stale evidence.
+        //
+        // Deliberately NOT extended to a pause the pipeline wrote itself: that
+        // path already recorded the agent's HEAD, so a later move is somebody
+        // else's commit (Case C), however it descends.
         return { ok: true, head, trustedAgentChange: true };
       }
-      // Case C. A commit Jarvis did not create, on a Job that was not inside an
-      // agent run. Never adopted silently.
+      // Case C. A commit Jarvis did not create -- on a Job that was not inside
+      // an agent run, or one that paused after recording its agent's HEAD.
+      // Never adopted silently.
       return {
         ok: false,
         kind: 'external_head_change',
@@ -2186,7 +2235,17 @@ export class JobPipeline {
     kind: AgentFailureKind | undefined,
     reason: string,
   ): void {
-    this.pauseWith(jobId, resumeStage, reason, kind ?? 'unavailable');
+    const failure = kind ?? 'unavailable';
+    // Only a classified infrastructure kind is recorded as one. A generic
+    // `agent_failure` is not a provider condition, and labelling it so would
+    // tell a human the provider stopped the Job; the reason text keeps the
+    // real error either way, and no budget is charged on either path.
+    this.pauseWith(
+      jobId,
+      resumeStage,
+      reason,
+      INFRASTRUCTURE_FAILURE_KINDS.includes(failure) ? failure : null,
+    );
   }
 
   private pauseWith(
@@ -2201,6 +2260,10 @@ export class JobPipeline {
       pauseReason: reason.slice(0, 20_000),
       error: reason.slice(0, 20_000),
       pauseFailureKind: failureKind,
+      // A pause the pipeline writes is never a crash checkpoint. Clearing it
+      // here is what stops a stale `orchestrator_restart` from an earlier
+      // recovery granting `assessCandidate`'s crash trust to this pause.
+      restartReason: null,
     });
     this.deps.bus.emit({
       type: 'system.recovery',

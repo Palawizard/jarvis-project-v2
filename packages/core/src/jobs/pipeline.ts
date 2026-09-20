@@ -17,7 +17,11 @@ import {
   type AgentFailureKind,
   type AgentRegistry,
 } from '../agents/registry.js';
-import type { VerificationEngine, VerificationReport } from '../verification/engine.js';
+import type {
+  VerificationEngine,
+  VerificationReport,
+  VerificationResult,
+} from '../verification/engine.js';
 import type { ReviewEngine, Review, ReviewFinding } from '../review/engine.js';
 import type { VisualReviewFinding } from '../visualqa/engine.js';
 import { VisualQaEngine } from '../visualqa/engine.js';
@@ -192,6 +196,8 @@ export class JobPipeline {
     let job = jobs.get(jobId) as Job;
     let provider = input.implementerProvider;
     let infrastructureAttempts = 0;
+    /** Checks proven on one exact commit, carried into that commit's retry only. */
+    let infraReuse: { head: string; results: VerificationResult[] } | null = null;
     let verificationMutationCycles = 0;
     /** Failure count of the previous full verification, for the progress gate. */
     let previousFailures: number | null = null;
@@ -265,7 +271,15 @@ export class JobPipeline {
           steps: input.project.config.verification?.steps,
           cycle: verificationCycle++,
           signal: input.signal,
+          // Only ever the previous cycle of THIS tree, and only after an
+          // infrastructure retry: a retry that re-ran forty minutes of checks
+          // that had already passed is how a single timed-out step turned into
+          // hours of standing still.
+          ...(infraReuse && infraReuse.head === verifiedHead
+            ? { reusePassed: infraReuse.results }
+            : {}),
         });
+        infraReuse = null;
         if (input.signal.aborted) return void jobs.transition(jobId, 'cancelled');
         if (job.validationOnly) {
           try {
@@ -315,10 +329,23 @@ export class JobPipeline {
           // source would be editing code to fix a missing executable.
           if (infrastructureAttempts < this.config.pipeline.verificationInfraRetries) {
             infrastructureAttempts += 1;
+            const passedOnThisTree = report.results.filter(
+              (result) => result.kind !== 'setup' && result.status === 'passed',
+            );
+            infraReuse = { head: verifiedHead, results: passedOnThisTree };
             this.deps.bus.emit({
               type: 'verification.retry',
               jobId,
-              payload: { attempt: infrastructureAttempts, failureKind: report.failureKind },
+              payload: {
+                attempt: infrastructureAttempts,
+                failureKind: report.failureKind,
+                // What the retry will actually do, so "verifying" for the third
+                // time is legible instead of alarming.
+                rerunning: report.results
+                  .filter((result) => result.kind === 'setup' || result.status !== 'passed')
+                  .map((result) => result.name),
+                reusing: passedOnThisTree.map((result) => result.name),
+              },
             });
             continue;
           }

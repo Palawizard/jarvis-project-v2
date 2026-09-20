@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { openDb, type Db } from '../db/index.js';
 import { loadConfig } from '../config.js';
 import { EventBus } from '../events/bus.js';
-import { VerificationEngine } from './engine.js';
+import { VerificationEngine, classifyVerificationFailure } from './engine.js';
 
 let home: string;
 let db: Db;
@@ -409,4 +409,158 @@ describe('the final gate phase', () => {
     expect(report.passed).toBe(false);
     expect(report.failureKind).toBe('product');
   });
+});
+
+describe('a timed-out check never erases a real product failure', () => {
+  const result = (
+    name: string,
+    over: Partial<{
+      status: 'passed' | 'failed';
+      failureKind: 'none' | 'product' | 'infrastructure' | 'cancelled';
+      kind: 'setup' | 'check' | 'final' | 'integration' | 'e2e';
+      required: boolean;
+    }> = {},
+  ) =>
+    ({
+      id: `ver_${name}`,
+      name,
+      command: name,
+      status: over.status ?? 'failed',
+      exitCode: null,
+      output: '',
+      outputPath: null,
+      durationMs: 1,
+      cycle: 0,
+      kind: over.kind ?? 'check',
+      required: over.required ?? true,
+      failureKind: over.failureKind ?? 'product',
+    }) as Parameters<typeof classifyVerificationFailure>[0][number];
+
+  it('classifies as product when one required check really failed', () => {
+    // Exactly the shipped shape: unit killed at its budget, integration a real
+    // non-zero exit. The old rule answered `infrastructure` and no fixer ran.
+    expect(
+      classifyVerificationFailure([
+        result('install', { status: 'passed', failureKind: 'none', kind: 'setup' }),
+        result('unit', { failureKind: 'infrastructure' }),
+        result('integration', { failureKind: 'product' }),
+      ]),
+    ).toBe('product');
+  });
+
+  it('stays infrastructure when nothing observed a product failure', () => {
+    expect(
+      classifyVerificationFailure([
+        result('install', { status: 'passed', failureKind: 'none', kind: 'setup' }),
+        result('unit', { failureKind: 'infrastructure' }),
+      ]),
+    ).toBe('infrastructure');
+  });
+
+  it('keeps a failed install infrastructure whatever the later checks say', () => {
+    expect(
+      classifyVerificationFailure([
+        result('install', { failureKind: 'infrastructure', kind: 'setup' }),
+        result('unit', { failureKind: 'product' }),
+      ]),
+    ).toBe('infrastructure');
+  });
+
+  it('cancellation still wins over everything', () => {
+    expect(
+      classifyVerificationFailure([
+        result('unit', { failureKind: 'product' }),
+        result('e2e', { failureKind: 'cancelled' }),
+      ]),
+    ).toBe('cancelled');
+  });
+});
+
+describe('an infrastructure retry re-runs only what is not proven', () => {
+  it('reuses a passed check on the same tree and re-runs the rest', async () => {
+    const first = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: {},
+      steps: [
+        { name: 'lint', command: OK },
+        { name: 'unit', command: FAIL },
+      ],
+      cycle: 0,
+    });
+    expect(first.passed).toBe(false);
+
+    const second = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: {},
+      steps: [
+        { name: 'lint', command: OK },
+        { name: 'unit', command: OK },
+      ],
+      cycle: 1,
+      reusePassed: first.results,
+    });
+
+    const lint = second.results.find((step) => step.name === 'lint');
+    expect(lint?.status).toBe('passed');
+    expect(lint?.output).toContain('reused');
+    expect(lint?.durationMs).toBe(0);
+    // The step that was not proven really ran again.
+    expect(second.results.find((step) => step.name === 'unit')?.output).toContain(
+      'verification-ran',
+    );
+    expect(second.passed).toBe(true);
+  });
+
+  it('never reuses setup: filesystem residue is not install evidence', async () => {
+    const first = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install: OK },
+      steps: [{ name: 'unit', command: FAIL }],
+      cycle: 0,
+    });
+    const second = await engine.run({
+      jobId: JOB_ID,
+      cwd: home,
+      commands: { install: OK },
+      steps: [{ name: 'unit', command: OK }],
+      cycle: 1,
+      reusePassed: first.results,
+    });
+    const install = second.results.find((step) => step.name === 'install');
+    expect(install?.output).not.toContain('reused');
+    expect(install?.output).toContain('verification-ran');
+  });
+});
+
+describe('the step timeout is configuration, not a constant', () => {
+  it('kills a check at the configured budget and calls it infrastructure', async () => {
+    const slowHome = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-verify-slow-'));
+    const config = loadConfig({
+      home: slowHome,
+      pipeline: { ...loadConfig({ home: slowHome }).pipeline, verificationStepTimeoutMs: 1_000 },
+    });
+    const slowDb = openDb(config);
+    slowDb.exec(`
+      INSERT INTO projects (id,name,root_path,default_branch,created_at,updated_at)
+        VALUES ('prj_s','s','${slowHome.replace(/\\/g, '/')}','main','now','now');
+      INSERT INTO jobs (id,project_id,request,goal,stage,status,created_at,updated_at)
+        VALUES ('job_slow','prj_s','r','g','verifying','running','now','now');
+    `);
+    const slowEngine = new VerificationEngine(slowDb, config.artifactsDir, undefined, config);
+    const report = await slowEngine.run({
+      jobId: 'job_slow',
+      cwd: slowHome,
+      commands: {},
+      steps: [{ name: 'unit', command: 'node -e "setTimeout(()=>{}, 30000)"' }],
+      cycle: 0,
+    });
+    expect(report.passed).toBe(false);
+    expect(report.failureKind).toBe('infrastructure');
+    expect(report.results[0]?.output).toContain('timed out after 1000ms');
+    slowDb.close();
+    fs.rmSync(slowHome, { recursive: true, force: true });
+  }, 20_000);
 });

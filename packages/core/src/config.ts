@@ -94,6 +94,10 @@ export interface JarvisConfig {
      */
     providerAttempts: number;
     verificationInfraRetries: number;
+    /** Per-check wall clock budget. A check killed at this bound is infrastructure. */
+    verificationStepTimeoutMs: number;
+    /** Dependency installs get their own, larger budget. */
+    verificationInstallTimeoutMs: number;
     codeReviewBlockingSeverities: string[];
     visualBlockingSeverities: string[];
     /** Retention for raw history rows, in days. 0 = keep forever. */
@@ -232,6 +236,19 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
       // value would only walk back to a provider that already failed this action.
       providerAttempts: Math.min(2, Math.max(1, envInt('JARVIS_PROVIDER_ATTEMPTS', 2))),
       verificationInfraRetries: Math.max(0, envInt('JARVIS_VERIFICATION_INFRA_RETRIES', 2)),
+      // A machine that runs the suite slowly is not a defect in the candidate.
+      // The old 15-minute constant was not reachable from anywhere, so a suite
+      // that needed 16 was killed, classified as infrastructure, and re-run
+      // whole -- three times, fixing nothing. A project step may still set its
+      // own `timeoutMs`; this is the floor everything else lands on.
+      verificationStepTimeoutMs: Math.max(
+        60_000,
+        envInt('JARVIS_VERIFICATION_STEP_TIMEOUT_MS', 30 * 60_000),
+      ),
+      verificationInstallTimeoutMs: Math.max(
+        60_000,
+        envInt('JARVIS_VERIFICATION_INSTALL_TIMEOUT_MS', 20 * 60_000),
+      ),
       // The single source of truth for "does this finding stop the pipeline".
       // Medium blocks: a real medium finding is a defect, and letting it reach
       // Visual QA is how reviewers learn to under-classify in order to approve.

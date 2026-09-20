@@ -7,6 +7,7 @@ import type { EventBus } from '../events/bus.js';
 import type { ProjectCommands, VerificationStep } from '../projects/service.js';
 import { redactSecrets } from '../memory/secrets.js';
 import { killTree, spawnContained, untrustedProcessEnv } from '../agents/spawn.js';
+import { getConfig, type JarvisConfig } from '../config.js';
 
 export interface VerificationResult {
   id: string;
@@ -38,9 +39,37 @@ export interface VerificationReport {
 const STEP_ORDER: (keyof ProjectCommands)[] = ['format', 'lint', 'typecheck', 'test', 'build'];
 
 const MAX_STORED_OUTPUT = 8000;
-const STEP_TIMEOUT_MS = 15 * 60_000;
-/** Dependency installs are slower than any single check and worth their own budget. */
-const INSTALL_TIMEOUT_MS = 20 * 60_000;
+
+/**
+ * WHAT KIND OF FAILURE THIS WAS, from every result together.
+ *
+ * The old rule was "any infrastructure result anywhere makes the whole report
+ * infrastructure". One check killed at its time budget therefore erased a real
+ * `pnpm test` failure standing right next to it: infrastructure never reaches a
+ * fixer, so the Job re-ran the entire suite instead -- to its budget, on the
+ * same tree, fixing nothing. A product failure is evidence about the candidate
+ * and cannot be un-observed by an unrelated step timing out, so it wins.
+ *
+ * Install is the exception that stays: if dependencies never landed, every
+ * later check failed for that reason and none of them is evidence.
+ */
+export function classifyVerificationFailure(
+  results: VerificationResult[],
+): VerificationFailureKind {
+  const checks = results.filter((result) => result.kind !== 'setup');
+  if (results.some((result) => result.failureKind === 'cancelled')) return 'cancelled';
+  if (results.some((result) => result.kind === 'setup' && result.status !== 'passed')) {
+    return 'infrastructure';
+  }
+  if (checks.length === 0) return 'infrastructure';
+  if (checks.some((result) => result.required && result.failureKind === 'product'))
+    return 'product';
+  if (results.some((result) => result.failureKind === 'infrastructure')) return 'infrastructure';
+  return 'product';
+}
+
+/** Marker `runCommand` appends when it killed a step at its budget. */
+const TIMED_OUT_MARKER = '[timed out after ';
 
 /**
  * Deterministic verification.
@@ -54,6 +83,7 @@ export class VerificationEngine {
     private readonly db: Db,
     private readonly artifactsDir: string,
     private readonly bus?: EventBus,
+    private readonly config: JarvisConfig = getConfig(),
   ) {}
 
   async run(opts: {
@@ -69,6 +99,14 @@ export class VerificationEngine {
      * `'final'` alone, on the HEAD that is about to be approved.
      */
     phase?: 'repairable' | 'final';
+    /**
+     * Results from an earlier cycle on THIS EXACT tree, after an infrastructure
+     * retry. A check that already passed on this commit is not re-derived: the
+     * retry exists to get past a flaky or timed-out step, not to spend another
+     * forty minutes proving `lint` again. Setup always re-runs, and the caller
+     * is responsible for only passing results bound to the current HEAD.
+     */
+    reusePassed?: VerificationResult[];
   }): Promise<VerificationReport> {
     const cycle = opts.cycle ?? 0;
     const results: VerificationResult[] = [];
@@ -91,7 +129,7 @@ export class VerificationEngine {
       steps.push({
         name: 'install',
         command: opts.commands.install,
-        timeoutMs: INSTALL_TIMEOUT_MS,
+        timeoutMs: this.config.pipeline.verificationInstallTimeoutMs,
         kind: 'setup',
         required: true,
       });
@@ -104,7 +142,7 @@ export class VerificationEngine {
         configured.push({
           name: step.name,
           command: step.command,
-          timeoutMs: step.timeoutMs ?? STEP_TIMEOUT_MS,
+          timeoutMs: step.timeoutMs ?? this.config.pipeline.verificationStepTimeoutMs,
           kind: step.kind ?? 'check',
           required: step.required ?? true,
         });
@@ -117,16 +155,40 @@ export class VerificationEngine {
       for (const name of STEP_ORDER) {
         const command = opts.commands[name];
         if (command)
-          steps.push({ name, command, timeoutMs: STEP_TIMEOUT_MS, kind: 'check', required: true });
+          steps.push({
+            name,
+            command,
+            timeoutMs: this.config.pipeline.verificationStepTimeoutMs,
+            kind: 'check',
+            required: true,
+          });
       }
     }
+
+    // Checks proven on this same tree by an earlier cycle of this job. Setup is
+    // never reused: filesystem residue is not setup evidence.
+    const reusable = new Map(
+      (opts.reusePassed ?? [])
+        .filter((result) => result.kind !== 'setup' && result.status === 'passed')
+        .map((result) => [result.name, result]),
+    );
 
     for (const { name, command, timeoutMs, kind, required } of steps) {
       if (opts.signal?.aborted) break;
 
+      const reused = kind === 'setup' ? undefined : reusable.get(name);
       const started = Date.now();
-      const outcome = await runCommand(command, opts.cwd, timeoutMs, kind, opts.signal);
-      const durationMs = Date.now() - started;
+      const outcome = reused
+        ? {
+            exitCode: 0,
+            output:
+              `[reused: this check passed on the same commit in cycle ${reused.cycle}; ` +
+              `an infrastructure retry does not re-derive it]\n${reused.output}`,
+            startFailed: false,
+            failureKind: 'none' as const,
+          }
+        : await runCommand(command, opts.cwd, timeoutMs, kind, opts.signal);
+      const durationMs = reused ? 0 : Date.now() - started;
 
       const outputPath = path.join(logDir, `${name}.log`);
       const fullOutput = redactSecrets(outcome.output);
@@ -179,7 +241,17 @@ export class VerificationEngine {
       this.bus?.emit({
         type: 'verification.step',
         jobId: opts.jobId,
-        payload: { name, status: result.status, exitCode: result.exitCode, durationMs },
+        payload: {
+          name,
+          status: result.status,
+          exitCode: result.exitCode,
+          durationMs,
+          // A step killed at its budget reads as "failed" everywhere unless the
+          // event says otherwise -- and it is the one failure a fixer must not
+          // be sent at.
+          ...(result.output.includes(TIMED_OUT_MARKER) ? { timedOut: true, timeoutMs } : {}),
+          ...(reused ? { reused: true, reusedFromCycle: reused.cycle } : {}),
+        },
       });
 
       // If dependencies could not be installed, every later check would fail for
@@ -198,11 +270,7 @@ export class VerificationEngine {
       required.every((r) => r.status === 'passed');
     const failureKind: VerificationFailureKind = passed
       ? 'none'
-      : results.some((result) => result.failureKind === 'cancelled')
-        ? 'cancelled'
-        : results.some((result) => result.failureKind === 'infrastructure') || checks.length === 0
-          ? 'infrastructure'
-          : 'product';
+      : classifyVerificationFailure(results);
     const report: VerificationReport = {
       results,
       passed,
@@ -292,11 +360,7 @@ function reportFromResults(
     results.filter((result) => result.required).every((result) => result.status === 'passed');
   const failureKind: VerificationFailureKind = passed
     ? 'none'
-    : results.some((result) => result.failureKind === 'cancelled')
-      ? 'cancelled'
-      : results.some((result) => result.failureKind === 'infrastructure') || checks.length === 0
-        ? 'infrastructure'
-        : 'product';
+    : classifyVerificationFailure(results);
   return {
     results,
     passed,

@@ -770,7 +770,7 @@ export class JobPipeline {
 
         // Persist what was actually looked at, so approval and the Job view read
         // a real evidence contract rather than a predeclared screenshot list.
-        jobs.patch(jobId, { visualQaPlan: evidencePlan(visual, hints) });
+        jobs.patch(jobId, { visualQaPlan: evidencePlan(visual, hints, changes.head) });
         if (visual.verdict === 'product_defect') {
           const maxVisualCycles = Math.min(
             this.config.pipeline.maxVisualFixCycles,
@@ -797,11 +797,15 @@ export class JobPipeline {
             return;
           }
           const cycle = job.visualFixCycles + 1;
-          // The targeted recheck verifies the failed checks only, never the
-          // whole exploration again.
-          recheckGoals = visual.checks
-            .filter((check) => check.status !== 'passed')
-            .map((check) => check.goal)
+          // The targeted recheck verifies what is still owed, never the whole
+          // exploration again -- including a requirement this attempt never
+          // met, such as a viewport that was never photographed.
+          const reportedGoal = new Map(visual.checks.map((check) => [check.id, check.goal]));
+          recheckGoals = visual.coverage
+            .filter((entry) => entry.status !== 'passed' && entry.status !== 'not_applicable')
+            // The agent's own wording when it reported the id, the requirement
+            // label when it never did.
+            .map((entry) => reportedGoal.get(entry.id) ?? entry.label)
             .slice(0, 8);
           jobs.transition(jobId, 'fixing', {
             visualQaStatus: 'product_defect',
@@ -1231,7 +1235,8 @@ export class JobPipeline {
             prompt = buildVisualFixerPrompt({
               job,
               findings: checkpoint.visual.findings,
-              checks: (checkpoint.visual.recheckGoals ?? []).map((goal) => ({
+              checks: (checkpoint.visual.recheckGoals ?? []).map((goal, index) => ({
+                id: `recheck-${index + 1}`,
                 goal,
                 status: 'failed' as const,
                 evidenceIds: [],
@@ -1462,6 +1467,10 @@ export class JobPipeline {
       summary: 'interactive visual QA did not run',
       checks: [],
       findings: [],
+      blocking: [],
+      advisories: [],
+      coverage: [],
+      allRequirementsVerified: false,
       evidence: [],
       provider: null,
       model: null,
@@ -1487,6 +1496,8 @@ export class JobPipeline {
         brief: { ...opts.brief, baseUrl: server.baseUrl },
         controlCredential: server.controlCredential(),
         expectedDevServerNoise: true,
+        // The one source of truth for what blocks. The gate never hardcodes it.
+        blockingSeverities: this.config.pipeline.visualBlockingSeverities,
         selfDevelopment: opts.project.isSelf,
         ...(opts.escalateModel ? { escalateModel: true } : {}),
         signal: opts.signal,
@@ -2660,7 +2671,11 @@ function routeHints(project: Project, hints: VisualQaPlan | null): string[] {
  * predeclared screenshot list, so a missing scenario nobody needed can no
  * longer look like missing evidence. Hint provenance is preserved.
  */
-function evidencePlan(visual: InteractiveVisualQaResult, hints: VisualQaPlan | null): VisualQaPlan {
+function evidencePlan(
+  visual: InteractiveVisualQaResult,
+  hints: VisualQaPlan | null,
+  head: string,
+): VisualQaPlan {
   const scenarios = [
     ...new Map(
       visual.evidence.map((shot) => [
@@ -2679,6 +2694,11 @@ function evidencePlan(visual: InteractiveVisualQaResult, hints: VisualQaPlan | n
     ...(hints?.catalogDigest ? { catalogDigest: hints.catalogDigest } : {}),
     required: visual.verdict === 'pass',
     scenarios,
+    // Persisted with the evidence and bound to the same HEAD: what was owed,
+    // what was reached, and what nobody ever looked at.
+    coverage: visual.coverage,
+    coverageHead: head,
+    advisories: visual.advisories.map(({ evidenceIds: _ids, ...advisory }) => advisory),
     reasons: [
       `interactive visual QA: ${visual.verdict}`,
       ...visual.checks.map((check) => `${check.status}: ${check.goal}`),
@@ -2689,20 +2709,20 @@ function evidencePlan(visual: InteractiveVisualQaResult, hints: VisualQaPlan | n
 
 /** The blocking findings a visual repair is allowed to act on. */
 function visualFixerFindings(visual: InteractiveVisualQaResult): VisualReviewFinding[] {
-  return visual.findings
-    .filter((finding) => finding.severity === 'critical' || finding.severity === 'high')
-    .map((finding) => {
-      const shot = visual.evidence.find((entry) => finding.evidenceIds.includes(entry.id));
-      return {
-        severity: 'high' as const,
-        scenarioName: shot?.scenarioName ?? 'interactive',
-        route: shot?.route ?? '/',
-        viewport: shot?.viewport ?? ('desktop' as const),
-        category: finding.category,
-        description: finding.description,
-        recommendation: finding.recommendation,
-      };
-    });
+  return visual.blocking.map((finding) => {
+    const shot = visual.evidence.find((entry) => finding.evidenceIds.includes(entry.id));
+    return {
+      // `critical` has no durable equivalent; every other severity is kept as
+      // reported, so a blocking medium no longer prints as high.
+      severity: finding.severity === 'critical' ? ('high' as const) : finding.severity,
+      scenarioName: shot?.scenarioName ?? 'interactive',
+      route: shot?.route ?? '/',
+      viewport: shot?.viewport ?? ('desktop' as const),
+      category: finding.category,
+      description: finding.description,
+      recommendation: finding.recommendation,
+    };
+  });
 }
 
 function renderCodeBlockers(findings: ReviewFinding[]): string {
@@ -2716,6 +2736,12 @@ function renderVisualBlockers(visual: InteractiveVisualQaResult): string {
   return `Interactive Visual QA found a product defect and the single repair cycle is spent.
 
 ${visual.summary}
+
+Required check coverage:
+${
+  visual.coverage.map((entry) => `- ${entry.id} ${entry.status}: ${entry.label}`).join('\n') ||
+  '- none required'
+}
 
 Checks:
 ${checks || '- none recorded'}

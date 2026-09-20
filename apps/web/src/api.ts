@@ -146,6 +146,18 @@ export interface Job {
     mode?: 'interactive';
     scenarios: Array<{ name: string; viewports?: Array<'desktop' | 'mobile'> }>;
     reasons: string[];
+    coverage?: Array<{
+      id: string;
+      label: string;
+      status: 'passed' | 'failed' | 'not_reached' | 'not_applicable' | 'missing';
+      note: string;
+    }>;
+    advisories?: Array<{
+      severity: 'critical' | 'high' | 'medium' | 'low';
+      category: string;
+      description: string;
+      recommendation: string;
+    }>;
   } | null;
   visualQaStatus:
     'skipped' | 'passed' | 'product_defect' | 'inconclusive' | 'infrastructure_error' | null;

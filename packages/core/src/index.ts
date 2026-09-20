@@ -250,10 +250,13 @@ export {
 } from './visualqa/candidate-plan.js';
 export {
   InteractiveVisualQaAgent,
+  requiredVisualChecks,
   type InteractiveVisualQaResult,
   type VisualQaBrief,
   type VisualQaCheck,
+  type VisualQaCoverageEntry,
   type VisualQaFinding,
+  type VisualQaRequirement,
   type VisualQaVerdict,
 } from './visualqa/agent.js';
 export {

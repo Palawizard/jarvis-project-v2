@@ -61,6 +61,12 @@ export class CandidateApplicationService {
     private readonly review: ReviewEngine,
     worktreesDir: string,
     private readonly artifactsDir: string,
+    /**
+     * `config.pipeline.visualBlockingSeverities`. The same list the Visual QA
+     * gate used, so approval cannot re-derive a different verdict from the same
+     * persisted findings.
+     */
+    private readonly visualBlockingSeverities: readonly string[] = ['high', 'medium'],
   ) {
     this.git = new GitWorkspace(worktreesDir);
   }
@@ -490,6 +496,7 @@ export class CandidateApplicationService {
               status: 'captured' as const,
               screenshotPath: row.screenshot_path,
             })),
+            this.visualBlockingSeverities,
           );
           passed = parsed.verdict === 'pass';
         } catch {

@@ -140,11 +140,42 @@ Per-turn observation images are transient and deleted. A blocking finding must c
 the controller actually captured; a `product_defect` with no such citation and no failed check is
 recorded as `qa_inconclusive` instead, and a `pass` with no evidence at all is too.
 
+**Mandatory checks are deterministic, and the gate is fail-closed.** Before the browser opens,
+trusted code derives the list of requirements this attempt owes from the request itself: one
+`viewport-*` id per declared viewport (mobile included whenever the diff is responsive-relevant)
+and one `acceptance-*` id per acceptance criterion of the compiled brief. The list is handed to the
+model in the prompt and every id must come back with a real status; extra checks the agent derived
+for itself are welcome alongside it. `finalize` then decides the verdict from what is actually
+there, never from the model's own word:
+
+- a required id that is absent, `not_reached`, or (for a viewport) never photographed is
+  `qa_inconclusive` — a `viewport-mobile` requirement is settled by the images that exist, so
+  claiming mobile without a mobile capture cannot pass;
+- `not_applicable` is allowed only with a stated reason, and is recorded as such; without one it
+  counts as missing;
+- any failed check or finding at a configured blocking severity is a `product_defect` when it cites
+  real evidence, and `qa_inconclusive` when it does not;
+- what blocks is `pipeline.visualBlockingSeverities` (`JARVIS_VISUAL_REVIEW_BLOCKING_SEVERITIES`,
+  default high and medium), not a list hardcoded in the gate.
+
+The defect on which this was built: an attempt returned `pass` while the mobile viewport and one
+acceptance criterion were never exercised at all, and the UI showed "passed". A pass now means
+every requirement of the request was verified, which is the claim the old gate could not make.
+This costs no extra budget — it changes what the same turns have to come back with.
+
+**Coverage is persisted, advisories are surfaced.** The per-id outcome (required / reached /
+missing) is written with the evidence into `visualQaPlan.coverage`, bound to the same HEAD by
+`coverageHead`, along with the non-blocking `advisories`. A repair's targeted recheck carries the
+unmet ids forward as its recheck goals, so a defect found before coverage was complete does not
+silently drop what nobody looked at. Job Detail renders both — the unmet requirements and the
+advisory findings — next to the approve button, because approval is the last point where a human
+can act on a real defect that merely sits below the blocking severities.
+
 **Verdicts** are a first-class pipeline distinction:
 
 | Verdict | Meaning | Source fixer? |
 | --- | --- | --- |
-| `pass` | The agent reached the changed state and it looks and behaves correctly. | n/a |
+| `pass` | Every mandatory requirement was verified and the changed state looks and behaves correctly. Non-blocking advisories may ride along, and are shown before approval. | n/a |
 | `product_defect` | The agent reached the state and observed a real visible problem. | Yes, once |
 | `qa_inconclusive` | The agent could not establish the state it needed. | Never |
 | `infrastructure_error` | Browser, candidate runtime or provider failed. | Never |
@@ -166,7 +197,8 @@ out-of-band activation token. No external coding agent is needed to escape the Q
 
 **Job UI and events.** `visual_qa.skipped`, `visual_qa.started`, `visual_qa.activity` (one per
 model turn, with a short label such as "opening Chat" or "checking Edit state"), `visual_qa.retried`
-and `visual_qa.completed` (with the verdict, check counts, turns and actions). Job Detail shows the
+and `visual_qa.completed` (with the verdict, check counts, `allRequirementsVerified`, the ids of
+any unmet requirements, advisory count, turns and actions). Job Detail shows the
 outcome separately from the pipeline step, so "screenshots captured" can no longer read as "the UI
 is fine", and a paused stage no longer renders a completed checkmark.
 
@@ -203,6 +235,6 @@ The threat model this boundary is declared against is explicit. Untrusted: candi
 
 The limit is worth stating plainly: the parent verifies that the mapping is *complete* and that its provenance is bound to the validated commit, not that it is *honest*. A candidate that changes a security-relevant view and points that view's matcher at a scenario rendering something trivial satisfies every check above. Proving honesty would mean independently attributing rendered pixels back to source modules -- runtime coverage plus sourcemaps -- which relocates the same trust into a larger, less auditable candidate-produced artifact and so buys nothing. Placement and naming are a second lever on the same limit: the test-only exemption is parent-side pattern matching, so a real component parked at `apps/web/src/__tests__/Panel.tsx` or renamed `Panel.stories.tsx` sheds its evidence duty without any catalog entry at all. Semantic independence is therefore out of reach for Visual QA alone, and Visual QA is not asked to carry it: the committed catalog diff is read by the independent code reviewer, and no candidate reaches `main` without deterministic verification, that review, and a human approving a supervised activation bound to its exact SHA.
 
-Visual QA judges what the agent could reach and see; it cannot claim hidden code correctness. Critical/high findings block by default; medium/low stay advisory. A blocking product finding enters the single bounded visual fixer cycle. Any source change invalidates both the prior code-review HEAD and the evidence, so Jarvis reruns deterministic verification, a fresh code review, the candidate runtime and a targeted visual recheck. Browser/runtime/provider failures are infrastructure failures: they never trigger CSS/source edits. Configure limits with `JARVIS_MAX_VISUAL_FIX_CYCLES` (clamped by `VISUAL_QA_BUDGET.visualFixCycles`) and `JARVIS_VISUAL_REVIEW_BLOCKING_SEVERITIES`.
+Visual QA judges what the agent could reach and see; it cannot claim hidden code correctness. Findings block at the configured severities (`JARVIS_VISUAL_REVIEW_BLOCKING_SEVERITIES`, default high and medium); anything below is recorded as an advisory, persisted with the evidence and shown before approval rather than dropped. A blocking product finding enters the single bounded visual fixer cycle. Any source change invalidates both the prior code-review HEAD and the evidence, so Jarvis reruns deterministic verification, a fresh code review, the candidate runtime and a targeted visual recheck. Browser/runtime/provider failures are infrastructure failures: they never trigger CSS/source edits. Configure limits with `JARVIS_MAX_VISUAL_FIX_CYCLES` (clamped by `VISUAL_QA_BUDGET.visualFixCycles`) and `JARVIS_VISUAL_REVIEW_BLOCKING_SEVERITIES`.
 
-Implemented and exercised deterministically: port/state isolation, the action schema and its refusals, real-Chromium origin/popup/download confinement, batch early stop, every budget, exact-HEAD sealed evidence, the four verdicts, the single retry, the single repair cycle, the targeted recheck, backend-only skip, legacy config compatibility, FF activation, health failure, and rollback in temporary repositories/processes. Live model-driven browsing remains separately reported by dogfood evidence because it consumes subscription quota.
+Implemented and exercised deterministically: deterministic mandatory checks and the fail-closed coverage gate, port/state isolation, the action schema and its refusals, real-Chromium origin/popup/download confinement, batch early stop, every budget, exact-HEAD sealed evidence, the four verdicts, the single retry, the single repair cycle, the targeted recheck, backend-only skip, legacy config compatibility, FF activation, health failure, and rollback in temporary repositories/processes. Live model-driven browsing remains separately reported by dogfood evidence because it consumes subscription quota.

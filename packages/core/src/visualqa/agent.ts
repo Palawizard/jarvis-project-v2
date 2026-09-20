@@ -37,11 +37,67 @@ const log = createLogger('visual-qa-agent');
 export type VisualQaVerdict =
   'pass' | 'product_defect' | 'qa_inconclusive' | 'infrastructure_error';
 
+export type VisualQaCheckStatus = 'passed' | 'failed' | 'not_reached' | 'not_applicable';
+
 export interface VisualQaCheck {
+  /** A required requirement id, or one the agent invented for an extra check. */
+  id: string;
   goal: string;
-  status: 'passed' | 'failed' | 'not_reached';
+  status: VisualQaCheckStatus;
   evidenceIds: string[];
   note: string;
+}
+
+/**
+ * One thing this run MUST report on, derived deterministically from the request
+ * before the agent starts. The model does not get to choose the list.
+ */
+export interface VisualQaRequirement {
+  id: string;
+  kind: 'viewport' | 'acceptance' | 'recheck';
+  label: string;
+  viewport?: Viewport;
+}
+
+/** What actually happened to a required id. `missing` means never reported. */
+export interface VisualQaCoverageEntry extends VisualQaRequirement {
+  status: VisualQaCheckStatus | 'missing';
+  evidenceIds: string[];
+  note: string;
+}
+
+/** The default when no caller supplies `config.pipeline.visualBlockingSeverities`. */
+const DEFAULT_BLOCKING_SEVERITIES = ['high', 'medium'] as const;
+
+/**
+ * The mandatory checks for one attempt.
+ *
+ * Deterministic and model-free: each declared viewport must be proven by real
+ * evidence, and each acceptance criterion must be reported on. A targeted
+ * recheck replaces the list with exactly the goals the repair had to fix.
+ */
+export function requiredVisualChecks(brief: VisualQaBrief): VisualQaRequirement[] {
+  if (brief.recheckGoals?.length) {
+    return brief.recheckGoals.slice(0, 8).map((goal, index) => ({
+      id: `recheck-${index + 1}`,
+      kind: 'recheck',
+      label: goal,
+    }));
+  }
+  const viewports: Viewport[] = brief.mobileRelevant ? ['desktop', 'mobile'] : ['desktop'];
+  return [
+    ...viewports.map((viewport) => ({
+      id: `viewport-${viewport}`,
+      kind: 'viewport' as const,
+      label: `judge the changed surface at the ${viewport} viewport`,
+      viewport,
+    })),
+    ...brief.acceptance.slice(0, 8).map((criterion, index) => ({
+      id: `acceptance-${index + 1}`,
+      kind: 'acceptance' as const,
+      label: criterion,
+    })),
+  ];
 }
 
 export interface VisualQaFinding {
@@ -57,6 +113,13 @@ export interface InteractiveVisualQaResult {
   summary: string;
   checks: VisualQaCheck[];
   findings: VisualQaFinding[];
+  /** Findings at a configured blocking severity. Only these reach a fixer. */
+  blocking: VisualQaFinding[];
+  /** Real findings that do not block. A pass carrying these is not a clean pass. */
+  advisories: VisualQaFinding[];
+  /** Deterministic per-requirement outcome, including what was never reported. */
+  coverage: VisualQaCoverageEntry[];
+  allRequirementsVerified: boolean;
   evidence: VisualQaShot[];
   provider: ProviderId | null;
   model: string | null;
@@ -98,8 +161,9 @@ const VERDICT = z
       .array(
         z
           .object({
+            id: z.string().trim().min(1).max(64),
             goal: z.string().trim().min(1).max(300),
-            status: z.enum(['passed', 'failed', 'not_reached']),
+            status: z.enum(['passed', 'failed', 'not_reached', 'not_applicable']),
             evidenceIds: z
               .array(z.string().min(1).max(64))
               .max(VISUAL_QA_BUDGET.evidence)
@@ -108,7 +172,7 @@ const VERDICT = z
           })
           .strict(),
       )
-      .max(12),
+      .max(16),
     findings: z
       .array(
         z
@@ -253,10 +317,17 @@ const VERDICT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['goal', 'status', 'evidenceIds', 'note'],
+        required: ['id', 'goal', 'status', 'evidenceIds', 'note'],
         properties: {
+          id: {
+            type: 'string',
+            description: 'A required check id, or your own id for an extra check.',
+          },
           goal: { type: 'string' },
-          status: { type: 'string', enum: ['passed', 'failed', 'not_reached'] },
+          status: {
+            type: 'string',
+            enum: ['passed', 'failed', 'not_reached', 'not_applicable'],
+          },
           evidenceIds: { type: 'array', items: { type: 'string' } },
           note: { type: ['string', 'null'] },
         },
@@ -308,6 +379,8 @@ export interface InteractiveVisualQaOptions {
   selfDevelopment?: boolean;
   /** Attempt 2 escalates the model profile exactly once. */
   escalateModel?: boolean;
+  /** `config.pipeline.visualBlockingSeverities`. Never a hardcoded list here. */
+  blockingSeverities?: readonly string[];
   signal?: AbortSignal;
   /** Test seam: the controller is a browser, so tests supply their own. */
   openController?: typeof InteractiveVisualQaController.open;
@@ -334,6 +407,11 @@ export class InteractiveVisualQaAgent {
     const empty = {
       checks: [] as VisualQaCheck[],
       findings: [] as VisualQaFinding[],
+      blocking: [] as VisualQaFinding[],
+      advisories: [] as VisualQaFinding[],
+      // Nothing was verified: every outcome built from `empty` is a non-pass.
+      coverage: [] as VisualQaCoverageEntry[],
+      allRequirementsVerified: false,
       evidence: [] as VisualQaShot[],
       turns: 0,
       actions: 0,
@@ -514,7 +592,15 @@ export class InteractiveVisualQaAgent {
           evidence: controller.evidence,
         };
       } else if (verdict) {
-        result = this.finalize(verdict, controller, provider.id, model, turns);
+        result = this.finalize(
+          verdict,
+          controller,
+          provider.id,
+          model,
+          turns,
+          opts.brief,
+          opts.blockingSeverities ?? DEFAULT_BLOCKING_SEVERITIES,
+        );
       } else if (result.verdict === 'infrastructure_error' && result.error) {
         result = { ...result, evidence: controller.evidence, actions: controller.actionsUsed };
       } else {
@@ -530,6 +616,9 @@ export class InteractiveVisualQaAgent {
           turns,
           actions: controller.actionsUsed,
           evidence: controller.evidence,
+          // Recorded even without a verdict: what was owed and never reported
+          // is the useful part of an exhausted run.
+          coverage: computeCoverage(opts.brief, [], controller.evidence),
           ...(protocolFailure ? { error: protocolFailure } : {}),
         };
       }
@@ -566,7 +655,14 @@ export class InteractiveVisualQaAgent {
         captured: result.evidence.length,
         checks: result.checks.length,
         passedChecks: result.checks.filter((check) => check.status === 'passed').length,
+        // "passed" alone was the misleading part of the old event: it said
+        // nothing about requirements nobody reached or findings nobody fixed.
+        allRequirementsVerified: result.allRequirementsVerified,
+        unmetRequirements: result.coverage
+          .filter((entry) => entry.status !== 'passed' && entry.status !== 'not_applicable')
+          .map((entry) => entry.id),
         findings: result.findings.length,
+        advisories: result.advisories.length,
         turns: result.turns,
         actions: result.actions,
         ...(result.error ? { error: result.error } : {}),
@@ -668,9 +764,12 @@ export class InteractiveVisualQaAgent {
   /**
    * Turn the model's verdict into the recorded outcome.
    *
-   * Evidence ids are re-bound to checkpoints this controller actually captured,
-   * so a model cannot cite an image that does not exist, and a blocking finding
-   * with no real evidence and no failed check cannot block.
+   * Fail-closed and deterministic. Evidence ids are re-bound to checkpoints this
+   * controller actually captured, so a model cannot cite an image that does not
+   * exist; every mandatory requirement must be reported on and — for a viewport
+   * — actually photographed; and what blocks is the configured severity list,
+   * never a list hardcoded here. `pass` therefore means "every requirement of
+   * the request was verified", which is the claim the old gate could not make.
    */
   private finalize(
     verdict: z.infer<typeof VERDICT>,
@@ -678,6 +777,8 @@ export class InteractiveVisualQaAgent {
     provider: ProviderId,
     model: string | null,
     turns: number,
+    brief: VisualQaBrief,
+    blockingSeverities: readonly string[],
   ): InteractiveVisualQaResult {
     const known = new Set(controller.checkpoints.map((checkpoint) => checkpoint.id));
     const bind = (ids: string[]) => [...new Set(ids.filter((id) => known.has(id)))];
@@ -689,39 +790,71 @@ export class InteractiveVisualQaAgent {
       ...finding,
       evidenceIds: bind(finding.evidenceIds),
     }));
-    let final: VisualQaVerdict =
-      verdict.verdict === 'product_defect'
-        ? 'product_defect'
-        : verdict.verdict === 'qa_inconclusive'
-          ? 'qa_inconclusive'
-          : 'pass';
-    let summary = verdict.summary;
-    const blocking = findings.filter(
-      (finding) => finding.severity === 'critical' || finding.severity === 'high',
+    const coverage = computeCoverage(brief, checks, controller.evidence);
+    const unmet = coverage.filter(
+      (entry) => entry.status === 'missing' || entry.status === 'not_reached',
     );
-    if (final === 'product_defect') {
-      // A defect claim must cite a real evidence checkpoint or a check the agent
-      // recorded as failed. Otherwise it is not evidence, and no source fixer
-      // may be sent at the product on the strength of it.
-      const cited = blocking.some((finding) => finding.evidenceIds.length > 0);
-      const failedCheck = checks.some((check) => check.status === 'failed');
-      if (blocking.length === 0 || (!cited && !failedCheck)) {
-        final = 'qa_inconclusive';
-        summary =
-          'The agent reported a product defect without a blocking finding bound to real ' +
-          `evidence, so it is recorded as inconclusive. Original summary: ${verdict.summary}`;
+    const failed = coverage.filter((entry) => entry.status === 'failed');
+    // Any failed check, not only a required one: an extra goal the agent
+    // derived for itself and watched fail is still a failure it observed.
+    const failedChecks = checks.filter((check) => check.status === 'failed');
+    const blocking = findings.filter((finding) => blockingSeverities.includes(finding.severity));
+    const advisories = findings.filter((finding) => !blockingSeverities.includes(finding.severity));
+    let final: VisualQaVerdict = 'pass';
+    let summary = verdict.summary;
+    const demote = (why: string) => {
+      summary = `${why} Original summary: ${verdict.summary}`;
+    };
+    if (verdict.verdict === 'qa_inconclusive') {
+      final = 'qa_inconclusive';
+    } else if (blocking.length > 0 || failedChecks.length > 0) {
+      // A defect claim must cite a real evidence checkpoint. Otherwise it is not
+      // evidence, and no source fixer may be sent at the product on its
+      // strength. An unmet requirement does not suppress a real, evidenced
+      // defect: the repair's targeted recheck carries the unmet ids forward.
+      const cited =
+        blocking.some((finding) => finding.evidenceIds.length > 0) ||
+        failedChecks.some((check) => check.evidenceIds.length > 0);
+      final = cited ? 'product_defect' : 'qa_inconclusive';
+      if (!cited) {
+        demote(
+          'A blocking finding or failed required check was reported without any real evidence, ' +
+            'so it is recorded as inconclusive.',
+        );
+      } else if (verdict.verdict !== 'product_defect') {
+        demote(
+          `The agent claimed ${verdict.verdict}, but ${blocking.length} blocking finding(s) and ` +
+            `${failedChecks.length} failed check(s) make this a product defect.`,
+        );
       }
-    }
-    if (final === 'pass' && controller.evidence.length === 0) {
+    } else if (verdict.verdict === 'product_defect') {
+      final = 'qa_inconclusive';
+      demote(
+        'The agent reported a product defect without a blocking finding bound to real evidence, ' +
+          'so it is recorded as inconclusive.',
+      );
+    } else if (unmet.length > 0) {
+      // The bug this gate exists for: a `pass` covering requirements that were
+      // never tested. Missing coverage is never a pass.
+      final = 'qa_inconclusive';
+      demote(
+        'The agent did not verify every required visual check: ' +
+          `${unmet.map((entry) => `${entry.id} (${entry.status}) — ${entry.label}`).join('; ')}.`,
+      );
+    } else if (controller.evidence.length === 0) {
       // "Pass" with no image is not a visual judgement.
       final = 'qa_inconclusive';
-      summary = `The agent passed the feature without capturing any evidence. Original summary: ${verdict.summary}`;
+      demote('The agent passed the feature without capturing any evidence.');
     }
     return {
       verdict: final,
       summary,
       checks,
       findings,
+      blocking,
+      advisories,
+      coverage,
+      allRequirementsVerified: unmet.length === 0 && failed.length === 0,
       evidence: controller.evidence,
       provider,
       model,
@@ -831,6 +964,34 @@ export class InteractiveVisualQaAgent {
   }
 }
 
+/**
+ * Requirement coverage, decided by trusted code.
+ *
+ * A viewport requirement is settled by the images that exist, never by the
+ * model's word for it; an unreported id is `missing`, and `not_applicable`
+ * without a stated reason is `missing` too.
+ */
+function computeCoverage(
+  brief: VisualQaBrief,
+  checks: VisualQaCheck[],
+  evidence: VisualQaShot[],
+): VisualQaCoverageEntry[] {
+  const reported = new Map(checks.map((check) => [check.id, check]));
+  const captured = new Set(evidence.map((shot) => shot.viewport));
+  return requiredVisualChecks(brief).map((requirement) => {
+    const check = reported.get(requirement.id);
+    let status: VisualQaCoverageEntry['status'] = check?.status ?? 'missing';
+    if (status === 'not_applicable' && !check?.note.trim()) status = 'missing';
+    if (requirement.viewport && !captured.has(requirement.viewport)) status = 'missing';
+    return {
+      ...requirement,
+      status,
+      evidenceIds: check?.evidenceIds ?? [],
+      note: check?.note ?? '',
+    };
+  });
+}
+
 function screenshotDigest(screenshotPath: string | null): string | null {
   return (
     /-([0-9a-f]{64})\.png$/i.exec(path.basename(screenshotPath ?? ''))?.[1]?.toLowerCase() ?? null
@@ -924,6 +1085,17 @@ schema has no absent keys.
 Keys allowed: Enter, Escape, Tab, Shift+Tab, Backspace, Delete, arrows, Home, End, PageUp, PageDown, Space.
 "checkpoint" saves the current screen as durable evidence — use it when you have reached a state
 worth proving or have found a defect. It is the ONLY way an image is kept.
+
+## Required checks (mandatory — Jarvis verifies this list itself)
+Your verdict MUST contain one entry in "checks" for EVERY id below, carrying its real status:
+${requiredVisualChecks(brief)
+  .map((requirement) => `- ${requirement.id}: ${requirement.label}`)
+  .join('\n')}
+A "viewport-*" requirement also needs at least one checkpoint captured at that viewport — Jarvis
+looks at the images, not at your word for it. Use "not_applicable" ONLY when a requirement cannot
+be judged visually at all, and say why in "note". Any required id that is absent, "not_reached" or
+unproven makes this run qa_inconclusive; it can never be a pass. Add extra checks with ids of your
+own whenever you tested more than this list.
 
 ## Finishing
 Return "verdict" (and a "finish" action) as soon as you can judge, and no later than the last turn:

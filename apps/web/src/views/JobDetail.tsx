@@ -389,6 +389,7 @@ export function JobDetailView({
         </Card>
       )}
       {actionError && <div className="alert error">{actionError}</div>}
+      {job.visualQaPlan && <VisualQaAdvisories plan={job.visualQaPlan} />}
       {job.stage === 'paused' && (
         <PausedPanel job={job} plan={resumePlan} providerHealth={detail.data.providerHealth} />
       )}
@@ -855,6 +856,23 @@ export function JobDetailView({
                     {scenario.name} · {(scenario.viewports ?? ['desktop', 'mobile']).join(' · ')}
                   </div>
                 ))}
+                {(job.visualQaPlan.coverage ?? []).map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="tiny"
+                    style={{
+                      color:
+                        entry.status === 'passed'
+                          ? undefined
+                          : entry.status === 'not_applicable'
+                            ? 'var(--warn)'
+                            : 'var(--err)',
+                    }}
+                  >
+                    required {entry.id}: {entry.status} — {entry.label}
+                    {entry.note ? ` (${entry.note})` : ''}
+                  </div>
+                ))}
                 {job.visualQaPlan.reasons.map((reason) => (
                   <div key={reason} className="tiny faint">
                     {reason}
@@ -1075,6 +1093,48 @@ function VisualQaActivity({ events }: { events: JarvisEvent[] }) {
       {typeof turn === 'number' ? ` ${turn}${typeof of === 'number' ? `/${of}` : ''}` : ''}:{' '}
       {String(latest.payload?.activity ?? '')}
       {viewport ? ` (${String(viewport)})` : ''}
+    </div>
+  );
+}
+
+/**
+ * What a "passed" Visual QA did NOT say.
+ *
+ * Advisory findings are real defects that merely sit below the configured
+ * blocking severities, and an unmet requirement is something nobody looked at.
+ * Approval is the last point where a human can act on either, so both are shown
+ * next to the approve button instead of only deep inside the evidence card.
+ */
+function VisualQaAdvisories({ plan }: { plan: NonNullable<Job['visualQaPlan']> }) {
+  const advisories = plan.advisories ?? [];
+  const unmet = (plan.coverage ?? []).filter(
+    (entry) => entry.status !== 'passed' && entry.status !== 'not_applicable',
+  );
+  if (advisories.length === 0 && unmet.length === 0) return null;
+  return (
+    <div className="alert warn small" role="status" data-testid="visual-qa-advisories">
+      {unmet.length > 0 && (
+        <div style={{ marginBottom: advisories.length > 0 ? 8 : 0 }}>
+          <strong>Visual QA did not verify {unmet.length} required check(s).</strong>
+          {unmet.map((entry) => (
+            <div key={entry.id} className="tiny">
+              {entry.status} — {entry.label}
+              {entry.note ? ` (${entry.note})` : ''}
+            </div>
+          ))}
+        </div>
+      )}
+      {advisories.length > 0 && (
+        <div>
+          <strong>Visual QA advisories ({advisories.length}) — not blocking, and not fixed:</strong>
+          {advisories.map((advisory, index) => (
+            <div key={index} className="tiny">
+              {advisory.severity} · {advisory.category} — {advisory.description}
+              {advisory.recommendation ? ` — ${advisory.recommendation}` : ''}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

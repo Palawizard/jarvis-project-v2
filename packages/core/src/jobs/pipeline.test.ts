@@ -454,6 +454,10 @@ async function harness(options: {
         actions: 5,
         checks: [],
         findings: [],
+        blocking: [],
+        advisories: [],
+        coverage: [],
+        allRequirementsVerified: false,
         evidence: [],
       };
       if (options.visual === 'infrastructure') {
@@ -470,7 +474,23 @@ async function harness(options: {
           verdict: 'qa_inconclusive',
           summary: 'the changed surface could not be reached within the action budget',
           checks: [
-            { goal: 'reach the Tools panel', status: 'not_reached', evidenceIds: [], note: '' },
+            {
+              id: 'viewport-desktop',
+              goal: 'reach the Tools panel',
+              status: 'not_reached',
+              evidenceIds: [],
+              note: '',
+            },
+          ],
+          coverage: [
+            {
+              id: 'viewport-desktop',
+              kind: 'viewport' as const,
+              label: 'judge the changed surface at the desktop viewport',
+              status: 'not_reached' as const,
+              evidenceIds: [],
+              note: '',
+            },
           ],
         };
       }
@@ -495,6 +515,29 @@ async function harness(options: {
         createdAt: nowIso(),
       };
       const defect = options.visual === 'repair' && visualCall === 1;
+      const blockingFindings = defect
+        ? [
+            {
+              severity: 'high' as const,
+              category: 'layout',
+              description: 'The Tools panel is clipped.',
+              recommendation: 'Allow the panel to wrap.',
+              evidenceIds: [shot.id],
+            },
+          ]
+        : [];
+      const advisoryFindings =
+        options.visual === 'advisory'
+          ? [
+              {
+                severity: 'low' as const,
+                category: 'polish',
+                description: 'Spacing is a little tight.',
+                recommendation: 'Consider more padding.',
+                evidenceIds: [shot.id],
+              },
+            ]
+          : [];
       return {
         ...base,
         evidence: [shot],
@@ -502,33 +545,27 @@ async function harness(options: {
         summary: defect ? 'The Tools panel is clipped.' : 'The changed surface looks correct.',
         checks: [
           {
+            id: 'viewport-desktop',
             goal: 'the Tools panel renders without clipping',
             status: defect ? 'failed' : 'passed',
             evidenceIds: [shot.id],
             note: '',
           },
         ],
-        findings: defect
-          ? [
-              {
-                severity: 'high' as const,
-                category: 'layout',
-                description: 'The Tools panel is clipped.',
-                recommendation: 'Allow the panel to wrap.',
-                evidenceIds: [shot.id],
-              },
-            ]
-          : options.visual === 'advisory'
-            ? [
-                {
-                  severity: 'low' as const,
-                  category: 'polish',
-                  description: 'Spacing is a little tight.',
-                  recommendation: 'Consider more padding.',
-                  evidenceIds: [shot.id],
-                },
-              ]
-            : [],
+        coverage: [
+          {
+            id: 'viewport-desktop',
+            kind: 'viewport' as const,
+            label: 'judge the changed surface at the desktop viewport',
+            status: defect ? ('failed' as const) : ('passed' as const),
+            evidenceIds: [shot.id],
+            note: '',
+          },
+        ],
+        allRequirementsVerified: !defect,
+        findings: [...blockingFindings, ...advisoryFindings],
+        blocking: blockingFindings,
+        advisories: advisoryFindings,
       };
     };
   }
@@ -1101,6 +1138,11 @@ describe('job repair pipeline', () => {
     // a reviewable state carrying a status a human can act on.
     expect(job.stage).toBe('awaiting_user');
     expect(job.visualQaStatus).toBe('inconclusive');
+    // Why it could not be judged is persisted with the evidence, so the pause
+    // for the human names the requirement nobody reached.
+    expect(job.visualQaPlan?.coverage?.map((entry) => [entry.id, entry.status])).toEqual([
+      ['viewport-desktop', 'not_reached'],
+    ]);
     expect(job.visualHead).toBeNull();
     expect(job.visualFixCycles).toBe(0);
     // Exactly two attempts. Never a third, and never a source fixer.
@@ -1167,6 +1209,14 @@ describe('job repair pipeline', () => {
     expect(job.visualQaPlan?.scenarios.map((scenario) => scenario.name)).toEqual(['tools']);
     expect(job.visualQaPlan?.reasons[0]).toBe('interactive visual QA: pass');
     expect(job.visualQaStatus).toBe('passed');
+    // A pass with a low finding is not a clean pass: the coverage and the
+    // advisory ride on the same persisted, HEAD-bound plan the API serves, so a
+    // human sees the unblocked defect before approving.
+    expect(job.visualQaPlan?.coverageHead).toBe(job.headRef);
+    expect(job.visualQaPlan?.coverage?.map((entry) => [entry.id, entry.status])).toEqual([
+      ['viewport-desktop', 'passed'],
+    ]);
+    expect(job.visualQaPlan?.advisories?.[0]?.description).toBe('Spacing is a little tight.');
     // Legacy project `visualQa.scenarios`/`routes` survive as route hints; they
     // are no longer a coverage contract the run has to satisfy.
     expect(h.visualBriefs[0]?.routeHints).toContain('/');

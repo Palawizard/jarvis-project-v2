@@ -1,5 +1,11 @@
 import type { Job } from '../jobs/service.js';
 import type { Project, VisualQaScenario } from '../projects/service.js';
+// Type-only: the gate that computes coverage lives in `agent.ts`, and this is
+// the envelope it is persisted in.
+import type { VisualQaCoverageEntry, VisualQaFinding } from './agent.js';
+
+/** A persisted advisory. The evidence ids stay in the Visual QA rows. */
+export type VisualQaAdvisory = Omit<VisualQaFinding, 'evidenceIds'>;
 
 /** Fixture profiles a candidate runtime may be asked to seed for Visual QA. */
 export const VISUAL_FIXTURE_PROFILES = [
@@ -34,6 +40,14 @@ export interface VisualQaPlan {
    * so this is deliberately not narrowed to the profiles this parent knows.
    */
   fixtures: string[];
+  /**
+   * What the interactive gate required and what it actually got, per id, bound
+   * to the same HEAD as the evidence it was computed from.
+   */
+  coverage?: VisualQaCoverageEntry[];
+  coverageHead?: string;
+  /** Real but non-blocking findings. A pass carrying these is not a clean pass. */
+  advisories?: VisualQaAdvisory[];
   /** Who mapped the diff onto surfaces. */
   plannerSource?: 'parent' | 'candidate_catalog';
   /** Exact validated candidate HEAD a committed catalog plan is bound to. */

@@ -74,8 +74,11 @@ class FakeProvider implements AgentProvider {
  */
 function fakeController(outDir: string, script?: (actions: BrowserAction[]) => void) {
   const evidence: VisualQaShot[] = [];
-  const checkpoints: Array<{ id: string; name: string; route: string; viewport: 'desktop' }> = [];
+  const checkpoints: Array<{ id: string; name: string; route: string; viewport: string }> = [];
   let actionsUsed = 0;
+  // The real controller stamps each checkpoint with the viewport it was taken
+  // at, which is exactly what the coverage gate reads.
+  let viewport: 'desktop' | 'mobile' = 'desktop';
   const observe = (results: Observation['results'], turnsRemaining: number): Observation => ({
     route: '/chat/x',
     viewport: 'desktop',
@@ -101,11 +104,17 @@ function fakeController(outDir: string, script?: (actions: BrowserAction[]) => v
       const results: Observation['results'] = [];
       for (const action of actions) {
         actionsUsed++;
+        if (action.action === 'set_viewport') viewport = action.viewport;
         if (action.action === 'checkpoint') {
           const id = `vqa_fake_${checkpoints.length}`;
-          const shot = { id, scenarioName: action.name, route: '/chat/x' } as VisualQaShot;
+          const shot = {
+            id,
+            scenarioName: action.name,
+            route: '/chat/x',
+            viewport,
+          } as VisualQaShot;
           evidence.push(shot);
-          checkpoints.push({ id, name: action.name, route: '/chat/x', viewport: 'desktop' });
+          checkpoints.push({ id, name: action.name, route: '/chat/x', viewport });
           results.push({ action: 'checkpoint', detail: action.name, status: 'ok', evidenceId: id });
         } else {
           results.push({ action: action.action, detail: '', status: 'ok' });
@@ -137,7 +146,7 @@ const brief: VisualQaBrief = {
   surfaceHints: ['apps/web/src/views/Chat.tsx -> chat-workspace'],
   routeHints: ['/chat/x'],
   fixtures: ['chat-workspace'],
-  mobileRelevant: true,
+  mobileRelevant: false,
   headRef: HEAD,
   baseUrl: 'http://127.0.0.1:4321',
   verificationSummary: 'passed (7 checks)',
@@ -171,6 +180,24 @@ async function setup(handler: (call: number, options: AgentStartOptions) => unkn
   return { home, config, db, bus, jobs, job, agent, provider, outDir };
 }
 
+/** The mandatory ids the shared desktop-only brief produces. */
+const required = (evidenceIds: string[] = [], status = 'passed') => [
+  {
+    id: 'viewport-desktop',
+    goal: 'judge the changed surface at the desktop viewport',
+    status,
+    evidenceIds,
+    note: '',
+  },
+  {
+    id: 'acceptance-1',
+    goal: 'hovering a user message reveals Edit',
+    status,
+    evidenceIds,
+    note: '',
+  },
+];
+
 const finish = (verdict: unknown) => ({
   activity: 'judging',
   actions: [{ action: 'finish' }],
@@ -194,14 +221,7 @@ describe('interactive visual QA agent', () => {
         : finish({
             verdict: 'pass',
             summary: 'Edit and Copy appear on hover and edit mode works.',
-            checks: [
-              {
-                goal: 'hovering a user message reveals Edit',
-                status: 'passed',
-                evidenceIds: ['vqa_fake_0'],
-                note: 'both controls visible',
-              },
-            ],
+            checks: required(['vqa_fake_0']),
             findings: [],
           }),
     );
@@ -271,6 +291,7 @@ describe('interactive visual QA agent', () => {
             summary: 'The Edit control is clipped on mobile.',
             checks: [
               {
+                id: 'acceptance-1',
                 goal: 'edit control is reachable on mobile',
                 status: 'failed',
                 evidenceIds: ['vqa_fake_0'],
@@ -306,7 +327,7 @@ describe('interactive visual QA agent', () => {
       finish({
         verdict: 'product_defect',
         summary: 'I believe it is broken.',
-        checks: [{ goal: 'edit works', status: 'passed', evidenceIds: [], note: '' }],
+        checks: required(),
         findings: [
           {
             severity: 'high',
@@ -377,9 +398,7 @@ describe('interactive visual QA agent', () => {
       verdict: {
         verdict: 'pass',
         summary: 'Edit mode renders correctly.',
-        checks: [
-          { goal: 'edit mode opens', status: 'passed', evidenceIds: ['vqa_fake_0'], note: '' },
-        ],
+        checks: required(['vqa_fake_0']),
         findings: [],
       },
     }));
@@ -408,9 +427,7 @@ describe('interactive visual QA agent', () => {
             verdict: {
               verdict: 'pass',
               summary: 'Second attempt at the same turn was well formed.',
-              checks: [
-                { goal: 'chat renders', status: 'passed', evidenceIds: ['vqa_fake_0'], note: '' },
-              ],
+              checks: required(['vqa_fake_0']),
               findings: [],
             },
           },
@@ -459,7 +476,7 @@ describe('interactive visual QA agent', () => {
               verdict: 'pass',
               summary: 'Looks right.',
               // No evidenceIds, no note: descriptive fields, not security ones.
-              checks: [{ goal: 'chat renders', status: 'passed' }],
+              checks: required().map(({ evidenceIds: _ids, note: _note, ...check }) => check),
               findings: [],
             },
           },
@@ -491,9 +508,7 @@ describe('interactive visual QA agent', () => {
             verdict: {
               verdict: 'pass',
               summary: 'Fine.',
-              checks: [
-                { goal: 'renders', status: 'passed', evidenceIds: ['vqa_fake_0'], note: '' },
-              ],
+              checks: required(['vqa_fake_0']),
               findings: [],
             },
           },
@@ -560,7 +575,7 @@ describe('interactive visual QA agent', () => {
     const passing = (call: number) =>
       call === 1
         ? { activity: 'capture', actions: [{ action: 'checkpoint', name: 'chat' }] }
-        : finish({ verdict: 'pass', summary: 'fine', checks: [], findings: [] });
+        : finish({ verdict: 'pass', summary: 'fine', checks: required(), findings: [] });
     const h = await setup(passing);
     // Real persistence, so the row and its sealed image are the ones approval reads.
     const controller = realisticController(h.outDir, h.agent, h.job.id, HEAD);
@@ -593,7 +608,7 @@ describe('interactive visual QA agent', () => {
         : finish({
             verdict: 'qa_inconclusive',
             summary: 'the conversation could not be created',
-            checks: [{ goal: 'reach edit mode', status: 'not_reached', evidenceIds: [], note: '' }],
+            checks: required([], 'not_reached'),
             findings: [],
           }),
     );
@@ -636,6 +651,222 @@ describe('interactive visual QA agent', () => {
     expect(prompt).toContain('no conversation existed');
     expect(prompt).toContain('TARGETED RECHECK');
     expect(prompt).toContain('edit control is reachable on mobile');
+  });
+
+  it('refuses to pass a responsive change whose mobile viewport was never captured', async () => {
+    // The reported bug: a `pass` covering a viewport nobody photographed.
+    const h = await setup((call) =>
+      call === 1
+        ? { activity: 'capture desktop', actions: [{ action: 'checkpoint', name: 'tools' }] }
+        : finish({
+            verdict: 'pass',
+            summary: 'Looks right on every viewport.',
+            checks: [
+              ...required(['vqa_fake_0']),
+              {
+                id: 'viewport-mobile',
+                goal: 'judge the changed surface at the mobile viewport',
+                status: 'passed',
+                evidenceIds: ['vqa_fake_0'],
+                note: 'claimed without a mobile capture',
+              },
+            ],
+            findings: [],
+          }),
+    );
+    const result = await h.agent.run({
+      jobId: h.job.id,
+      cwd: h.home,
+      baseUrl: brief.baseUrl,
+      headRef: HEAD,
+      cycle: 0,
+      brief: { ...brief, mobileRelevant: true },
+      openController: async () => fakeController(h.outDir),
+    });
+    expect(result.verdict).toBe('qa_inconclusive');
+    expect(result.allRequirementsVerified).toBe(false);
+    expect(result.summary).toContain('viewport-mobile');
+    expect(result.coverage.find((entry) => entry.id === 'viewport-mobile')?.status).toBe('missing');
+    // The mandatory list reaches the model rather than being a hidden gate.
+    expect(h.provider.calls[0]?.prompt).toContain('viewport-mobile');
+  });
+
+  it('passes a responsive change once both viewports are actually photographed', async () => {
+    const h = await setup((call) =>
+      call === 1
+        ? {
+            activity: 'capture both viewports',
+            actions: [
+              { action: 'checkpoint', name: 'tools desktop' },
+              { action: 'set_viewport', viewport: 'mobile' },
+              { action: 'checkpoint', name: 'tools mobile' },
+            ],
+          }
+        : finish({
+            verdict: 'pass',
+            summary: 'Correct on desktop and on mobile.',
+            checks: [
+              ...required(['vqa_fake_0']),
+              {
+                id: 'viewport-mobile',
+                goal: 'judge the changed surface at the mobile viewport',
+                status: 'passed',
+                evidenceIds: ['vqa_fake_1'],
+                note: '',
+              },
+            ],
+            findings: [],
+          }),
+    );
+    const result = await h.agent.run({
+      jobId: h.job.id,
+      cwd: h.home,
+      baseUrl: brief.baseUrl,
+      headRef: HEAD,
+      cycle: 0,
+      brief: { ...brief, mobileRelevant: true },
+      openController: async () => fakeController(h.outDir),
+    });
+    expect(result.verdict).toBe('pass');
+    expect(result.allRequirementsVerified).toBe(true);
+    expect(result.coverage.map((entry) => entry.status)).toEqual(['passed', 'passed', 'passed']);
+  });
+
+  it('refuses to pass when the agent omits a required check entirely', async () => {
+    const h = await setup((call) =>
+      call === 1
+        ? { activity: 'capture', actions: [{ action: 'checkpoint', name: 'tools' }] }
+        : finish({
+            verdict: 'pass',
+            summary: 'The panel renders.',
+            // viewport-desktop only: the acceptance criterion is simply absent.
+            checks: [required(['vqa_fake_0'])[0]],
+            findings: [],
+          }),
+    );
+    const result = await h.agent.run({
+      jobId: h.job.id,
+      cwd: h.home,
+      baseUrl: brief.baseUrl,
+      headRef: HEAD,
+      cycle: 0,
+      brief,
+      openController: async () => fakeController(h.outDir),
+    });
+    expect(result.verdict).toBe('qa_inconclusive');
+    expect(result.coverage.find((entry) => entry.id === 'acceptance-1')?.status).toBe('missing');
+    expect(result.summary).toContain('acceptance-1');
+  });
+
+  it('blocks on a configured blocking severity rather than a hardcoded one', async () => {
+    const defect = (blockingSeverities?: readonly string[]) =>
+      setup((call) =>
+        call === 1
+          ? { activity: 'capture', actions: [{ action: 'checkpoint', name: 'tools' }] }
+          : finish({
+              verdict: 'pass',
+              summary: 'Mostly fine.',
+              checks: required(['vqa_fake_0']),
+              findings: [
+                {
+                  severity: 'medium',
+                  category: 'layout',
+                  description: 'The label is truncated to "Write p...".',
+                  recommendation: 'Let the label wrap.',
+                  evidenceIds: ['vqa_fake_0'],
+                },
+              ],
+            }),
+      ).then(async (h) => ({
+        h,
+        result: await h.agent.run({
+          jobId: h.job.id,
+          cwd: h.home,
+          baseUrl: brief.baseUrl,
+          headRef: HEAD,
+          cycle: 0,
+          brief,
+          ...(blockingSeverities ? { blockingSeverities } : {}),
+          openController: async () => fakeController(h.outDir),
+        }),
+      }));
+    // Default (high, medium): medium blocks, and the model's own `pass` claim
+    // does not survive its own evidence.
+    const blocked = await defect();
+    expect(blocked.result.verdict).toBe('product_defect');
+    expect(blocked.result.blocking).toHaveLength(1);
+    expect(blocked.result.advisories).toHaveLength(0);
+    // Configured down to high only: the same finding becomes an advisory.
+    const advisory = await defect(['high']);
+    expect(advisory.result.verdict).toBe('pass');
+    expect(advisory.result.advisories).toHaveLength(1);
+  });
+
+  it('separates a clean pass from a pass carrying low advisories', async () => {
+    const h = await setup((call) =>
+      call === 1
+        ? { activity: 'capture', actions: [{ action: 'checkpoint', name: 'tools' }] }
+        : finish({
+            verdict: 'pass',
+            summary: 'Everything asked for works.',
+            checks: required(['vqa_fake_0']),
+            findings: [
+              {
+                severity: 'low',
+                category: 'polish',
+                description: 'The theme toggle label reads "Write p...".',
+                recommendation: 'Widen the control.',
+                evidenceIds: ['vqa_fake_0'],
+              },
+            ],
+          }),
+    );
+    const result = await h.agent.run({
+      jobId: h.job.id,
+      cwd: h.home,
+      baseUrl: brief.baseUrl,
+      headRef: HEAD,
+      cycle: 0,
+      brief,
+      openController: async () => fakeController(h.outDir),
+    });
+    expect(result.verdict).toBe('pass');
+    expect(result.allRequirementsVerified).toBe(true);
+    expect(result.blocking).toEqual([]);
+    expect(result.advisories[0]?.description).toContain('Write p...');
+  });
+
+  it('requires every recheck goal on a targeted recheck instead of the full list', async () => {
+    const h = await setup((call) =>
+      call === 1
+        ? { activity: 'capture', actions: [{ action: 'checkpoint', name: 'tools' }] }
+        : finish({
+            verdict: 'pass',
+            summary: 'The repaired control is fine now.',
+            checks: [
+              {
+                id: 'recheck-1',
+                goal: 'edit control is reachable on mobile',
+                status: 'passed',
+                evidenceIds: ['vqa_fake_0'],
+                note: '',
+              },
+            ],
+            findings: [],
+          }),
+    );
+    const result = await h.agent.run({
+      jobId: h.job.id,
+      cwd: h.home,
+      baseUrl: brief.baseUrl,
+      headRef: HEAD,
+      cycle: 0,
+      // A recheck is targeted: the full acceptance/viewport list is not re-owed.
+      brief: { ...brief, recheckGoals: ['edit control is reachable on mobile'] },
+      openController: async () => fakeController(h.outDir),
+    });
+    expect(result.verdict).toBe('pass');
+    expect(result.coverage.map((entry) => entry.id)).toEqual(['recheck-1']);
   });
 
   it('fences candidate page output as untrusted data rather than instruction', async () => {

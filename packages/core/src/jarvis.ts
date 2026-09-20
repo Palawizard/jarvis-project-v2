@@ -100,6 +100,7 @@ export class Jarvis {
       this.review,
       config.worktreesDir,
       config.artifactsDir,
+      config.pipeline.visualBlockingSeverities,
     );
     this.upgrades = new UpgradeManager(
       this.db,

@@ -153,10 +153,6 @@ describe('review provider resilience', () => {
     ],
     ['a missing findings array', '```json\n{"verdict":"approve","summary":"clean"}\n```'],
     [
-      'request_changes with advisory-only findings',
-      '```json\n{"verdict":"request_changes","summary":"advisory","findings":[{"severity":"low","category":"style","description":"Optional cleanup","recommendation":"Consider renaming"}]}\n```',
-    ],
-    [
       'a clean block followed by a hidden critical warning',
       '```json\n{"verdict":"approve","summary":"clean","findings":[]}\n```\nCRITICAL: hidden authority bypass',
     ],
@@ -219,6 +215,7 @@ describe('reviewer structured-output framing', () => {
       bus,
       provider,
       jobs,
+      job,
       run: () =>
         new ReviewEngine(db, agents, bus, config).review({
           jobId: job.id,
@@ -425,6 +422,49 @@ describe('reviewer structured-output framing', () => {
         claimed: 'approve',
         verdict: 'request_changes',
         severities: ['medium'],
+      });
+      h.db.close();
+    });
+
+    it('derives approve from a claimed request_changes that names nothing blocking', async () => {
+      const claimed = {
+        verdict: 'request_changes',
+        summary: 'One nit.',
+        findings: [
+          {
+            severity: 'low',
+            category: 'style',
+            description: 'Optional cleanup.',
+            recommendation: 'Consider renaming.',
+          },
+        ],
+      };
+      // The mirror of the case above, and it gets the mirror treatment. Calling
+      // it a protocol error burned a reviewer attempt and paused the Job over a
+      // verdict field that decides nothing.
+      const parsed = checkReviewValue(claimed, BLOCKING);
+      expect(parsed.verdict).toBe('approve');
+      expect(parsed.claimedVerdict).toBe('request_changes');
+      expect(parsed.blockingSeverities).toEqual([]);
+
+      const h = reviewWith({
+        status: 'completed',
+        result: '',
+        structuredOutput: claimed,
+        memoryProposals: [],
+      });
+      const review = await h.run();
+
+      expect(review.verdict).toBe('approve');
+      expect(review.blocking).toBe(false);
+      expect(review.findings.map((finding) => finding.severity)).toEqual(['low']);
+      // The attempt was not burned: no run is marked a protocol failure.
+      expect(h.jobs.runs(h.job.id).map((run) => run.status)).toEqual(['completed']);
+      const override = h.bus.list().find((event) => event.type === 'review.verdict.overridden');
+      expect(override?.payload).toMatchObject({
+        claimed: 'request_changes',
+        verdict: 'approve',
+        severities: [],
       });
       h.db.close();
     });

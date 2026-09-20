@@ -11,6 +11,7 @@ import { redactSecrets, redactSecretValues } from '../memory/secrets.js';
 import { stripNulls } from '../agents/structured.js';
 import { newId, nowIso } from '../ids.js';
 import { createLogger } from '../logger.js';
+import { mentionsMobile } from './candidate-plan.js';
 import { validateVisualEvidence, type VisualQaShot } from './engine.js';
 import { hasCompleteClaudeImageReads, serializeVisualReview } from './reviewer.js';
 import {
@@ -77,11 +78,18 @@ const DEFAULT_BLOCKING_SEVERITIES = ['high', 'medium'] as const;
  * recheck replaces the list with exactly the goals the repair had to fix.
  */
 export function requiredVisualChecks(brief: VisualQaBrief): VisualQaRequirement[] {
+  // A criterion that names mobile is judged at the mobile viewport or not at
+  // all: without this it is prose the agent can mark `passed` off a desktop
+  // shot, which is exactly the hole a viewport requirement exists to close.
+  const stated = (label: string) =>
+    mentionsMobile(label)
+      ? { label: `${label} — needs evidence at the mobile viewport`, viewport: 'mobile' as const }
+      : { label };
   if (brief.recheckGoals?.length) {
     return brief.recheckGoals.slice(0, 8).map((goal, index) => ({
       id: `recheck-${index + 1}`,
       kind: 'recheck',
-      label: goal,
+      ...stated(goal),
     }));
   }
   const viewports: Viewport[] = brief.mobileRelevant ? ['desktop', 'mobile'] : ['desktop'];
@@ -95,7 +103,7 @@ export function requiredVisualChecks(brief: VisualQaBrief): VisualQaRequirement[
     ...brief.acceptance.slice(0, 8).map((criterion, index) => ({
       id: `acceptance-${index + 1}`,
       kind: 'acceptance' as const,
-      label: criterion,
+      ...stated(criterion),
     })),
   ];
 }
@@ -1091,7 +1099,7 @@ Your verdict MUST contain one entry in "checks" for EVERY id below, carrying its
 ${requiredVisualChecks(brief)
   .map((requirement) => `- ${requirement.id}: ${requirement.label}`)
   .join('\n')}
-A "viewport-*" requirement also needs at least one checkpoint captured at that viewport — Jarvis
+A requirement naming a viewport needs at least one checkpoint captured at that viewport — Jarvis
 looks at the images, not at your word for it. Use "not_applicable" ONLY when a requirement cannot
 be judged visually at all, and say why in "note". Any required id that is absent, "not_reached" or
 unproven makes this run qa_inconclusive; it can never be a pass. Add extra checks with ids of your

@@ -713,7 +713,12 @@ export class JobPipeline {
           surfaceHints: hints?.reasons ?? (hintError ? [`no surface hints: ${hintError}`] : []),
           routeHints: routeHints(input.project, hints),
           fixtures: hints?.fixtures ?? [],
-          mobileRelevant: mobileRelevant(changedFiles),
+          mobileRelevant: mobileRelevant({
+            changedFiles,
+            isSelf: input.project.isSelf,
+            texts: [job.request, job.goal, ...job.acceptance],
+            scenarios: hints?.scenarios,
+          }),
           headRef: changes.head,
           baseUrl: '',
           verificationSummary: report.passed

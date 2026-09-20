@@ -72,10 +72,51 @@ describe('deterministic visual QA eligibility', () => {
     expect(eligible(['packages/core/src/db/index.ts'], project(), explicit).eligible).toBe(true);
   });
 
-  it('marks responsive-relevant diffs so the agent spends a viewport switch', () => {
-    expect(mobileRelevant(['apps/web/src/styles.css'])).toBe(true);
-    expect(mobileRelevant(['apps/web/src/components.tsx'])).toBe(true);
-    expect(mobileRelevant(['apps/web/src/views/Chat.tsx'])).toBe(true);
-    expect(mobileRelevant(['packages/core/src/memory/service.ts'])).toBe(false);
+  describe('mobile relevance', () => {
+    const self = (changedFiles: string[]) => mobileRelevant({ changedFiles, isSelf: true });
+
+    it('(a) requires mobile for any rendered file under the UI folder', () => {
+      expect(self(['apps/web/src/styles.css'])).toBe(true);
+      expect(self(['apps/web/src/components.tsx'])).toBe(true);
+      expect(self(['apps/web/src/views/Chat.tsx'])).toBe(true);
+      // The hole this closes: a view the old name-based regex never matched.
+      expect(self(['apps/web/src/views/JobDetail.tsx'])).toBe(true);
+      expect(self(['apps/web/src/theme.scss'])).toBe(true);
+      // A generic project has no apps/web, so any rendered file counts.
+      expect(mobileRelevant({ changedFiles: ['src/App.vue'], isSelf: false })).toBe(true);
+      expect(mobileRelevant({ changedFiles: ['src/App.vue'], isSelf: true })).toBe(false);
+    });
+
+    it('(b) requires mobile when the request or a criterion says so, accents and all', () => {
+      const asked = (text: string) =>
+        mobileRelevant({ changedFiles: ['packages/core/src/x.ts'], isSelf: true, texts: [text] });
+      expect(asked('Make the job list readable on mobile')).toBe(true);
+      expect(asked('Le panneau doit être responsive')).toBe(true);
+      expect(asked('Lisible sur téléphone')).toBe(true);
+      expect(asked('Works on a small screen')).toBe(true);
+      expect(asked('Rework the SQLite migration')).toBe(false);
+    });
+
+    it('(c) requires mobile when a planned scenario declares that viewport', () => {
+      const withScenarios = (viewports: ('desktop' | 'mobile')[]) =>
+        mobileRelevant({
+          changedFiles: ['packages/core/src/x.ts'],
+          isSelf: true,
+          scenarios: [{ viewports }],
+        });
+      expect(withScenarios(['desktop', 'mobile'])).toBe(true);
+      expect(withScenarios(['desktop'])).toBe(false);
+    });
+
+    it('leaves a backend-only candidate alone', () => {
+      expect(
+        mobileRelevant({
+          changedFiles: ['packages/core/src/memory/service.ts', 'apps/web/src/App.test.tsx'],
+          isSelf: true,
+          texts: ['Rank memories by recency', 'scope-filter before ranking'],
+          scenarios: [{ viewports: ['desktop'] }],
+        }),
+      ).toBe(false);
+    });
   });
 });

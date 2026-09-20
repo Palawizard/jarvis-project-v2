@@ -732,6 +732,60 @@ describe('interactive visual QA agent', () => {
     expect(result.coverage.map((entry) => entry.status)).toEqual(['passed', 'passed', 'passed']);
   });
 
+  it('refuses to pass a mobile acceptance criterion proven only on desktop', async () => {
+    // The criterion says "mobile", so it is a viewport requirement like any
+    // other: `passed` off a desktop shot is exactly what used to slip through.
+    const mobileCriterion = {
+      ...brief,
+      acceptance: ['the job list stays readable on mobile'],
+      mobileRelevant: true,
+    };
+    const h = await setup((call) =>
+      call === 1
+        ? { activity: 'capture desktop', actions: [{ action: 'checkpoint', name: 'tools' }] }
+        : finish({
+            verdict: 'pass',
+            summary: 'Readable everywhere.',
+            checks: [
+              {
+                id: 'viewport-desktop',
+                goal: 'judge the changed surface at the desktop viewport',
+                status: 'passed',
+                evidenceIds: ['vqa_fake_0'],
+                note: '',
+              },
+              {
+                id: 'viewport-mobile',
+                goal: 'judge the changed surface at the mobile viewport',
+                status: 'passed',
+                evidenceIds: ['vqa_fake_0'],
+                note: '',
+              },
+              {
+                id: 'acceptance-1',
+                goal: 'the job list stays readable on mobile',
+                status: 'passed',
+                evidenceIds: ['vqa_fake_0'],
+                note: 'looked fine on the desktop shot',
+              },
+            ],
+            findings: [],
+          }),
+    );
+    const result = await h.agent.run({
+      jobId: h.job.id,
+      cwd: h.home,
+      baseUrl: brief.baseUrl,
+      headRef: HEAD,
+      cycle: 0,
+      brief: mobileCriterion,
+      openController: async () => fakeController(h.outDir),
+    });
+    expect(result.verdict).toBe('qa_inconclusive');
+    expect(result.coverage.find((entry) => entry.id === 'acceptance-1')?.status).toBe('missing');
+    expect(h.provider.calls[0]?.prompt).toContain('needs evidence at the mobile viewport');
+  });
+
   it('refuses to pass when the agent omits a required check entirely', async () => {
     const h = await setup((call) =>
       call === 1
@@ -839,7 +893,15 @@ describe('interactive visual QA agent', () => {
   it('requires every recheck goal on a targeted recheck instead of the full list', async () => {
     const h = await setup((call) =>
       call === 1
-        ? { activity: 'capture', actions: [{ action: 'checkpoint', name: 'tools' }] }
+        ? {
+            activity: 'capture',
+            // The goal itself names mobile, so it owes a mobile capture even
+            // though the rest of the list is not re-owed.
+            actions: [
+              { action: 'set_viewport', viewport: 'mobile' },
+              { action: 'checkpoint', name: 'tools' },
+            ],
+          }
         : finish({
             verdict: 'pass',
             summary: 'The repaired control is fine now.',

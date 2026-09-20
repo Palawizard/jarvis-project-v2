@@ -353,16 +353,15 @@ export class ReviewEngine {
       headRef: opts.headRef,
       blocking: verdict !== 'approve',
     });
-    // The model said "approve" and the severities it itself reported say
-    // otherwise. The gate already won -- this only makes that visible, instead
-    // of leaving a request_changes whose reviewer claimed the opposite.
-    if (verdict === 'request_changes' && parsed.claimedVerdict === 'approve') {
+    // The model's verdict field and the severities it itself reported disagree,
+    // in either direction. The gate already won -- this only makes that visible.
+    if (parsed.claimedVerdict !== null && parsed.claimedVerdict !== verdict) {
       this.bus?.emit({
         type: 'review.verdict.overridden',
         jobId: opts.jobId,
         runId,
         payload: {
-          claimed: 'approve',
+          claimed: parsed.claimedVerdict,
           verdict,
           severities: parsed.blockingSeverities,
           provider: routed.provider.id,
@@ -585,9 +584,9 @@ export function parseReviewOutput(
  *
  * Whether the object arrived through the provider's constrained-output channel
  * or was scraped out of a fenced block, the same rules decide whether it is a
- * review: the strict schema, a recommendation on every blocking finding, and a
- * `request_changes` that actually names one. The schema was never the loose
- * part — the transport was.
+ * review: the strict schema and a recommendation on every blocking finding.
+ * The verdict field itself is never one of them — the severities decide it.
+ * The schema was never the loose part; the transport was.
  */
 export function checkReviewValue(
   value: unknown,
@@ -600,9 +599,11 @@ export function checkReviewValue(
   if (blocking.some((finding) => !finding.recommendation.trim())) {
     return invalidReview('blocking findings require a recommendation');
   }
-  if (checked.data.verdict === 'request_changes' && blocking.length === 0) {
-    return invalidReview('request_changes requires at least one configured blocking finding');
-  }
+  // A `request_changes` naming nothing blocking is the mirror of an `approve`
+  // that reported a blocking finding, and it gets the mirror treatment: the
+  // severities decide, the claim is only recorded. Calling it a protocol error
+  // burned a reviewer attempt and paused the Job over a verdict field that
+  // decides nothing -- for a reviewer whose findings were, say, all LOW.
   return {
     verdict: blocking.length ? 'request_changes' : 'approve',
     // What the model CLAIMED, kept only so the gate can report when it had to

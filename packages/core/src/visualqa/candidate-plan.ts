@@ -151,18 +151,49 @@ export function visualQaEligibility(input: {
   };
 }
 
+/** Jarvis's own UI lives under the web app; any other project uses the generic set. */
+const SELF_MOBILE_FILE = /^apps\/web\/src\/.*\.(?:tsx|jsx|css|scss)$/i;
+const PROJECT_MOBILE_FILE = /\.(?:tsx|jsx|vue|svelte|css|scss)$/i;
 /**
- * Whether the changed UI is responsive-relevant, so the agent is told to spend
- * a viewport switch. Deterministic, and a hint rather than a requirement.
+ * Mobile/responsive wording, FR and EN, after diacritics are stripped so
+ * "telephone" matches what the user actually typed.
  */
-export function mobileRelevant(changedFiles: string[]): boolean {
-  return changedFiles
-    .map(normalise)
-    .some(
-      (file) =>
-        /\.(?:css|scss)$/i.test(file) || /(?:^|\/)(?:App|components|Chat)[^/]*\.tsx$/i.test(file),
-    );
+const MOBILE_WORDS = /\b(?:mobile|responsiv|telephon|phone|smartphone|small[ -]screen)/i;
+
+const deaccent = (value: string) => value.normalize('NFD').replace(/\p{Diacritic}/gu, '');
+
+export interface MobileRelevance {
+  changedFiles: string[];
+  /** Jarvis itself scopes rendered UI to its web app; other projects do not. */
+  isSelf: boolean;
+  /** Free text the user wrote: the request, the goal, acceptance criteria. */
+  texts?: string[];
+  /** Hinted scenarios; one declaring the mobile viewport settles it. */
+  scenarios?: readonly { viewports?: readonly ('desktop' | 'mobile')[] }[];
 }
+
+/**
+ * Whether this candidate owes mobile-viewport evidence. Deterministic, no model.
+ *
+ * Any one of three independent signals is enough, because each of them on its
+ * own describes a change a desktop-only capture cannot judge: rendered UI that
+ * changed, a request that asked for mobile in so many words, or a plan that
+ * already declares the mobile viewport. It is a REQUIREMENT, not a hint: the
+ * agent cannot report a mobile acceptance criterion `passed` off a desktop shot.
+ */
+export function mobileRelevant(input: MobileRelevance): boolean {
+  const uiFile = input.isSelf ? SELF_MOBILE_FILE : PROJECT_MOBILE_FILE;
+  return (
+    input.changedFiles
+      .map(normalise)
+      .some((file) => uiFile.test(file) && !NOT_RENDERED.test(file)) ||
+    (input.texts ?? []).some((text) => MOBILE_WORDS.test(deaccent(text))) ||
+    (input.scenarios ?? []).some((scenario) => scenario.viewports?.includes('mobile') === true)
+  );
+}
+
+/** The same wording test, for one acceptance criterion or recheck goal. */
+export const mentionsMobile = (text: string) => MOBILE_WORDS.test(deaccent(text));
 
 /**
  * Resolve self-development Visual QA from versioned declarative data committed

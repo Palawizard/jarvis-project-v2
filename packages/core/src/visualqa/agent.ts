@@ -8,6 +8,7 @@ import type { AgentRegistry } from '../agents/registry.js';
 import type { AgentEvent, AgentRunResult, ProviderId } from '../agents/types.js';
 import type { EffortLevel } from '../agents/policy.js';
 import { redactSecrets, redactSecretValues } from '../memory/secrets.js';
+import { stripNulls } from '../agents/structured.js';
 import { newId, nowIso } from '../ids.js';
 import { createLogger } from '../logger.js';
 import { validateVisualEvidence, type VisualQaShot } from './engine.js';
@@ -147,7 +148,8 @@ const TURN = z
 const LOCATOR_SCHEMA = {
   description:
     'Exactly one of: {testId} | {role,name} | {text} | {css}. Prefer testId, then role+name.',
-  oneOf: [
+  // `anyOf`, not `oneOf`: strict Structured Outputs rejects `oneOf` outright.
+  anyOf: [
     {
       type: 'object',
       additionalProperties: false,
@@ -176,53 +178,66 @@ const LOCATOR_SCHEMA = {
 } as const;
 
 const LOCATOR_REF = { $ref: '#/$defs/locator' } as const;
+/**
+ * A locator the model may leave out.
+ *
+ * Strict Structured Outputs has no optional properties: every key of
+ * `properties` must be in `required`, so "absent" is spelled `null`.
+ * `stripNulls` turns it back into absence before the zod union parses.
+ */
+const NULLABLE_LOCATOR = { anyOf: [{ type: 'null' }, LOCATOR_REF] } as const;
 
-/** One entry per action, mirroring the zod union member for member. */
+/**
+ * One entry per action, mirroring the zod union member for member.
+ *
+ * `required` is not listed: under strict Structured Outputs it is always every
+ * property, so deriving it removes the only place the two could drift apart.
+ */
 const ACTION_VARIANTS = [
-  ['goto', ['route'], { route: { type: 'string', description: 'Same-origin absolute path.' } }],
-  ['click', ['locator'], { locator: LOCATOR_REF }],
-  ['hover', ['locator'], { locator: LOCATOR_REF }],
-  ['fill', ['locator', 'value'], { locator: LOCATOR_REF, value: { type: 'string' } }],
+  ['goto', { route: { type: 'string', description: 'Same-origin absolute path.' } }],
+  ['click', { locator: LOCATOR_REF }],
+  ['hover', { locator: LOCATOR_REF }],
+  ['fill', { locator: LOCATOR_REF, value: { type: 'string' } }],
   [
     'press',
-    ['key'],
     {
       key: { type: 'string', enum: [...KEYS] },
-      locator: LOCATOR_REF,
+      locator: NULLABLE_LOCATOR,
     },
   ],
   [
     'scroll',
-    ['direction'],
     {
       direction: { type: 'string', enum: ['up', 'down'] },
-      amount: { type: 'integer', minimum: 1, maximum: 4000 },
+      amount: { type: ['integer', 'null'], minimum: 1, maximum: 4000 },
     },
   ],
   [
     'wait',
-    [],
-    { locator: LOCATOR_REF, timeoutMs: { type: 'integer', minimum: 1, maximum: 15_000 } },
-  ],
-  ['inspect', [], { locator: LOCATOR_REF }],
-  ['set_viewport', ['viewport'], { viewport: { type: 'string', enum: ['desktop', 'mobile'] } }],
-  [
-    'checkpoint',
-    ['name'],
     {
-      name: { type: 'string', description: 'Short label for this piece of evidence.' },
-      note: { type: 'string' },
+      locator: NULLABLE_LOCATOR,
+      timeoutMs: { type: ['integer', 'null'], minimum: 1, maximum: 15_000 },
     },
   ],
-  ['finish', [], {}],
-] as const satisfies ReadonlyArray<readonly [string, readonly string[], Record<string, unknown>]>;
+  ['inspect', { locator: NULLABLE_LOCATOR }],
+  ['set_viewport', { viewport: { type: 'string', enum: ['desktop', 'mobile'] } }],
+  [
+    'checkpoint',
+    {
+      name: { type: 'string', description: 'Short label for this piece of evidence.' },
+      note: { type: ['string', 'null'] },
+    },
+  ],
+  ['finish', {}],
+] as const satisfies ReadonlyArray<readonly [string, Record<string, unknown>]>;
 
 const ACTION_SCHEMA = {
-  oneOf: ACTION_VARIANTS.map(([action, required, properties]) => ({
+  anyOf: ACTION_VARIANTS.map(([action, properties]) => ({
     type: 'object',
     additionalProperties: false,
-    required: ['action', ...required],
-    properties: { action: { type: 'string', const: action }, ...properties },
+    required: ['action', ...Object.keys(properties)],
+    // `enum` rather than `const`: only the former is in the strict keyword set.
+    properties: { action: { type: 'string', enum: [action] }, ...properties },
   })),
 } as const;
 
@@ -238,12 +253,12 @@ const VERDICT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['goal', 'status'],
+        required: ['goal', 'status', 'evidenceIds', 'note'],
         properties: {
           goal: { type: 'string' },
           status: { type: 'string', enum: ['passed', 'failed', 'not_reached'] },
           evidenceIds: { type: 'array', items: { type: 'string' } },
-          note: { type: 'string' },
+          note: { type: ['string', 'null'] },
         },
       },
     },
@@ -252,7 +267,7 @@ const VERDICT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['severity', 'category', 'description', 'recommendation'],
+        required: ['severity', 'category', 'description', 'recommendation', 'evidenceIds'],
         properties: {
           severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
           category: { type: 'string' },
@@ -265,10 +280,10 @@ const VERDICT_SCHEMA = {
   },
 } as const;
 
-const TURN_SCHEMA = {
+export const TURN_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['activity', 'actions'],
+  required: ['activity', 'actions', 'verdict'],
   $defs: { locator: LOCATOR_SCHEMA },
   properties: {
     activity: { type: 'string', description: 'Short user-visible label for this step.' },
@@ -277,7 +292,7 @@ const TURN_SCHEMA = {
       maxItems: VISUAL_QA_BUDGET.actionsPerTurn,
       items: ACTION_SCHEMA,
     },
-    verdict: { oneOf: [{ type: 'null' }, VERDICT_SCHEMA] },
+    verdict: { anyOf: [{ type: 'null' }, VERDICT_SCHEMA] },
   },
 } as const;
 
@@ -611,7 +626,7 @@ export class InteractiveVisualQaAgent {
       // The provider itself failed. Another turn cannot fix that.
       return { kind: 'error', error: redactSecrets(run.error ?? 'visual QA agent turn failed') };
     }
-    const parsed = TURN.safeParse(redactSecretValues(run.structuredOutput));
+    const parsed = TURN.safeParse(stripNulls(redactSecretValues(run.structuredOutput)));
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
       return {
@@ -904,6 +919,8 @@ goto {route} | click {locator} | hover {locator} | fill {locator,value} | press 
 scroll {direction[,amount]} | wait {[locator][,timeoutMs]} | inspect {[locator]} |
 set_viewport {viewport} | checkpoint {name[,note]} | finish
 Locator: {"testId":"..."} | {"role":"...","name":"..."} | {"text":"..."} | {"css":"..."}.
+Fields in [brackets] are optional, and so is "verdict": send them as null when you have none. The
+schema has no absent keys.
 Keys allowed: Enter, Escape, Tab, Shift+Tab, Backspace, Delete, arrows, Home, End, PageUp, PageDown, Space.
 "checkpoint" saves the current screen as durable evidence — use it when you have reached a state
 worth proving or have found a defect. It is the ONLY way an image is kept.

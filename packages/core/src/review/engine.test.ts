@@ -296,10 +296,47 @@ describe('reviewer structured-output framing', () => {
     expect(finding.description.minLength).toBe(1);
     expect(finding.recommendation.minLength).toBe(1);
     expect(finding.file.minLength).toBe(1);
-    // `file` and `line` stay OPTIONAL, because the trusted schema makes them
-    // optional; requiring them would manufacture the mirror-image failure.
-    expect(REVIEW_OUTPUT_SCHEMA.properties.findings.items.required).not.toContain('file');
-    expect(REVIEW_OUTPUT_SCHEMA.properties.findings.items.required).not.toContain('line');
+    // `file` and `line` are optional to the trusted schema, but strict
+    // Structured Outputs has no optional properties: they are REQUIRED and
+    // nullable, and `null` is normalized back to absence. Requiring them
+    // non-nullably would manufacture the mirror-image failure.
+    expect(REVIEW_OUTPUT_SCHEMA.properties.findings.items.required).toContain('file');
+    expect(REVIEW_OUTPUT_SCHEMA.properties.findings.items.required).toContain('line');
+    expect(finding.file.type).toEqual(['string', 'null']);
+    expect(finding.line.type).toEqual(['integer', 'null']);
+  });
+
+  // A provider answering the schema literally sends `null`, not an absent key.
+  // The Review that comes out must be indistinguishable from one where the
+  // model simply left them out -- otherwise every downstream consumer of
+  // `ReviewFinding.file` has to learn about a spelling the provider chose.
+  it('accepts a null file/line and produces findings without those fields', () => {
+    const checked = checkReviewValue({
+      verdict: 'request_changes',
+      summary: 'One blocking issue.',
+      findings: [
+        {
+          severity: 'high',
+          category: 'correctness',
+          file: null,
+          line: null,
+          description: 'Repository-wide problem with no single location.',
+          recommendation: 'Fix it.',
+        },
+        {
+          severity: 'low',
+          category: 'style',
+          file: 'src/a.ts',
+          line: 12,
+          description: 'Naming.',
+          recommendation: 'Rename.',
+        },
+      ],
+    });
+    expect(checked.verdict).toBe('request_changes');
+    expect(checked.findings[0]).not.toHaveProperty('file');
+    expect(checked.findings[0]).not.toHaveProperty('line');
+    expect(checked.findings[1]).toMatchObject({ file: 'src/a.ts', line: 12 });
   });
 
   it.each([

@@ -88,3 +88,30 @@ function lastBalancedObject(raw: string): string | null {
   }
   return last;
 }
+
+/**
+ * Drop JSON `null`s so a strict provider schema can spell "optional".
+ *
+ * OpenAI Structured Outputs — which is what Codex `--output-schema` compiles
+ * to — requires every key of `properties` to appear in `required`; a schema
+ * that omits one is refused with `invalid_json_schema` before the model ever
+ * runs, burning the attempt. The only way to say "optional" is `required` plus
+ * a nullable type, so the provider answers `"file": null` where the trusted Zod
+ * schema wants the key absent.
+ *
+ * Normalizing here keeps that spelling out of every downstream type: the `null`
+ * is exactly the absence the schema advertised. Nothing else about the value
+ * changes, and the strict Zod parse still runs afterwards — this is a spelling
+ * fix at the boundary, not a relaxation of it.
+ */
+export function stripNulls<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((item) => stripNulls(item)) as T;
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== null)
+        .map(([key, item]) => [key, stripNulls(item)]),
+    ) as T;
+  }
+  return value;
+}

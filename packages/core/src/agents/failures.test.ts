@@ -59,6 +59,22 @@ describe('agent failure classification', () => {
     );
   });
 
+  const schemaRejected = [
+    'unexpected status 400 Bad Request: {"error":{"message":"Invalid schema for response_format \'review\': In context=(\'properties\', \'findings\', \'items\'), \'required\' is required to be supplied and to be an array including every key in properties.","code":"invalid_json_schema"}}',
+    'invalid_json_schema',
+    "Invalid schema for function 'turn': 'oneOf' is not permitted.",
+  ];
+  it.each(schemaRejected)(
+    'calls a rejected output schema our bug, not a provider fault: %s',
+    (error) => {
+      const kind = classifyAgentFailure({ status: 'failed', error });
+      expect(kind).toBe('schema_rejected');
+      // Infrastructure: nothing about the candidate caused it, so no source fixer.
+      expect(INFRASTRUCTURE_FAILURE_KINDS).toContain(kind);
+      expect(describeAgentFailure(kind, error)).toContain('Schema rejected by provider');
+    },
+  );
+
   it('only calls a real agent error an agent error', () => {
     const kind = classifyAgentFailure({
       status: 'failed',

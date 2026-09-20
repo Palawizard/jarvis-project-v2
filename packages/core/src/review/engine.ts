@@ -7,6 +7,7 @@ import type { EventBus } from '../events/bus.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import type { AgentRunResult, ProviderId } from '../agents/types.js';
 import { classifyChangedPaths, type TaskSignals } from '../agents/policy.js';
+import { stripNulls } from '../agents/structured.js';
 import type { VerificationReport } from '../verification/engine.js';
 import { getConfig, type JarvisConfig } from '../config.js';
 import { redactSecrets, redactSecretValues } from '../memory/secrets.js';
@@ -110,12 +111,13 @@ export const REVIEW_OUTPUT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        // `file` and `line` are deliberately NOT required: the trusted schema
-        // makes both optional, and requiring them here would let a provider
-        // return a schema-valid answer that Jarvis then rejects as a protocol
-        // error — manufacturing the exact infrastructure pause this change
-        // exists to remove.
-        required: ['severity', 'category', 'description', 'recommendation'],
+        // Strict Structured Outputs (Codex `--output-schema`) requires EVERY key
+        // of `properties` to appear in `required`; an omitted one is rejected
+        // outright as `invalid_json_schema` and burns the whole reviewer
+        // attempt. An optional field is spelled `required` + nullable instead,
+        // and `stripNulls` turns the provider's `null` back into the absence
+        // the trusted schema above already expects.
+        required: ['severity', 'category', 'file', 'line', 'description', 'recommendation'],
         properties: {
           severity: {
             type: 'string',
@@ -125,10 +127,11 @@ export const REVIEW_OUTPUT_SCHEMA = {
             type: 'string',
             enum: ['correctness', 'security', 'design', 'tests', 'performance', 'style'],
           },
-          // Optional, but never empty when present -- same bound as the
-          // trusted `z.string().trim().min(1).optional()`.
-          file: { type: 'string', minLength: 1, maxLength: 500 },
-          line: { type: 'integer', minimum: 1 },
+          // Nullable, but never empty when it IS a string -- same bound as the
+          // trusted `z.string().trim().min(1).optional()`. `minLength` only
+          // constrains strings, so `null` still satisfies it.
+          file: { type: ['string', 'null'], minLength: 1, maxLength: 500 },
+          line: { type: ['integer', 'null'], minimum: 1 },
           description: { type: 'string', minLength: 1, maxLength: 4000 },
           // `checkReviewValue` refuses a blocking finding with an empty
           // recommendation, so the constrained channel must refuse one too.
@@ -541,7 +544,7 @@ export function checkReviewValue(
   value: unknown,
   blockingSeverities: readonly string[] = ['critical', 'high'],
 ): { verdict: Review['verdict']; summary: string; findings: ReviewFinding[] } {
-  const checked = REVIEW_SCHEMA.safeParse(value);
+  const checked = REVIEW_SCHEMA.safeParse(stripNulls(value));
   if (!checked.success) return invalidReview(checked.error.issues[0]?.message);
   const findings = checked.data.findings as ReviewFinding[];
   const blocking = findings.filter((finding) => blockingSeverities.includes(finding.severity));

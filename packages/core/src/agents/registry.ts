@@ -48,6 +48,7 @@ export type AgentFailureKind =
   | 'unavailable'
   | 'timeout'
   | 'protocol'
+  | 'schema_rejected'
   | 'agent_failure';
 
 /** Failure kinds that describe provider/infrastructure state, never the source. */
@@ -58,6 +59,7 @@ export const INFRASTRUCTURE_FAILURE_KINDS: readonly AgentFailureKind[] = [
   'timeout',
   'session_invalid',
   'protocol',
+  'schema_rejected',
 ];
 
 /**
@@ -78,6 +80,22 @@ const QUOTA_PATTERNS = [
 ];
 
 /**
+ * The provider refused the OUTPUT SCHEMA Jarvis sent, before the model ran.
+ *
+ * Codex `--output-schema` compiles to OpenAI Structured Outputs in strict mode,
+ * which rejects a schema that omits a `properties` key from `required`, uses
+ * `oneOf`, or is not rooted in an object. That is a defect in a Jarvis schema,
+ * not provider state and emphatically not the reviewed code — so it gets its
+ * own kind rather than hiding inside `agent_failure`, where it read as "the
+ * agent reported an error" and cost a reviewer attempt with no explanation.
+ */
+const SCHEMA_REJECTED_PATTERNS = [
+  /invalid_json_schema/i,
+  /invalid schema for (?:response_format|function|output)/i,
+  /schema (?:is )?(?:invalid|not supported|unsupported)/i,
+];
+
+/**
  * A persisted provider session that can no longer be resumed. Distinguished
  * from a generic failure so recovery can retire the session id and try ONCE in
  * a fresh context instead of replaying the same broken thread forever.
@@ -94,6 +112,9 @@ export function classifyAgentFailure(
   if (result.status === 'cancelled') return 'cancelled';
   if (result.status === 'timeout') return 'timeout';
   const error = result.error ?? '';
+  // Before everything else: this one is OUR bug, and several of its phrasings
+  // ("invalid schema ... not supported") would otherwise land in `unavailable`.
+  if (SCHEMA_REJECTED_PATTERNS.some((pattern) => pattern.test(error))) return 'schema_rejected';
   if (QUOTA_PATTERNS.some((pattern) => pattern.test(error))) return 'quota';
   if (/cooldown/i.test(error)) return 'cooldown';
   // Auth outages are provider health, not a stale thread id: "your session has
@@ -143,6 +164,8 @@ export function describeAgentFailure(kind: AgentFailureKind, error: string | und
       return 'The provider run exceeded its time budget.';
     case 'protocol':
       return 'The provider produced an unusable structured response.';
+    case 'schema_rejected':
+      return 'Schema rejected by provider: the output schema Jarvis sent was refused before the model ran. This is a Jarvis schema defect, not provider state and not a problem with the code.';
     case 'cancelled':
       return 'The run was cancelled.';
     default:
@@ -348,6 +371,9 @@ export class AgentRegistry {
         payload: {
           provider,
           kind,
+          // The one-line human reading of `kind`, so an event is legible without
+          // re-deriving it — "schema rejected by provider" above all.
+          detail: describeAgentFailure(kind, result.error),
           ...(reset ? { reportedReset: reset } : {}),
           // Said out loud because the previous behaviour was the opposite.
           routingBlocked: false,

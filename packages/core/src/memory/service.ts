@@ -725,6 +725,7 @@ export class MemoryService {
         signals: {
           ...(lex !== undefined ? { lexical: lex } : {}),
           ...(sem !== undefined ? { semantic: sem } : {}),
+          relevance,
           subjectMatch,
           scopePriority,
           importance: memory.importance,

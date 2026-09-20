@@ -11,6 +11,13 @@ export interface ExplicitCommand {
   action: 'remember' | 'forget' | 'update';
   /** Text after the trigger phrase, i.e. the thing to remember/forget. */
   payload: string;
+  /**
+   * The trigger was a discourse marker ("actually", "en fait", "correction"),
+   * not an unambiguous memory command. The caller may only act on it when it
+   * can point at an existing memory the text is clearly about; otherwise the
+   * message is an ordinary turn that happens to start with the word.
+   */
+  tentative?: boolean;
 }
 
 // French + English triggers. Ordered longest-first so "n'oublie plus" doesn't
@@ -22,24 +29,58 @@ const REMEMBER_TRIGGERS = [
   /^\s*(?:jarvis[,: ]+)?save\s+this[:\s]+(.+)$/i,
   /^\s*(?:jarvis[,: ]+)?retiens\s+(?:que\s+)?(.+)$/i,
   /^\s*(?:jarvis[,: ]+)?souviens[- ]toi\s+(?:que\s+)?(.+)$/i,
-  /^\s*(?:jarvis[,: ]+)?n['’]oublie\s+pas\s+(?:que\s+)?(.+)$/i,
+  // The "n'" is optional: spoken French drops it, and "oublie pas que X" means
+  // remember X, never forget it.
+  /^\s*(?:jarvis[,: ]+)?(?:n['’]\s*)?oublie\s+pas\s+(?:que\s+)?(.+)$/i,
 ];
 
 const FORGET_TRIGGERS = [
   /^\s*(?:jarvis[,: ]+)?forget\s+(?:about\s+|that\s+)?(.+)$/i,
   /^\s*(?:jarvis[,: ]+)?stop\s+remembering\s+(.+)$/i,
-  /^\s*(?:jarvis[,: ]+)?oublie\s+(?:que\s+)?(.+)$/i,
+  // "oublie pas que …" is colloquial French for "n'oublie pas que …" — a
+  // remember with the negation dropped, and the exact opposite of a forget.
+  // Only the negation-free "oublie X" deletes anything.
+  /^\s*(?:jarvis[,: ]+)?oublie\s+(?!pas\b)(?:que\s+)?(.+)$/i,
 ];
 
 const UPDATE_TRIGGERS = [
   /^\s*(?:jarvis[,: ]+)?update\s+what\s+you\s+(?:remember|know)\s+about\s+(.+)$/i,
+];
+
+/**
+ * Correction markers, which are ordinary discourse far more often than they are
+ * memory commands: "En fait, peux-tu m'expliquer X ?" and "Actually, fix the
+ * bug in Jarvis" both open with one and neither corrects a stored fact.
+ *
+ * A match here is `tentative`: the text still has to read as a statement (no
+ * question, no request to do something), and the caller still has to find a
+ * memory it is clearly about before anything is overwritten.
+ */
+const SOFT_UPDATE_TRIGGERS = [
   /^\s*(?:jarvis[,: ]+)?actually[,:]?\s+(.+)$/i,
   /^\s*(?:jarvis[,: ]+)?correction[:\s]+(.+)$/i,
   /^\s*(?:jarvis[,: ]+)?en\s+fait[,:]?\s+(.+)$/i,
 ];
 
+/** Interrogative openings, for the questions that carry no question mark. */
+const QUESTION_OPENERS =
+  /^(?:est[- ]ce\s+que|qu[' ’]?est[- ]ce|peux[- ]tu|pourrais[- ]tu|saurais[- ]tu|pourquoi|comment|quand|combien|quel|quelle|quels|quelles|can\s+you|could\s+you|would\s+you|do\s+you|did\s+you|are\s+you|is\s+there|are\s+there|what|why|how|when|which|who)\b/;
+
+/** Verbs that make the sentence a request to act, not a statement of fact. */
+const ACTION_OPENERS =
+  /^(?:please\s+|s[' ’]il\s+te\s+plait\s*,?\s*|stp\s*,?\s*)?(?:fix|repair|debug|add|implement|create|make|build|run|execute|write|refactor|deploy|delete|remove|rename|check|review|show|explain|open|close|start|stop|help|find|search|list|give|send|install|test|update\s+the|corrige|repare|ajoute|implemente|cree|creer|fais|faire|construis|lance|execute|ecris|refactorise|deploie|supprime|enleve|renomme|verifie|regarde|montre|explique|ouvre|ferme|demarre|arrete|aide|trouve|cherche|liste|donne|envoie|installe|teste|mets|met|passe)\b/;
+
+/** A trailing "?" is the one unambiguous marker, in both languages. */
+function endsWithQuestion(text: string): boolean {
+  return /[?？]\s*$/.test(text);
+}
+
 export function detectExplicitCommand(text: string): ExplicitCommand | null {
   const line = text.trim();
+  // A question asks ABOUT memory, it never commands one: "Remember the
+  // meeting?" wants an answer, not a write.
+  if (endsWithQuestion(line)) return null;
+
   for (const re of FORGET_TRIGGERS) {
     const m = re.exec(line);
     if (m?.[1]) return { action: 'forget', payload: m[1].trim() };
@@ -47,6 +88,14 @@ export function detectExplicitCommand(text: string): ExplicitCommand | null {
   for (const re of UPDATE_TRIGGERS) {
     const m = re.exec(line);
     if (m?.[1]) return { action: 'update', payload: m[1].trim() };
+  }
+  for (const re of SOFT_UPDATE_TRIGGERS) {
+    const m = re.exec(line);
+    if (!m?.[1]) continue;
+    const payload = m[1].trim();
+    const folded = foldAccents(payload);
+    if (QUESTION_OPENERS.test(folded) || ACTION_OPENERS.test(folded)) return null;
+    return { action: 'update', payload, tentative: true };
   }
   for (const re of REMEMBER_TRIGGERS) {
     const m = re.exec(line);

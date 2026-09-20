@@ -8,10 +8,10 @@ import type { EventBus } from '../events/bus.js';
 import type { AgentRegistry } from '../agents/registry.js';
 import { classifyAgentFailure, describeAgentFailure } from '../agents/registry.js';
 import type { AgentEvent, AgentRunResult } from '../agents/types.js';
-import type { ContextPackBuilder } from '../context/pack.js';
+import { estimateTokens, type ContextPackBuilder } from '../context/pack.js';
 import type { MemoryService } from '../memory/service.js';
 import type { Memory, MemoryScope } from '../memory/types.js';
-import { classifyExplicitMemory, detectExplicitCommand } from '../memory/policy.js';
+import { classifyExplicitMemory, detectExplicitCommand, foldAccents } from '../memory/policy.js';
 import { renderProjectRegistry, type Project, type ProjectService } from '../projects/service.js';
 import type { Job, JobService } from '../jobs/service.js';
 import { JobBriefCompiler, type CompiledJobBrief } from '../jobs/brief.js';
@@ -77,6 +77,10 @@ export interface ChatTurn {
 
 /** Reasonable ceiling on transcript turns handed to the model. */
 const CONTEXT_TURNS = 12;
+
+/** Ways of saying "the project we are in" without naming it. Accent-folded. */
+const PROJECT_DEIXIS =
+  /\b(?:ce projet|le projet|ce depot|le depot|ce repo|le repo|cette appli|cette application|this project|the project|this repo(?:sitory)?|the repo(?:sitory)?|this codebase|the codebase)\b/;
 
 /**
  * Execution statuses that mean the tool never ran.
@@ -192,7 +196,13 @@ export class ChatService {
     // provider quota to decide whether "remember that I prefer pnpm" is a memory
     // command is exactly the pattern the design forbids.
     const explicit = detectExplicitCommand(text);
-    if (explicit) return this.handleMemoryCommand(conversation.id, explicit, userMessage);
+    if (explicit) {
+      const settled = await this.handleMemoryCommand(conversation.id, explicit, userMessage);
+      // A tentative "actually …" that matched nothing Jarvis remembers was
+      // never a memory command: it is an ordinary turn and still needs an
+      // answer. Falling through here is the whole reason this returns null.
+      if (settled) return settled;
+    }
 
     return this.handleTurn(conversation.id, userMessage);
   }
@@ -413,11 +423,10 @@ export class ChatService {
     }
     // Memory commands never reach the tool boundary — they are handled
     // deterministically in `send` — so they have no execution row to inspect.
-    if (
-      doomed.some(
-        (message) => message.role === 'user' && detectExplicitCommand(message.content) !== null,
-      )
-    ) {
+    // The assistant row they produced is the record that one ran: re-detecting
+    // on the user's text would also refuse a "actually …" that turned out to be
+    // ordinary conversation and wrote nothing.
+    if (doomed.some((message) => message.metadata.activity === 'memory')) {
       throw new Error('that branch changed memory; undo the memory change before editing');
     }
     // Nothing here ran, so nothing may run later either: an approval dialog for
@@ -440,11 +449,20 @@ export class ChatService {
 
   // ------------------------------------------------------------- memory path --
 
+  /**
+   * Run a detected memory command, or hand the turn back.
+   *
+   * Returns null when the trigger was only `tentative` — "actually", "en fait",
+   * "correction" — and no stored memory is clearly the subject of it. Those
+   * words open ordinary sentences constantly, and treating every one of them as
+   * a write meant "En fait, peux-tu m'expliquer X" silently overwrote whatever
+   * ranked first and was never answered.
+   */
   private async handleMemoryCommand(
     conversationId: string,
     explicit: ReturnType<typeof detectExplicitCommand> & object,
     userMessage: Message,
-  ): Promise<ChatTurn> {
+  ): Promise<ChatTurn | null> {
     const { memory, sessions } = this.deps;
     const conversation = sessions.get(conversationId);
     const projectId = conversation?.projectId ?? null;
@@ -454,10 +472,10 @@ export class ChatService {
     ];
 
     if (explicit.action === 'remember') {
-      const scope: MemoryScope = projectId ? 'project' : 'user';
+      const scope = this.rememberScope(projectId, explicit.payload);
       const outcome = await memory.remember({
         scope,
-        scopeId: projectId,
+        scopeId: scope === 'project' ? projectId : null,
         kind: classifyExplicitMemory(explicit.payload, scope),
         content: explicit.payload,
         sourceType: 'user_explicit',
@@ -500,26 +518,70 @@ export class ChatService {
       );
     }
 
+    // Ranked first is not the same as "about this". `score` folds in pinning,
+    // importance and scope priority, so the best-ranked row of an unrelated
+    // query is still a row — which is exactly how a bare "actually" used to
+    // overwrite the most important memory in the database.
     const matches = await memory.retrieve({ query: explicit.payload, scopes, limit: 3 });
-    const target = matches[0];
-    if (target) {
-      await memory.correct(target.memory.id, explicit.payload, { sessionId: conversationId });
+    const target = matches.find(
+      (match) => match.signals.relevance >= this.deps.config.memory.correctionRelevance,
+    );
+
+    if (!target) {
+      if (explicit.tentative) return null;
+      const scope = this.rememberScope(projectId, explicit.payload);
+      await memory.remember({
+        scope,
+        scopeId: scope === 'project' ? projectId : null,
+        kind: 'correction',
+        content: explicit.payload,
+        sourceType: 'user_explicit',
+        sourceRef: { sessionId: conversationId },
+        explicit: true,
+      });
+      return this.finishMemoryTurn(conversationId, userMessage, 'Noted as a new memory.');
+    }
+
+    // Pinning is the user saying "keep this one". A word like "actually" is not
+    // an instruction to overwrite it, so this path asks instead. The explicit
+    // "update what you remember about …" is the way to say it on purpose.
+    if (target.memory.pinned && explicit.tentative) {
       return this.finishMemoryTurn(
         conversationId,
         userMessage,
-        'Updated — the previous version is kept as superseded.',
+        `That reads like a correction to a pinned memory: “${target.memory.content}”. ` +
+          'I left it alone. Say “update what you remember about …” to overwrite it on purpose, ' +
+          'or forget it first.',
       );
     }
-    await memory.remember({
-      scope: projectId ? 'project' : 'user',
-      scopeId: projectId,
-      kind: 'correction',
-      content: explicit.payload,
-      sourceType: 'user_explicit',
-      sourceRef: { sessionId: conversationId },
-      explicit: true,
-    });
-    return this.finishMemoryTurn(conversationId, userMessage, 'Noted as a new memory.');
+
+    await memory.correct(target.memory.id, explicit.payload, { sessionId: conversationId });
+    return this.finishMemoryTurn(
+      conversationId,
+      userMessage,
+      'Updated — the previous version is kept as superseded.',
+    );
+  }
+
+  /**
+   * Which scope an explicit remember belongs to.
+   *
+   * A conversation being linked to a project is not evidence that what the user
+   * asked Jarvis to remember is ABOUT that project: "retiens que je préfère
+   * pnpm" is a fact about the human, and filing it under the project hides it
+   * from every other conversation. Project scope has to be earned by the
+   * content naming the project — by name, by an alias the user registered, or
+   * by saying "this project" outright.
+   */
+  private rememberScope(projectId: string | null, content: string): MemoryScope {
+    if (!projectId) return 'user';
+    const text = foldAccents(content);
+    const project = this.deps.projects.get(projectId);
+    const names = [project?.name, ...(project?.aliases ?? [])]
+      .filter((name): name is string => Boolean(name))
+      .map(foldAccents);
+    if (names.some((name) => name.length > 1 && text.includes(name))) return 'project';
+    return PROJECT_DEIXIS.test(text) ? 'project' : 'user';
   }
 
   private finishMemoryTurn(conversationId: string, userMessage: Message, reply: string): ChatTurn {
@@ -1551,28 +1613,10 @@ export class ChatService {
     // resolved for this turn: the model should never have to ask where a
     // registered repository lives, and it cannot know what it is not told.
     const registry = renderProjectRegistry(this.deps.projects.list({ status: 'active' }));
-    const transcript = this.deps.sessions
-      .recentMessages(conversationId, CONTEXT_TURNS)
-      .filter((message) => message.content.trim())
-      .map((message) => {
-        if (message.role === 'assistant') {
-          // A model may quote a hostile calendar value in an ordinary answer,
-          // not only in a calendar tool result. Assistant output is therefore
-          // never replayed as trusted prompt prose; calendar actions retain a
-          // more specific label for the model's benefit.
-          const calendar = isCalendarActivity(message.metadata.activity);
-          const tag = calendar ? 'untrusted-calendar-observation' : 'untrusted-assistant-output';
-          const source = calendar
-            ? 'previous calendar provider observation'
-            : 'previous assistant output; may quote untrusted provider data';
-          return `<${tag}${calendar ? ' history="true"' : ''}>\n${renderCalendarObservation({
-            source,
-            content: message.content,
-          })}\n</${tag}>`;
-        }
-        return `${message.role === 'user' ? 'User' : 'Jarvis'}: ${message.content}`;
-      })
-      .join('\n\n');
+    const transcript = renderTranscript(
+      this.deps.sessions.recentMessages(conversationId, CONTEXT_TURNS),
+      this.deps.config.context.budgetTokens,
+    );
 
     const linked = this.deps.jobs
       .list({ sessionId: conversationId, archived: 'all', limit: 5 })
@@ -1749,4 +1793,62 @@ function isCalendarActivity(value: unknown): boolean {
     value === 'update_calendar_event' ||
     value === 'delete_calendar_event'
   );
+}
+
+/**
+ * Make text inert inside the untrusted markers without changing what it says.
+ *
+ * Escaping `<`, `>` and `&` is all that is needed: nothing in the content can
+ * then close the surrounding tag or open a new one. Newlines and length are
+ * deliberately left alone — an answer is only useful as context if it is still
+ * the answer.
+ */
+function escapeForPrompt(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** One transcript entry, already inert. */
+function renderTranscriptMessage(message: Message): string {
+  if (message.role !== 'assistant') {
+    return `${message.role === 'user' ? 'User' : 'Jarvis'}: ${message.content}`;
+  }
+  // Calendar activity keeps the JSON-observation treatment: that content is
+  // provider data Jarvis relayed, it is one line of values by construction, and
+  // the 500-character cap is part of `sanitizeCalendarText`'s job.
+  if (isCalendarActivity(message.metadata.activity)) {
+    return `<untrusted-calendar-observation history="true">\n${renderCalendarObservation({
+      source: 'previous calendar provider observation',
+      content: message.content,
+    })}\n</untrusted-calendar-observation>`;
+  }
+  // Ordinary assistant output is still untrusted — it may quote a hostile
+  // calendar value — but it is prose the user is replying to. It used to go
+  // through the same calendar renderer, which cut it at 500 characters and
+  // flattened every newline, so multi-turn context lost every long answer and
+  // every code block. Escaping is the protection; truncation was never it.
+  return `<untrusted-assistant-output>
+${escapeForPrompt(message.content)}
+</untrusted-assistant-output>`;
+}
+
+/**
+ * Replay the recent transcript under one token ceiling for the whole thing.
+ *
+ * Newest first, so what falls off the end is the oldest turn rather than the
+ * answer the user is replying to. The most recent message is always kept, even
+ * when it alone is over budget: a prompt with no transcript at all is worse
+ * than a long one.
+ */
+function renderTranscript(messages: Message[], budgetTokens: number): string {
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message?.content.trim()) continue;
+    const text = renderTranscriptMessage(message);
+    used += estimateTokens(text);
+    if (used > budgetTokens && kept.length > 0) break;
+    kept.push(text);
+  }
+  return kept.reverse().join('\n\n');
 }

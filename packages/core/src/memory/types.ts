@@ -89,6 +89,14 @@ export interface RetrievedMemory {
   signals: {
     lexical?: number;
     semantic?: number;
+    /**
+     * The fused topical match alone, before scope priority, importance,
+     * confidence, pinning and freshness are folded into `score`. This is the
+     * only signal that answers "is this memory about that text?" — `score`
+     * deliberately ranks a pinned or important memory higher whether or not it
+     * matched anything.
+     */
+    relevance: number;
     subjectMatch?: boolean;
     scopePriority: number;
     importance: number;

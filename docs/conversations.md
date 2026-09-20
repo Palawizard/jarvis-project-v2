@@ -27,7 +27,14 @@ Every message you send takes exactly one of these paths.
 1. **Explicit memory command** — `remember …`, `forget …`, `update …`. Handled
    deterministically and locally. No model call, so no provider quota is spent
    deciding that "remember that I prefer pnpm" is a memory command. An ambiguous
-   `forget` renders the exact candidates in chat rather than guessing.
+   `forget` renders the exact candidates in chat rather than guessing. A
+   question is never one of these: "Remember the meeting?" asks about memory
+   and is answered, not written. The correction markers — "actually", "en
+   fait", "correction" — only take this path when the sentence states a fact
+   **and** a stored memory is clearly about it; see
+   [memory.md](memory.md#write-policy). Everything else they open ("En fait,
+   peux-tu m'expliquer X ?", "Actually, fix the bug in Jarvis") is an ordinary
+   message and takes one of the paths below.
 2. **A code change** — a message that tells Jarvis to change the source of a
    registered repository: "implémente OAuth dans Sitepilot", "code sur le projet
    Jarvis …", "fix this bug in Jarvis". Jarvis creates exactly one Job and
@@ -357,6 +364,24 @@ everything it knows about a repository, Jarvis handed it.
 Per-turn resolution is not conversation affinity. Mentioning a project in a
 question enriches that turn's context; it does not change what the conversation
 is about. Affinity is only written when a Job really exists.
+
+## What the conversation remembers of itself
+
+The recent turns are replayed into the next prompt. Anything Jarvis said is
+replayed inside an `untrusted-assistant-output` marker with `<`, `>` and `&`
+escaped, because a model may quote a hostile calendar value in an ordinary
+answer as easily as in a tool result: nothing in a previous reply can close the
+marker or read as Jarvis's own policy. Messages produced by a calendar action
+keep the stricter JSON-observation form, which is bounded provider data by
+construction.
+
+What escaping does **not** do is shorten the answer. The replay is capped once,
+for the whole history, by the same estimated-token budget the context pack uses
+— never per message. A per-message cap is what a previous version did, and at
+500 characters with newlines collapsed it meant every long explanation and
+every code block was gone by the follow-up question. Under a whole-history
+budget the oldest turn falls off the end instead, and the answer you are
+replying to arrives intact.
 
 ## The four layers of memory
 

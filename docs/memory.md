@@ -17,6 +17,15 @@ Durable records include scope, kind, optional structured subject, content, impor
 
 Deterministic commands (`remember`, `forget`, `update`) are handled locally. Explicit remember classification recognizes English/French preference, constraint, and decision markers; unmarked project statements become project knowledge and unmarked user statements facts. It never calls an agent.
 
+Detection is deliberately conservative, because a false positive here writes to durable memory and swallows the turn:
+
+- A message ending in `?` is never a command. "Remember the meeting?" and "Tu te souviens de la réunion ?" ask about memory; they are answered.
+- `oublie pas que …` is a remember, not a forget. Spoken French drops the `n'`, and only the negation-free `oublie …` deletes anything.
+- The correction markers `actually`, `en fait` and `correction` are *tentative*. They act as an update only when the sentence states a fact — no question, no request to act — **and** retrieval returns a memory whose topical relevance (`signals.relevance`, which excludes the pinning, importance and scope priors folded into `score`) reaches `memory.correctionRelevance`. Otherwise the message is ordinary conversation and is routed and answered normally. "Actually, fix the bug in Jarvis" and "En fait, peux-tu m'expliquer X ?" write nothing.
+- A tentative correction never overwrites a **pinned** memory. Jarvis says which one it would have replaced and leaves it alone; `update what you remember about …` is how to mean it on purpose.
+
+An explicit remember is scoped by its content, not by the conversation. A project-linked conversation does not make "retiens que je préfère pnpm" project knowledge — that is a fact about the user, and filing it under one repository hides it everywhere else. Project scope requires the content to name the project, one of its registered aliases, or "this project"/"ce projet".
+
 Forget auto-deletes only an explicit in-scope memory ID or a unique exact normalized subject/content. Fuzzy or duplicate matches return auditable candidates for user choice and delete nothing.
 
 Automatic writes are thresholded, normalized, exact/near deduplicated, scope-checked, and secret-scanned. Explicit requests bypass importance thresholds but never the secret gate. Routine transcripts, command logs, source files, and credentials do not become memories.

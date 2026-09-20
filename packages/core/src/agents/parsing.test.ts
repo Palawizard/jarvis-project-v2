@@ -493,6 +493,11 @@ describe('explicit memory command detection (Stage A, no LLM)', () => {
     ['oublie que j utilise npm', 'forget', 'j utilise npm'],
     ['update what you remember about my editor', 'update', 'my editor'],
     ['actually I use bun now', 'update', 'I use bun now'],
+    // Spoken French drops the "n'". It still means remember, not forget.
+    ['Oublie pas que le build casse sur Windows', 'remember', 'le build casse sur Windows'],
+    ['oublie le vieux script de déploiement', 'forget', 'le vieux script de déploiement'],
+    ['En fait je préfère pnpm', 'update', 'je préfère pnpm'],
+    ['Correction : le port de dev est 5174', 'update', 'le port de dev est 5174'],
   ];
 
   for (const [input, action, payload] of cases) {
@@ -506,6 +511,32 @@ describe('explicit memory command detection (Stage A, no LLM)', () => {
   it('does not fire on an ordinary development request', () => {
     expect(detectExplicitCommand('Add a dark mode toggle to the settings page')).toBeNull();
     expect(detectExplicitCommand('Can you fix the failing build?')).toBeNull();
+  });
+
+  it('marks a correction marker tentative and an unambiguous command not', () => {
+    expect(detectExplicitCommand('actually I use bun now')?.tentative).toBe(true);
+    expect(detectExplicitCommand('En fait je préfère pnpm')?.tentative).toBe(true);
+    expect(detectExplicitCommand('Correction : le port de dev est 5174')?.tentative).toBe(true);
+    expect(
+      detectExplicitCommand('update what you remember about my editor')?.tentative,
+    ).toBeUndefined();
+    expect(detectExplicitCommand('remember that I prefer pnpm')?.tentative).toBeUndefined();
+  });
+
+  it.each([
+    // A question asks ABOUT memory; it never writes one.
+    'Remember the meeting?',
+    'Jarvis, remember that dinner on Friday?',
+    'Tu te souviens de la réunion ?',
+    // A correction marker in front of a question or a request to act is
+    // ordinary conversation, and used to silently overwrite a memory instead.
+    "En fait, peux-tu m'expliquer les embeddings ?",
+    'Actually, fix the bug in Jarvis',
+    'En fait, corrige le bug du chat',
+    'Actually can you explain how retrieval ranks memories',
+    'En fait, ajoute un bouton sombre',
+  ])('does not treat %j as a memory command', (input) => {
+    expect(detectExplicitCommand(input)).toBeNull();
   });
 });
 

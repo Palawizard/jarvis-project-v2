@@ -58,6 +58,15 @@ export interface JarvisConfig {
     semanticMargin: number;
     embeddingsEnabled: boolean;
     embeddingModel: string;
+    /**
+     * How topically relevant the best retrieved memory must be before a bare
+     * "actually …" / "en fait …" is allowed to rewrite it. Measured on
+     * `RetrievedMemory.signals.relevance`, never on `score`: pinning and
+     * importance must not make an unrelated memory the target of a correction.
+     * ~0.5 means two distinct matching terms, a strong semantic hit, or an
+     * exact structured subject match.
+     */
+    correctionRelevance: number;
     /** Max characters stored for a single memory's content. */
     maxContentChars: number;
     /** Hard cap on Layer-2 core user memories kept active. */
@@ -209,6 +218,7 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
       dedupeLexical: envFloat('JARVIS_MEMORY_DEDUPE_LEXICAL', 0.8),
       semanticFloor: envFloat('JARVIS_MEMORY_SEMANTIC_FLOOR', 0.2),
       semanticMargin: envFloat('JARVIS_MEMORY_SEMANTIC_MARGIN', 0.06),
+      correctionRelevance: envFloat('JARVIS_MEMORY_CORRECTION_RELEVANCE', 0.5),
       embeddingsEnabled: envBool('JARVIS_EMBEDDINGS', true),
       embeddingModel: process.env.JARVIS_EMBEDDING_MODEL || 'Xenova/multilingual-e5-small',
       maxContentChars: envInt('JARVIS_MEMORY_MAX_CONTENT_CHARS', 1200),

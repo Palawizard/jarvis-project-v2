@@ -7,7 +7,7 @@ queued -> planning -> implementing -> verifying
                                 |         `-> verification fixer (bounded) --+
                                 |                                             |
                                 +----> reviewing <----------------------------+
-                                          | critical/high
+                                          | critical/high/medium
                                           v
                                      code fixer --commit--> verifying (max 2)
                                           |
@@ -154,7 +154,7 @@ Review runs in a fresh, read-only provider context with the original request, ac
 
 The review answer arrives through the provider's own constrained-output channel (`--json-schema` / `--output-schema`), with the terminal fenced block kept as a fallback for a CLI that cannot be constrained or that answers in prose anyway. Both paths end at the same strict validation, so nothing is loosened: a contradictory verdict, a blocking finding with no recommendation, or an answer that fails the schema is a protocol error, which is **infrastructure** — it consumes no review repair cycle, marks no HEAD as reviewed, and invalidates no verification evidence. The schema file is written under the artifacts directory, never into the candidate worktree. Every schema handed to a provider is written for STRICT Structured Outputs — root object, `additionalProperties: false`, every `properties` key listed in `required`, no `oneOf` — because Codex refuses anything else with `invalid_json_schema` before the model runs and the whole attempt is spent. An optional field is therefore spelled required-and-nullable, and the provider's `null` is normalized back to absence before the trusted Zod parse. `strict-schema.test.ts` asserts those rules over every exported provider schema.
 
-Structured severity, not the reviewer's prose/verdict alone, determines blocking. Code defaults to `critical,high`; medium/low/info remain persisted advisory findings. A source change clears the reviewed HEAD identity, so a new deterministic verification and independent review are mandatory. Limits are configurable through `JARVIS_MAX_REVIEW_FIX_CYCLES` (default 1 batch fixer) and `JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES`.
+Structured severity, not the reviewer's prose/verdict alone, determines blocking. Code defaults to `critical,high,medium`; only low/info remain persisted advisory findings. `codeReviewBlockingSeverities` is the single source of truth: the reviewer prompt defines each severity from it and names which ones block, the derivation in `review/engine.ts`, the pipeline's fixer gate and the Job view's blocking/advisory labels all read that one list. The model's own `verdict` field decides nothing — when it claims `approve` while the severities it reported derive `request_changes`, Jarvis emits `review.verdict.overridden` with the severities in question and the Job view says the gate corrected the reviewer. A source change clears the reviewed HEAD identity, so a new deterministic verification and independent review are mandatory. Limits are configurable through `JARVIS_MAX_REVIEW_FIX_CYCLES` (default 1 batch fixer) and `JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES`.
 
 ### HEAD-bound evidence and repair budgets
 

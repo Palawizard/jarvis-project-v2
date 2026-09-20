@@ -55,9 +55,11 @@ export interface ReviewOptions {
 }
 
 const MAX_DIFF_CHARS = 120_000;
+/** Every severity the reviewer may report, worst first. */
+const SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
 const FINDING_SCHEMA = z
   .object({
-    severity: z.enum(['critical', 'high', 'medium', 'low', 'info']),
+    severity: z.enum(SEVERITIES),
     category: z.enum(['correctness', 'security', 'design', 'tests', 'performance', 'style']),
     file: z.string().trim().min(1).optional(),
     line: z.number().int().positive().optional(),
@@ -217,7 +219,7 @@ export class ReviewEngine {
       return review;
     }
 
-    const prompt = buildReviewPrompt(opts);
+    const prompt = buildReviewPrompt(opts, this.config.pipeline.codeReviewBlockingSeverities);
     // The schema file lives in the artifacts directory, NEVER in the candidate
     // worktree: a file written there would show up as an uncommitted change and
     // the candidate-identity assertions would (correctly) refuse the review.
@@ -340,10 +342,7 @@ export class ReviewEngine {
         .prepare(`UPDATE agent_runs SET status='failed', error=? WHERE id=?`)
         .run(`protocol failure: ${protocolError}`, runId);
     }
-    const blocking = parsed.findings.some((finding) =>
-      this.config.pipeline.codeReviewBlockingSeverities.includes(finding.severity),
-    );
-    const verdict = parsed.verdict === 'error' ? 'error' : blocking ? 'request_changes' : 'approve';
+    const verdict = parsed.verdict;
     const review = this.persist({
       jobId: opts.jobId,
       runId,
@@ -354,6 +353,22 @@ export class ReviewEngine {
       headRef: opts.headRef,
       blocking: verdict !== 'approve',
     });
+    // The model said "approve" and the severities it itself reported say
+    // otherwise. The gate already won -- this only makes that visible, instead
+    // of leaving a request_changes whose reviewer claimed the opposite.
+    if (verdict === 'request_changes' && parsed.claimedVerdict === 'approve') {
+      this.bus?.emit({
+        type: 'review.verdict.overridden',
+        jobId: opts.jobId,
+        runId,
+        payload: {
+          claimed: 'approve',
+          verdict,
+          severities: parsed.blockingSeverities,
+          provider: routed.provider.id,
+        },
+      });
+    }
     this.bus?.emit({
       type: 'review.completed',
       jobId: opts.jobId,
@@ -439,7 +454,7 @@ function reviewSignals(opts: ReviewOptions): TaskSignals {
   };
 }
 
-function buildReviewPrompt(opts: ReviewOptions): string {
+function buildReviewPrompt(opts: ReviewOptions, blockingSeverities: readonly string[]): string {
   const diff =
     opts.diff.length > MAX_DIFF_CHARS
       ? `${opts.diff.slice(0, MAX_DIFF_CHARS)}\n[diff truncated]`
@@ -501,8 +516,46 @@ ONE fenced json block and nothing else after it:
 }
 \`\`\`
 
-Use "approve" only if there are no critical or high findings. An empty findings
-array is a valid and common answer for a clean change.`;
+## Severity — classify by impact, not by the verdict you want
+
+- critical: exploitable security hole, data loss/corruption, or the change is
+  broken in its main path. Example: a mutation route that skips the permission
+  boundary; a migration that drops rows.
+- high: a real defect that will bite in normal use, or a missing test for the
+  behaviour this change exists to add. Example: an unhandled rejection that
+  leaves a job stuck; an off-by-one in a budget check.
+- medium: a genuine correctness, security-hardening, design or test gap that a
+  maintainer would ask to be fixed before merge, but that does not break the
+  main path today. Example: an error swallowed so a failure surfaces as a
+  silent no-op; a race only reachable under load; validation missing on a
+  second, less-used call site.
+- low: it works and is not wrong; a maintainer might mention it in passing.
+  Example: a slightly awkward name, a redundant local.
+- info: an observation with no requested change.
+
+${blockingSeverities.join(', ')} are BLOCKING here: any one of them sends the
+change back to a fixer. ${SEVERITIES.filter((severity) => !blockingSeverities.includes(severity)).join(', ')} are advisory
+and recorded, not acted on.
+
+Classify honestly. Do not downgrade a real finding to reach "approve" — the
+verdict field does not decide anything: Jarvis derives the verdict from the
+severities you report, and a downgrade only hides a defect it would have fixed.
+Reporting nothing when there is nothing is the expected answer for a clean
+change, and an empty findings array is common and welcome.
+
+Set "verdict" to "request_changes" if you report any ${blockingSeverities.join('/')} finding,
+otherwise "approve".`;
+}
+
+/** The derived verdict, plus what the model claimed and the severities that decided. */
+export interface ParsedReview {
+  verdict: Review['verdict'];
+  /** The model's own verdict field; null when the answer was not a review at all. */
+  claimedVerdict: Review['verdict'] | null;
+  /** Distinct configured-blocking severities actually present in `findings`. */
+  blockingSeverities: string[];
+  summary: string;
+  findings: ReviewFinding[];
 }
 
 /**
@@ -513,12 +566,8 @@ array is a valid and common answer for a clean change.`;
  */
 export function parseReviewOutput(
   text: string,
-  blockingSeverities: readonly string[] = ['critical', 'high'],
-): {
-  verdict: Review['verdict'];
-  summary: string;
-  findings: ReviewFinding[];
-} {
+  blockingSeverities: readonly string[],
+): ParsedReview {
   const match = text.trim().match(/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/);
   const block = match?.[1];
   if (!block) return invalidReview('expected exactly one terminal JSON block');
@@ -542,8 +591,8 @@ export function parseReviewOutput(
  */
 export function checkReviewValue(
   value: unknown,
-  blockingSeverities: readonly string[] = ['critical', 'high'],
-): { verdict: Review['verdict']; summary: string; findings: ReviewFinding[] } {
+  blockingSeverities: readonly string[],
+): ParsedReview {
   const checked = REVIEW_SCHEMA.safeParse(stripNulls(value));
   if (!checked.success) return invalidReview(checked.error.issues[0]?.message);
   const findings = checked.data.findings as ReviewFinding[];
@@ -556,6 +605,10 @@ export function checkReviewValue(
   }
   return {
     verdict: blocking.length ? 'request_changes' : 'approve',
+    // What the model CLAIMED, kept only so the gate can report when it had to
+    // disagree. It is never what decides.
+    claimedVerdict: checked.data.verdict as Review['verdict'],
+    blockingSeverities: [...new Set(blocking.map((finding) => finding.severity))],
     summary: checked.data.summary,
     findings,
   };
@@ -625,13 +678,11 @@ function hasDuplicateJsonKeys(text: string): boolean {
   return duplicate;
 }
 
-function invalidReview(detail?: string): {
-  verdict: 'error';
-  summary: string;
-  findings: [];
-} {
+function invalidReview(detail?: string): ParsedReview {
   return {
     verdict: 'error',
+    claimedVerdict: null,
+    blockingSeverities: [],
     summary: `Reviewer output failed strict structured validation${detail ? `: ${detail}` : '.'}`,
     findings: [],
   };

@@ -912,6 +912,12 @@ export function createRoutes(jarvis: Jarvis): Hono {
         lastFailure: jarvis.agents.lastFailure(provider),
       })),
       deletionPlan: jarvis.lifecycle.deletionPlan(job.id),
+      // The same configured lists the gate itself uses, so the view labels a
+      // finding blocking/advisory from the one source of truth.
+      blockingSeverities: {
+        code: jarvis.config.pipeline.codeReviewBlockingSeverities,
+        visual: jarvis.config.pipeline.visualBlockingSeverities,
+      },
     });
   });
 

@@ -118,6 +118,25 @@ const highFinding = (): ReviewFinding => ({
   recommendation: 'Repair the fixture candidate.',
 });
 
+const mediumFindings = (): ReviewFinding[] => [
+  {
+    severity: 'medium',
+    category: 'correctness',
+    file: 'change.txt',
+    line: 1,
+    description: 'The error is swallowed, so the failure surfaces as a silent no-op.',
+    recommendation: 'Propagate it.',
+  },
+  {
+    severity: 'medium',
+    category: 'tests',
+    file: 'change.txt',
+    line: 2,
+    description: 'The new branch has no test.',
+    recommendation: 'Cover it.',
+  },
+];
+
 const failedVerification = (failureKind: 'product' | 'infrastructure'): VerificationReport => ({
   passed: false,
   ran: failureKind === 'product' ? 1 : 0,
@@ -672,6 +691,59 @@ describe('job repair pipeline', () => {
     h.db.close();
   });
 
+  // Two real mediums are a defect, not a nit. The gate reads the severities it
+  // was configured with; the verdict field on the review is not consulted.
+  it('sends two medium findings to the fixer even when the review claims approve', async () => {
+    const h = await harness({
+      review: (call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve' as const,
+        summary: call === 1 ? 'two mediums' : 'approved',
+        findings: call === 1 ? mediumFindings() : [],
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('awaiting_user');
+    expect(job.reviewFixCycles).toBe(1);
+    const fixers = h.provider.calls.filter((call) => call.role === 'fixer');
+    expect(fixers).toHaveLength(1);
+    expect(fixers[0]?.prompt).toContain(mediumFindings()[0]!.description);
+    // One batch fixer, then ONE fresh review on the commit that actually moved.
+    expect(h.reviewHeads).toHaveLength(2);
+    expect(h.reviewHeads[1]).not.toBe(h.reviewHeads[0]);
+    h.db.close();
+  });
+
+  // The budget is one fixer, so a medium that survives it pauses with the
+  // findings in hand: no second fixer, no loop, and never a pass.
+  it('pauses with the blocking mediums when the single fixer did not clear them', async () => {
+    const h = await harness({
+      maxReviewFixCycles: 1,
+      review: (_call, opts) => ({
+        runId: null,
+        provider: 'codex',
+        verdict: 'approve' as const,
+        summary: 'two mediums',
+        findings: mediumFindings(),
+        headRef: opts.headRef,
+        blocking: false,
+      }),
+    });
+    const job = await runToRest(h);
+
+    expect(job.stage).toBe('paused');
+    expect(job.reviewFixCycles).toBe(1);
+    expect(job.reviewBlockedHead).toBe(job.headRef);
+    expect(job.pauseReason).toContain('Code review repair budget exhausted');
+    expect(job.pauseReason).toContain('The new branch has no test.');
+    expect(h.provider.calls.filter((call) => call.role === 'fixer')).toHaveLength(1);
+    h.db.close();
+  });
+
   it('repairs a high code finding, verifies again, and obtains a fresh review', async () => {
     const h = await harness({
       selfDevelopment: true,
@@ -734,7 +806,6 @@ describe('job repair pipeline', () => {
         verdict: 'approve',
         summary: 'advisory only',
         findings: [
-          { ...highFinding(), severity: 'medium' },
           { ...highFinding(), severity: 'low' },
           { ...highFinding(), severity: 'info' },
         ],

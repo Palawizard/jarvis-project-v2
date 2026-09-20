@@ -64,7 +64,7 @@ The suite performs one tiny real edit per available CLI, strips API-key variable
 2. A live Job card appears in the conversation, and the conversation stays usable while the Job runs.
 3. Jarvis creates `jarvis/<job-id>` in an isolated worktree based on committed `HEAD`; dirty user files stay untouched and are excluded.
 4. A real Claude/Codex worker receives a bounded, inspectable Context Pack.
-5. Jarvis observes structured CLI events, runs explicit ordered verification steps, and performs an independent review. Critical/high code findings enter a bounded repair → verification → fresh-review loop.
+5. Jarvis observes structured CLI events, runs explicit ordered verification steps, and performs an independent review. Critical/high/medium code findings enter a bounded repair → verification → fresh-review loop; only low/info are advisory. Severity, never the reviewer's own verdict, decides (`JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES`).
 6. Configured web projects run on isolated dynamic ports and receive scenario-based Playwright desktop/mobile evidence and subscription-backed visual review. High/medium visible findings enter a bounded visual repair → verification → code review → recapture loop.
 7. Jarvis stores one compact project episode and validated memory proposals.
 8. The user approves the exact reviewed candidate, then separately applies it. Application is clean-target, exact-ancestry, FF-only, idempotent, persisted, and never pushes.

@@ -25,6 +25,14 @@ import {
 const FENCED_APPROVE =
   '```json\n{"verdict":"approve","summary":"Clean change.","findings":[]}\n```';
 
+/**
+ * The configured blocking severities, not a literal: these functions have no
+ * default of their own any more, and a test that hard-coded one would be free
+ * to drift away from the gate it is supposed to be checking.
+ */
+const BLOCKING = loadConfig({ home: os.tmpdir(), dbPath: ':memory:' }).pipeline
+  .codeReviewBlockingSeverities;
+
 const homes: string[] = [];
 afterEach(() => {
   for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true });
@@ -146,7 +154,7 @@ describe('review provider resilience', () => {
     ['a missing findings array', '```json\n{"verdict":"approve","summary":"clean"}\n```'],
     [
       'request_changes with advisory-only findings',
-      '```json\n{"verdict":"request_changes","summary":"advisory","findings":[{"severity":"medium","category":"style","description":"Optional cleanup","recommendation":"Consider renaming"}]}\n```',
+      '```json\n{"verdict":"request_changes","summary":"advisory","findings":[{"severity":"low","category":"style","description":"Optional cleanup","recommendation":"Consider renaming"}]}\n```',
     ],
     [
       'a clean block followed by a hidden critical warning',
@@ -157,12 +165,13 @@ describe('review provider resilience', () => {
       '```json\n{"verdict":"request_changes","summary":"blocked","findings":[{"severity":"critical","category":"security","description":"Authority bypass","recommendation":"Authenticate"}]}\n```\n```json\n{"verdict":"approve","summary":"clean","findings":[]}\n```',
     ],
   ])('rejects %s as a protocol error', (_name, output) => {
-    expect(parseReviewOutput(output).verdict).toBe('error');
+    expect(parseReviewOutput(output, BLOCKING).verdict).toBe('error');
   });
 
   it('never approves a claimed approve with a valid critical finding', () => {
     const result = parseReviewOutput(
       '```json\n{"verdict":"approve","summary":"claimed clean","findings":[{"severity":"critical","category":"security","description":"Authority bypass","recommendation":"Authenticate it"}]}\n```',
+      BLOCKING,
     );
     expect(result.verdict).toBe('request_changes');
   });
@@ -171,6 +180,7 @@ describe('review provider resilience', () => {
     expect(
       parseReviewOutput(
         '```json\n{"verdict":"approve","summary":"Clean review","findings":[]}\n```',
+        BLOCKING,
       ).verdict,
     ).toBe('approve');
   });
@@ -311,28 +321,31 @@ describe('reviewer structured-output framing', () => {
   // model simply left them out -- otherwise every downstream consumer of
   // `ReviewFinding.file` has to learn about a spelling the provider chose.
   it('accepts a null file/line and produces findings without those fields', () => {
-    const checked = checkReviewValue({
-      verdict: 'request_changes',
-      summary: 'One blocking issue.',
-      findings: [
-        {
-          severity: 'high',
-          category: 'correctness',
-          file: null,
-          line: null,
-          description: 'Repository-wide problem with no single location.',
-          recommendation: 'Fix it.',
-        },
-        {
-          severity: 'low',
-          category: 'style',
-          file: 'src/a.ts',
-          line: 12,
-          description: 'Naming.',
-          recommendation: 'Rename.',
-        },
-      ],
-    });
+    const checked = checkReviewValue(
+      {
+        verdict: 'request_changes',
+        summary: 'One blocking issue.',
+        findings: [
+          {
+            severity: 'high',
+            category: 'correctness',
+            file: null,
+            line: null,
+            description: 'Repository-wide problem with no single location.',
+            recommendation: 'Fix it.',
+          },
+          {
+            severity: 'low',
+            category: 'style',
+            file: 'src/a.ts',
+            line: 12,
+            description: 'Naming.',
+            recommendation: 'Rename.',
+          },
+        ],
+      },
+      BLOCKING,
+    );
     expect(checked.verdict).toBe('request_changes');
     expect(checked.findings[0]).not.toHaveProperty('file');
     expect(checked.findings[0]).not.toHaveProperty('line');
@@ -360,7 +373,132 @@ describe('reviewer structured-output framing', () => {
   ])('still fails closed on %s', (_label, value) => {
     // Rejected by BOTH: the schema above stops the provider producing it, and
     // the trusted validator refuses it if one does anyway. Nothing is loosened.
-    expect(checkReviewValue(value).verdict).toBe('error');
+    expect(checkReviewValue(value, BLOCKING).verdict).toBe('error');
+  });
+
+  /**
+   * The product rule this suite exists for: critical/high/medium is a defect,
+   * and a reviewer cannot buy an "approve" by classifying one down to medium.
+   */
+  describe('medium is blocking', () => {
+    const mediums = [
+      {
+        severity: 'medium',
+        category: 'correctness',
+        file: 'src/a.ts',
+        line: 4,
+        description: 'The error is swallowed, so the failure surfaces as a silent no-op.',
+        recommendation: 'Propagate it.',
+      },
+      {
+        severity: 'medium',
+        category: 'tests',
+        file: 'src/b.ts',
+        line: 9,
+        description: 'The new branch has no test.',
+        recommendation: 'Cover it.',
+      },
+    ];
+
+    it('derives request_changes from two mediums the model itself claimed were an approve', async () => {
+      const claimed = { verdict: 'approve', summary: 'Looks fine to me.', findings: mediums };
+      const parsed = checkReviewValue(claimed, BLOCKING);
+      expect(parsed.verdict).toBe('request_changes');
+      expect(parsed.claimedVerdict).toBe('approve');
+      expect(parsed.blockingSeverities).toEqual(['medium']);
+
+      const h = reviewWith({
+        status: 'completed',
+        result: '',
+        structuredOutput: claimed,
+        memoryProposals: [],
+      });
+      const review = await h.run();
+
+      expect(review.verdict).toBe('request_changes');
+      // `blocking` is what the pipeline reads to send the candidate to a fixer.
+      expect(review.blocking).toBe(true);
+      expect(review.findings).toHaveLength(2);
+      // And the correction is visible, not silent.
+      const override = h.bus.list().find((event) => event.type === 'review.verdict.overridden');
+      expect(override?.payload).toMatchObject({
+        claimed: 'approve',
+        verdict: 'request_changes',
+        severities: ['medium'],
+      });
+      h.db.close();
+    });
+
+    it('approves a low-only review and keeps the findings as advisories', async () => {
+      const h = reviewWith({
+        status: 'completed',
+        result: '',
+        structuredOutput: {
+          verdict: 'approve',
+          summary: 'Clean, two nits.',
+          findings: [
+            {
+              severity: 'low',
+              category: 'style',
+              description: 'Awkward name.',
+              recommendation: 'Rename it.',
+            },
+            {
+              severity: 'info',
+              category: 'design',
+              description: 'Worth knowing about.',
+              recommendation: 'No change requested.',
+            },
+          ],
+        },
+        memoryProposals: [],
+      });
+      const review = await h.run();
+
+      expect(review.verdict).toBe('approve');
+      expect(review.blocking).toBe(false);
+      expect(review.findings.map((finding) => finding.severity)).toEqual(['low', 'info']);
+      // Nothing was corrected, so nothing claims it was.
+      expect(h.bus.list().some((event) => event.type === 'review.verdict.overridden')).toBe(false);
+      h.db.close();
+    });
+
+    it('honours a critical,high environment override', () => {
+      const previous = process.env.JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES;
+      process.env.JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES = 'critical,high';
+      try {
+        const overridden = loadConfig({ home: os.tmpdir(), dbPath: ':memory:' }).pipeline
+          .codeReviewBlockingSeverities;
+        expect(overridden).toEqual(['critical', 'high']);
+        const parsed = checkReviewValue(
+          { verdict: 'approve', summary: 'Two mediums.', findings: mediums },
+          overridden,
+        );
+        expect(parsed.verdict).toBe('approve');
+        expect(parsed.blockingSeverities).toEqual([]);
+      } finally {
+        if (previous === undefined) delete process.env.JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES;
+        else process.env.JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES = previous;
+      }
+    });
+
+    it('tells the reviewer, in the prompt, that medium blocks and what medium means', async () => {
+      const h = reviewWith({
+        status: 'completed',
+        result: FENCED_APPROVE,
+        memoryProposals: [],
+      });
+      await h.run();
+      const prompt = h.provider.lastOptions?.prompt ?? '';
+
+      expect(prompt).toContain('critical, high, medium are BLOCKING');
+      expect(prompt).toContain('low, info are advisory');
+      for (const severity of ['critical:', 'high:', 'medium:', 'low:', 'info:']) {
+        expect(prompt).toContain(`- ${severity}`);
+      }
+      expect(prompt).toContain('Do not downgrade a real finding to reach "approve"');
+      h.db.close();
+    });
   });
 
   it('refuses a claimed approve that hides a critical finding, through either channel', async () => {
@@ -376,7 +514,7 @@ describe('reviewer structured-output framing', () => {
         },
       ],
     };
-    expect(checkReviewValue(critical).verdict).toBe('request_changes');
+    expect(checkReviewValue(critical, BLOCKING).verdict).toBe('request_changes');
     const h = reviewWith({
       status: 'completed',
       result: '',

@@ -140,13 +140,21 @@ export function JobDetailView({
     staleness,
     resumePlan,
     deletionPlan,
+    blockingSeverities,
   } = detail.data;
+  const codeBlocking = blockingSeverities.code;
+  const visualBlocking = blockingSeverities.visual;
   // A Resume that cannot change anything is not a Resume. Saying so before the
   // button is pressed is the whole point: the old generic button re-ran a full
   // verification suite and a second reviewer on an unchanged candidate to
   // arrive back at exactly the same paused state.
   const resumeUseless = resumePlan?.plan.kind === 'none';
   const review = reviews[reviews.length - 1];
+  // The gate disagreeing with its own reviewer is a thing to see, not to infer
+  // from a request_changes whose summary reads like an approval.
+  const verdictOverride = events.findLast(
+    (event) => event.type === 'review.verdict.overridden' && event.runId === review?.runId,
+  );
   const implementationRun = runs.findLast(
     (run) => (run.role === 'implementer' || run.role === 'fixer') && !!run.result,
   );
@@ -613,6 +621,14 @@ export function JobDetailView({
                   <span className="tiny dim">by {review.provider} (independent run)</span>
                   <span className="tiny dim">head {review.headRef.slice(0, 12)}</span>
                 </div>
+                {verdictOverride && (
+                  <div className="alert warn small" style={{ marginBottom: 10 }}>
+                    Gate override: the reviewer answered <strong>approve</strong>, but it reported{' '}
+                    {(verdictOverride.payload?.severities as string[] | undefined)?.join(', ') ??
+                      'blocking'}{' '}
+                    findings, so Jarvis derived <strong>request changes</strong>.
+                  </div>
+                )}
                 {review.summary && (
                   <div className="small" style={{ marginBottom: 10 }}>
                     {review.summary}
@@ -627,19 +643,17 @@ export function JobDetailView({
                         <div className="mem-head">
                           <Badge
                             tone={
-                              f.severity === 'critical' || f.severity === 'high'
-                                ? 'err'
+                              !codeBlocking.includes(f.severity)
+                                ? undefined
                                 : f.severity === 'medium'
                                   ? 'warn'
-                                  : undefined
+                                  : 'err'
                             }
                           >
                             {f.severity}
                           </Badge>
                           <Badge>
-                            {f.severity === 'critical' || f.severity === 'high'
-                              ? 'blocking'
-                              : 'advisory'}
+                            {codeBlocking.includes(f.severity) ? 'blocking' : 'advisory'}
                           </Badge>
                           <Badge>{f.category}</Badge>
                           {f.file && (
@@ -905,18 +919,12 @@ export function JobDetailView({
                         .map((finding, index) => (
                           <div key={index} className="tiny" style={{ marginTop: 4 }}>
                             <Badge
-                              tone={
-                                finding.severity === 'high' || finding.severity === 'medium'
-                                  ? 'err'
-                                  : undefined
-                              }
+                              tone={visualBlocking.includes(finding.severity) ? 'err' : undefined}
                             >
                               {finding.severity}
                             </Badge>{' '}
                             <Badge>
-                              {finding.severity === 'high' || finding.severity === 'medium'
-                                ? 'blocking'
-                                : 'advisory'}
+                              {visualBlocking.includes(finding.severity) ? 'blocking' : 'advisory'}
                             </Badge>{' '}
                             {finding.description}
                             {finding.recommendation ? ` — ${finding.recommendation}` : ''}

@@ -232,9 +232,12 @@ export function loadConfig(overrides: Partial<JarvisConfig> = {}): JarvisConfig 
       // value would only walk back to a provider that already failed this action.
       providerAttempts: Math.min(2, Math.max(1, envInt('JARVIS_PROVIDER_ATTEMPTS', 2))),
       verificationInfraRetries: Math.max(0, envInt('JARVIS_VERIFICATION_INFRA_RETRIES', 2)),
+      // The single source of truth for "does this finding stop the pipeline".
+      // Medium blocks: a real medium finding is a defect, and letting it reach
+      // Visual QA is how reviewers learn to under-classify in order to approve.
       codeReviewBlockingSeverities: envSeverities(
         'JARVIS_CODE_REVIEW_BLOCKING_SEVERITIES',
-        ['critical', 'high'],
+        ['critical', 'high', 'medium'],
         ['critical', 'high', 'medium', 'low', 'info'],
       ),
       visualBlockingSeverities: envSeverities(

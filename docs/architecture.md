@@ -35,7 +35,7 @@ The event log supports live UI updates and post-restart inspection. Startup mark
 
 ```text
 implement -> verify -> independent code review
-                    | blockers (critical/high)
+                    | blockers (critical/high/medium)
                     v
                code fixer --commit--> verify --fresh review (max 2)
                     |

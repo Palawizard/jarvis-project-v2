@@ -66,6 +66,9 @@ export type JarvisEventType =
   | 'verification.retry'
   | 'review.started'
   | 'review.completed'
+  // The model claimed `approve` while the severities it reported derive
+  // `request_changes`. The gate corrected the reviewer; this says so.
+  | 'review.verdict.overridden'
   | 'visual_qa.plan.resolved'
   | 'visual_qa.started'
   | 'visual_qa.captured'

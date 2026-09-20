@@ -252,6 +252,7 @@ export interface ReviewFinding {
 
 export interface Review {
   id: string;
+  runId: string | null;
   provider: string;
   verdict: 'approve' | 'request_changes' | 'error';
   summary: string;
@@ -343,6 +344,8 @@ export interface JobDetail {
     lastFailure: { at: string; kind: string; reset?: string } | null;
   }>;
   deletionPlan: JobDeletionPlan;
+  /** Configured blocking severities, from the gate's own config. */
+  blockingSeverities: { code: string[]; visual: string[] };
 }
 
 export interface ResumePlan {

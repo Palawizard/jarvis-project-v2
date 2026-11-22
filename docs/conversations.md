@@ -24,30 +24,30 @@ human approval and self-upgrade boundaries stay explicit
 
 Every message you send takes exactly one of these paths.
 
-1. **Explicit memory command** — `remember …`, `forget …`, `update …`. Handled
+1. **Explicit memory command** - `remember …`, `forget …`, `update …`. Handled
    deterministically and locally. No model call, so no provider quota is spent
    deciding that "remember that I prefer pnpm" is a memory command. An ambiguous
    `forget` renders the exact candidates in chat rather than guessing. A
    question is never one of these: "Remember the meeting?" asks about memory
-   and is answered, not written. The correction markers — "actually", "en
-   fait", "correction" — only take this path when the sentence states a fact
+   and is answered, not written. The correction markers - "actually", "en
+   fait", "correction" - only take this path when the sentence states a fact
    **and** a stored memory is clearly about it; see
    [memory.md](memory.md#write-policy). Everything else they open ("En fait,
    peux-tu m'expliquer X ?", "Actually, fix the bug in Jarvis") is an ordinary
    message and takes one of the paths below.
-2. **A code change** — a message that tells Jarvis to change the source of a
+2. **A code change** - a message that tells Jarvis to change the source of a
    registered repository: "implémente OAuth dans Sitepilot", "code sur le projet
-   Jarvis …", "fix this bug in Jarvis". Jarvis creates exactly one Job and
+   Jarvis ...", "fix this bug in Jarvis". Jarvis creates exactly one Job and
    starts it. Which messages these are is decided by a dedicated classifier, not
    by the conversational assistant; see below.
-3. **A clarification** — a change is clearly wanted, but not clearly to a
+3. **A clarification** - a change is clearly wanted, but not clearly to a
    registered repository. Jarvis asks, offers the projects as choices, and
    starts nothing.
-4. **Ordinary conversation** — an explanation, an opinion, brainstorming, a
+4. **Ordinary conversation** - an explanation, an opinion, brainstorming, a
    question about Jarvis itself, or anything you want written that is not a
    change to a repository. This produces an answer and nothing else. **A normal
    message never creates a Job.**
-5. **A structured action** — the assistant writes its reply for you and may
+5. **A structured action** - the assistant writes its reply for you and may
    append at most one `jarvis-action` block: inspect a Job, rename the
    conversation, analyse or archive a project. Trusted code validates and
    dispatches it, and anything destructive stops at your confirmation.
@@ -64,7 +64,7 @@ That is only honest while the deleted branch left nothing behind it, so a rewind
 is refused when the branch:
 
 - has a tool execution still `running`;
-- started a Job — cancel the Job instead, `job.cancel` is the capability for
+- started a Job - cancel the Job instead, `job.cancel` is the capability for
   stopping work, and rewriting the request is not;
 - ran anything above `observe` that did not stop before executing. Not just the
   actions you confirmed: `conversation.create` is `safe_action`, so it is
@@ -76,20 +76,20 @@ is refused when the branch:
 
 An execution that only read (`observe`) is edited straight through: deleting the
 messages around it leaves nothing in Jarvis that the transcript now contradicts.
-A request still waiting for your confirmation is denied first — an approval
+A request still waiting for your confirmation is denied first - an approval
 dialog whose message is about to disappear has no context left to answer.
 
 This rests on every assistant message produced by a tool execution carrying that
 execution's id, not only the ones that stopped at a confirmation. The link is
-written when the execution row is created — before the tool body can change
-anything, not after it returns — and restart recovery keeps it. Otherwise a
+written when the execution row is created - before the tool body can change
+anything, not after it returns - and restart recovery keeps it. Otherwise a
 crash between an effect landing and the turn finishing would leave the effect in
 Jarvis with nothing in the transcript pointing at it, and the rewind would look
 safe.
 
 A conversation is named once, from its first user message, so rewinding past
 that message drops the derived name and lets the new wording name the
-conversation again — otherwise the sidebar keeps pointing at a turn that no
+conversation again - otherwise the sidebar keeps pointing at a turn that no
 longer exists. A name you chose, or one `conversation.rename` wrote, is not a
 default and survives the rewind untouched.
 
@@ -98,7 +98,7 @@ default and survives the rewind untouched.
 ### Why this is not left to the conversational assistant
 
 It used to be. Asked, in a new conversation, to "code sur le projet Jarvis une
-nouvelle implémentation …", the conversational provider answered that its
+nouvelle implémentation ...", the conversational provider answered that its
 working folder was empty and asked where the Jarvis repository was. No Job was
 created, and Jarvis had a registered self project with that exact path the whole
 time. A capability that only exists when a model chooses to emit a JSON block is
@@ -153,8 +153,8 @@ empty scratch directory, with no session persisted.
 
 They classify. They cannot act. And the only thing either of them produces that
 survives is **a project id chosen from the list it was handed**. Neither writes
-the instruction the coding agent executes — that is your own message, carried
-across by Jarvis — and neither writes any text that reaches a later prompt.
+the instruction the coding agent executes - that is your own message, carried
+across by Jarvis - and neither writes any text that reaches a later prompt.
 
 At most twelve projects are described in one routing decision, with the
 conversation's own project always among them. If you have more, the prompt says
@@ -163,20 +163,20 @@ so and asks rather than choosing from a partial list.
 ### What each classifier is allowed to read
 
 A routing prompt has two regions, and what decides which region a value goes in
-is **who wrote it** — never how useful it looks.
+is **who wrote it** - never how useful it looks.
 
 | Region | Written by | Contains |
 | --- | --- | --- |
-| Trusted, first | Jarvis, from its own registry | project ids, detected stack, the conversation's project id, whether Jarvis asked a question last turn and about which id — plus the names and aliases **you** registered (a model can propose a rename, but only through a confirmation you answer) |
+| Trusted, first | Jarvis, from its own registry | project ids, detected stack, the conversation's project id, whether Jarvis asked a question last turn and about which id - plus the names and aliases **you** registered (a model can propose a rename, but only through a confirmation you answer) |
 | Untrusted, last | anyone else | your latest message; for the router only, your own previous messages |
 
 Everything in the trusted region is serialised as JSON, so a project you named
 `", "id": "…` is a name rather than a structure, and nothing is interpolated into
 an English sentence. Everything in the untrusted region is a JSON string
-literal, introduced as material to interpret — which is also why nothing in
+literal, introduced as material to interpret - which is also why nothing in
 your message is rewritten on the way in to keep a delimiter intact. (It arrives
 as stored, so anything that looked like a credential was redacted and a very
-long message truncated — both before routing sees it.)
+long message truncated - both before routing sees it.)
 
 **Neither prompt contains** a project's summary, its analysis profile, any
 memory, any search or job result, or anything Jarvis said on a previous turn.
@@ -198,7 +198,7 @@ verifier   trusted facts + your latest message + the proposal (three values)
 
 The verifier sees no transcript at all. If a request only reads as a code change
 in the light of an earlier turn, the verifier cannot establish a repository and
-asks instead — one question, zero Jobs. That is the intended outcome rather than
+asks instead - one question, zero Jobs. That is the intended outcome rather than
 a gap: an unattended agent should not start on an instruction nobody typed.
 
 ### What trusted code checks before anything starts
@@ -206,19 +206,19 @@ a gap: an unattended agent should not start on an instruction nobody typed.
 The classifier's answer is untrusted structured data, and is treated as such:
 
 - the schema version must be exactly the one Jarvis wrote, every enum value must
-  be known, every field within bounds, and an unknown field is a refusal — not a
+  be known, every field within bounds, and an unknown field is a refusal - not a
   field to ignore;
 - `targetProjectId` must be an id **this invocation offered**, not merely a
   project that exists, so an id a model invented or was told to say by something
   inside your message resolves to nothing;
 - the project is resolved from that id by `ProjectService`, which remains the
-  only source of a repository path — no model-produced string ever becomes a
+  only source of a repository path - no model-produced string ever becomes a
   path or a command;
 - archived projects are never offered and never accepted;
 - and the verifier must independently return `allow` **on the same project id**.
 
-Anything else — disagreement, a malformed answer, an unreachable provider, a
-Stop — ends in a question or an ordinary answer, and zero Jobs. There is no
+Anything else - disagreement, a malformed answer, an unreachable provider, a
+Stop - ends in a question or an ordinary answer, and zero Jobs. There is no
 "repair the answer and continue" path.
 
 ### Two checks, because one model is not a security boundary
@@ -226,17 +226,17 @@ Stop — ends in a question or an ordinary answer, and zero Jobs. There is no
 The router prompt frames your whole message as content to interpret rather than
 instructions to follow, which measurably helps with pasted email, quoted
 changelogs and tickets. It is not claimed as a defence: a model can be talked
-out of any instruction. That is precisely why a second, independent run — fresh
+out of any instruction. That is precisely why a second, independent run - fresh
 context, different prompt, shown the same candidate list and asked to name the
-repository itself rather than to confirm one — has to agree before an unattended
+repository itself rather than to confirm one - has to agree before an unattended
 write-capable agent starts. Exactly one router, at most one verifier, never a
 third opinion.
 
 For that second opinion to be worth anything, the two runs must not share an
 input that something outside Jarvis can write. Two runs of the same model over
 the same inputs are one opinion counted twice. So nothing a classifier produces
-is ever fed to the other or to a later turn — not its clarification question,
-not a restatement of your request — and every free-text input the verifier
+is ever fed to the other or to a later turn - not its clarification question,
+not a restatement of your request - and every free-text input the verifier
 drops is one the router keeps, as set out above. Its inputs are not a strict
 subset: it also gets the router's conclusion, three categorical values that
 carry no text. Every one of those was a real
@@ -256,7 +256,7 @@ was asked for. In a conversation bound to Jarvis:
 | "écris-moi un email pour prévenir l'équipe" | an email, zero Jobs |
 | "crée une facture pour ce client" | an invoice, zero Jobs |
 
-Affinity is only written when a Job really exists — asking for one, or being
+Affinity is only written when a Job really exists - asking for one, or being
 asked which repository you meant, does not change what the conversation is
 about.
 
@@ -267,8 +267,8 @@ projects as buttons. **Clicking one is the fastest and most exact answer**: it
 names the project yourself, so no classifier is consulted at all, and the Job
 starts on the request Jarvis carried forward from the message it asked about.
 
-Answering in words works too. Jarvis remembers which repository it named — as an
-id, not as a sentence — so "oui, Jarvis" is enough. When Jarvis had named a
+Answering in words works too. Jarvis remembers which repository it named - as an
+id, not as a sentence - so "oui, Jarvis" is enough. When Jarvis had named a
 specific repository and you agree, that is the second opinion: a person who was
 shown the name and said yes is better evidence than another model run, and
 without it the same question could be asked forever with no way through it.
@@ -282,19 +282,19 @@ the way.
 The Job is created through the same `job.create` tool, with the same input shape
 and the same policy evaluation, as the "Start Job" button on the project page.
 What reaches it is your own sentence, verbatim, and a project id trusted code
-resolved from a list it had itself offered — no model-authored text at all. A
+resolved from a list it had itself offered - no model-authored text at all. A
 model chose between candidates; it did not write anything that gets executed.
 
-A `create_job` the conversational assistant emits is a different thing — that is
-the model's inference about what you wanted, in the model's own words — and it
+A `create_job` the conversational assistant emits is a different thing - that is
+the model's inference about what you wanted, in the model's own words - and it
 stops at a confirmation the model cannot answer.
 
 ### The job brief compiler
 
 Once both classifiers have agreed and trusted code has resolved the project, one
-more tool-free run turns your request into a structured brief — a title, a goal,
+more tool-free run turns your request into a structured brief - a title, a goal,
 requirements, checkable acceptance criteria, the project context that actually
-bears on the task, constraints, and any assumptions it had to make — so the
+bears on the task, constraints, and any assumptions it had to make - so the
 coding agent starts from a compiled reading of the task instead of re-deriving
 one. That same structured response also offers a bounded semantic execution
 recommendation (capability tier, effort and short reasons) for the **initial
@@ -311,13 +311,13 @@ a message from you. The request you typed is stored verbatim on the Job as
 which is which, and the prompt says the request wins wherever they disagree.
 
 Its rules are the compiler's whole job: never invent a feature, never widen
-scope, never drop a requirement, never turn an ambiguity into a requirement —
+scope, never drop a requirement, never turn an ambiguity into a requirement -
 that goes under assumptions, marked unverified. The only thing anybody else
 wrote that it is shown at all is your request, in the untrusted region under the
 same rule the routing prompts use: content to read, never an instruction. The
-project summary and analysis profile are deliberately **not** given to it —
+project summary and analysis profile are deliberately **not** given to it -
 prose it can restate as project context would reach the coding agent as a
-compiled fact — and the coding agent receives that material on its own path
+compiled fact - and the coding agent receives that material on its own path
 instead, labelled as a previous analysis.
 
 The brief comes back through the provider's own structured-output mechanism: a
@@ -332,9 +332,9 @@ A brief that cannot be compiled is simply absent, and the Job is created exactly
 as it was before this stage existed. Failing open is right **here specifically**,
 because a brief is derived context; everything that fails closed was settled
 upstream. Each attempt records `job.brief.compilation.started` and then either
-`completed` or `failed` with the precise reason — provider unavailable, provider
+`completed` or `failed` with the precise reason - provider unavailable, provider
 failed, cancelled, timed out, empty output, structured output missing, or schema
-rejected — carrying counts and field paths, never brief content. Retrying a Job
+rejected - carrying counts and field paths, never brief content. Retrying a Job
 reuses the brief the first attempt was given rather than compiling a new one,
 and a message that has already produced a Job is never compiled a second time.
 
@@ -344,7 +344,7 @@ Every message in a workspace with at least one registered project spends one
 tool-free classification run; a message that routes to a code change spends a
 second for the independent check, and a third to compile the brief. Messages in a workspace with no registered
 projects, and explicit memory commands, spend none. The model policy pins routing to the
-cheap bounded model at low effort, and it gives up after 90 seconds — a one-sentence classification that
+cheap bounded model at low effort, and it gives up after 90 seconds - a one-sentence classification that
 has not answered by then has failed, not thought harder. There is no retry: if a
 provider is unreachable, the turn becomes an ordinary answer and no Job is
 created.
@@ -357,8 +357,8 @@ project has been analysed. When a turn mentions a project, that project's full
 snapshot and profile are injected too, along with its project-scoped memories.
 
 That is why "où est le projet Jarvis ?" and "quelle stack utilise Jarvis ?" are
-answered directly. The conversational provider has no filesystem access at all —
-it runs in an empty scratch directory with every built-in tool disabled — so
+answered directly. The conversational provider has no filesystem access at all -
+it runs in an empty scratch directory with every built-in tool disabled - so
 everything it knows about a repository, Jarvis handed it.
 
 Per-turn resolution is not conversation affinity. Mentioning a project in a
@@ -376,8 +376,8 @@ keep the stricter JSON-observation form, which is bounded provider data by
 construction.
 
 What escaping does **not** do is shorten the answer. The replay is capped once,
-for the whole history, by the same estimated-token budget the context pack uses
-— never per message. A per-message cap is what a previous version did, and at
+for the whole history, by the same estimated-token budget the context pack uses -
+never per message. A per-message cap is what a previous version did, and at
 500 characters with newlines collapsed it meant every long explanation and
 every code block was gone by the follow-up question. Under a whole-history
 budget the oldest turn falls off the end instead, and the answer you are
@@ -398,7 +398,7 @@ another.
 
 A new conversation gets fresh working state and still has access to your durable
 memory. Deleting a conversation removes its transcript and its working state.
-Explicit `forget` operates on durable memory, never on message history — and a
+Explicit `forget` operates on durable memory, never on message history - and a
 full transcript is never promoted into memory wholesale.
 
 ## Conversation ↔ Job provenance
@@ -428,14 +428,14 @@ precedence is, strongest first:
 
 The self project is the one special case. Its name is also how you *address*
 Jarvis, so a bare "Jarvis" anywhere in a sentence is not a reference to its
-repository — only a construction that cannot be an address is: a preposition
+repository - only a construction that cannot be an address is: a preposition
 ("in Jarvis", "sur Jarvis", "dans Jarvis"), a possessive, or an explicit noun
 ("the Jarvis repo", "le projet Jarvis"). French phrasings are included because
 their absence was the reason "code sur le projet Jarvis" resolved to nothing.
 
 "Fix the Jobs page in Jarvis" resolves the self project. "Implement OAuth in
 Sitepilot" resolves by name or alias. "Fix auth in website" with two plausible
-websites resolves to **nothing** — Jarvis asks which one. Affinity is
+websites resolves to **nothing** - Jarvis asks which one. Affinity is
 convenience, not authority: naming another project overrides it, and destructive
 actions always require an explicitly resolved target.
 
@@ -447,24 +447,24 @@ default candidate set but are still resolvable when named explicitly.
 Archive is the normal way to put something away. It is reversible and it
 preserves everything.
 
-- **Conversation** — archive hides it from the sidebar; delete removes the
+- Conversation: archive hides it from the sidebar; delete removes the
   transcript and working state only.
-- **Project** — archive hides it from active views and default resolution.
+- Project: archive hides it from active views and default resolution.
   *Unregister never deletes the repository from disk.* If the project has active
   Jobs, unregister is refused and names the blocker. If it has historical Jobs or
   memory, unregister soft-archives it so that history stays understandable. Only
   a registration nothing depends on is removed outright. The Jarvis self project
   can never be unregistered.
-- **Job** — archive removes it from History and preserves every artifact.
+- Job: archive removes it from History and preserves every artifact.
 
 ### When a Job may be deleted
 
 | State | Deletable |
 | --- | --- |
-| Running or otherwise active | No — cancel first, and let the worktree be released |
-| Paused / awaiting_user, never applied | Yes, with confirmation — deleting abandons the candidate |
+| Running or otherwise active | No - cancel first, and let the worktree be released |
+| Paused / awaiting_user, never applied | Yes, with confirmation - deleting abandons the candidate |
 | Failed / completed, never applied | Yes, with confirmation |
-| Any candidate application row (including `approved` or `failed`), or any self-upgrade transaction | **Never** — Archive is the only offer |
+| Any candidate application row (including `approved` or `failed`), or any self-upgrade transaction | **Never** - Archive is the only offer |
 
 An application row is immutable evidence: that a change really happened to a
 repository, or that a human authorised one. Deleting an eligible Job removes its disposable worktree, candidate
@@ -491,8 +491,8 @@ plainly rather than claiming it did the thing.
 ## Project analysis
 
 A registered project can be analysed once, on request: a bounded read-only agent
-reads a **disposable worktree pinned to the project's committed HEAD** — never
-your working checkout, so uncommitted work is neither seen nor touched — and
+reads a **disposable worktree pinned to the project's committed HEAD** - never
+your working checkout, so uncommitted work is neither seen nor touched - and
 returns a structured profile: purpose, architecture, languages, frameworks,
 modules, entrypoints, test strategy, build workflow, conventions, integrations,
 data stores, risks and where to read first.
@@ -511,12 +511,12 @@ count: they are Jarvis's own orientation notes, and counting them would turn
 every analysed project into a soft archive on Jarvis's say-so rather than on
 anything the user did. Because that lets the hard path run while project-scoped
 memories exist, unregistering deletes the project's memory in the same
-transaction as the row — `memories.scope_id` has no foreign key, so nothing else
+transaction as the row - `memories.scope_id` has no foreign key, so nothing else
 would.
 
 **A profile is context, never authority.** Nothing an analysis writes is ever
 executed. `Project.commands` stays what deterministic detection found or what
-you configured — the analyst may describe a build workflow in prose, and that
+you configured - the analyst may describe a build workflow in prose, and that
 prose never becomes a shell command.
 
 When the repository moves past the analysed commit, the profile is marked
@@ -534,7 +534,7 @@ may not approve a candidate, apply a change, activate a self-upgrade, or obtain
 the activation token. Those need you, and activation additionally needs the
 external supervisor. The chat agent runs with no source-editing authority, never
 inside a development worktree, and has no path to SQLite, Git, approval state or
-supervisor state — it may only request one of the declared actions, which
+supervisor state - it may only request one of the declared actions, which
 trusted code then decides.
 
 ## Agent recovery
@@ -551,14 +551,14 @@ a reset time.
 When a persisted external Claude/Codex session cannot be resumed, Jarvis retires
 that session id and retries **once** in a fresh provider context: the same
 provider, the same worktree with its edits intact, and the same prompt. Nothing
-is rebuilt or re-summarised for the retry — the worktree already holds the work,
+is rebuilt or re-summarised for the retry - the worktree already holds the work,
 and the agent is told to inspect it. The retry consumes an attempt from the
 stage's existing budget, so it is bounded and cannot loop, and the retired
 session id is cleared from the Job row so a later Resume cannot replay it.
 
 A session id belongs to exactly one provider. The Job records the provider that
 issued it alongside the id, and a resumed session is only ever handed back to
-that same provider — a Claude thread is never passed to Codex, or the reverse,
+that same provider - a Claude thread is never passed to Codex, or the reverse,
 whichever call site assembled the pair.
 
 Resuming a *paused* Job is a different path: it rebuilds the stage prompt from
@@ -569,8 +569,8 @@ stage from the exact persisted checkpoint.
 
 Before resuming, Jarvis checks that the project still exists, its repository is
 present, the worktree is intact, and the target head still matches the base the
-candidate branched from. If the target has moved on — exactly what happens after
-Jarvis self-updates — resume is blocked and explains itself:
+candidate branched from. If the target has moved on - exactly what happens after
+Jarvis self-updates - resume is blocked and explains itself:
 
 ```text
 This Job was based on 9a69af65.
@@ -583,11 +583,11 @@ evidence), inspecting the old candidate, or archiving the old Job.
 
 ## Supervised versus unsupervised development
 
-- `pnpm dev` — the normal supervised launcher. Builds core and the orchestrator,
+- `pnpm dev` - the normal supervised launcher. Builds core and the orchestrator,
   runs the orchestrator under `scripts/supervisor.mjs`, and prints the
   self-upgrade activation token once for that session. Self-upgrade activation
   is possible.
-- `pnpm dev:unsupervised` — the raw watch-oriented loop for iterating on source.
+- `pnpm dev:unsupervised` - the raw watch-oriented loop for iterating on source.
   No supervisor, so it can prepare a self-upgrade but can never activate one.
 
 Ctrl+C is a clean shutdown of the whole tree on every platform, and the ports

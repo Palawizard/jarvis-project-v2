@@ -1,4 +1,4 @@
-# 0003 — One gated boundary for tool execution
+# 0003 - One gated boundary for tool execution
 
 ## Context
 

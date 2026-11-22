@@ -3,7 +3,7 @@
 Jarvis runs actions through one boundary: `ToolRegistry` in `packages/core/src/tools/`.
 It classifies, decides, records, and recovers. Nothing else runs a tool.
 
-This layer exists ahead of the modules that need it — screen/desktop, Gmail,
+This layer exists ahead of the modules that need it - screen/desktop, Gmail,
 Calendar, voice, automations. None of those are implemented; registering one is
 supposed to be a matter of declaring its risk level, not of inventing permission
 logic again.
@@ -11,7 +11,7 @@ logic again.
 Two things to be clear about up front. The registered tools today are `observe`,
 `reversible_modification` and one `destructive` (`memory.purge`); the
 `sensitive` tier is exercised by tests, not by shipped functionality. And the
-coding agents do not call this registry at all yet — they are CLI subprocesses
+coding agents do not call this registry at all yet - they are CLI subprocesses
 with their own tooling. `actor: 'agent'` is therefore the rule that will apply
 when they do, enforced and tested now so it is not retrofitted later.
 
@@ -20,7 +20,7 @@ when they do, enforced and tested now so it is not retrofitted later.
 | Level | Meaning | Examples |
 | --- | --- | --- |
 | `observe` | Reads state, changes nothing | `memory.search`, `project.list` |
-| `safe_action` | Changes only Jarvis-internal scratch state | — |
+| `safe_action` | Changes only Jarvis-internal scratch state | - |
 | `reversible_modification` | Changes durable state that can be undone | `memory.store`, `job.create` |
 | `sensitive` | Touches private data or the outside world | mail, calendar, screen, desktop input |
 | `destructive` | Loses data, or has no undo | `memory.purge`, sending, paying |
@@ -43,7 +43,7 @@ Three rules hold regardless of configuration, grants, or call arguments:
    are a future decision, not something that leaks in on the day someone
    registers a tool with the wrong actor.
 2. **A standing permission can only turn `confirm` into `allow`.** It can never
-   overturn a `deny`, and it is capped at `sensitive` — a `destructive` action
+   overturn a `deny`, and it is capped at `sensitive` - a `destructive` action
    always comes back to a human, grant or no grant.
 3. **`maxRisk` only tightens.** A call site may lower its own ceiling. There is
    no value, in any argument, that raises it.
@@ -59,7 +59,7 @@ that authorised it.
 
 Standing permissions are only ever granted to the user's own actions.
 `ToolRegistry.grant()` rejects any other actor, so this holds for every caller,
-not just the HTTP route — and `#matchingGrant` additionally refuses to match a
+not just the HTTP route - and `#matchingGrant` additionally refuses to match a
 grant row belonging to a non-user actor, so a row written directly into the
 database (or left by an older build) authorises nothing.
 
@@ -69,7 +69,7 @@ Delegated autonomy for agents is gated behind the OS-isolation milestone in
 
 ## Audit
 
-Every attempt writes one `tool_executions` row — including the refused ones,
+Every attempt writes one `tool_executions` row - including the refused ones,
 which are the interesting ones. The row is written *before* the tool runs, which
 is what makes a crash recoverable. It holds the decision, the reason, the actor,
 the context, the arguments, the result or error, and the duration.
@@ -79,7 +79,7 @@ Stored arguments come in two flavours and the difference matters:
 - **Accepted** arguments are the exact validated payload, because an approval
   that outlives the process replays it. They are therefore never truncated, and
   a call whose arguments contain something matching a credential pattern is
-  refused outright rather than stored redacted — a redacted argument would
+  refused outright rather than stored redacted - a redacted argument would
   silently execute with mangled input.
 - **Rejected** arguments are audit text only. They are redacted and bounded, and
   `inputValidated` is false, which is what blocks them from ever being replayed.
@@ -97,15 +97,15 @@ whether a call may run.
 
 It used to decide both, and that was a real execution bug: a legitimate
 4,644-character structured request was refused outright with *"4644 characters
-of arguments exceeds the 4000 character limit"* — a payload rejected because
+of arguments exceeds the 4000 character limit"* - a payload rejected because
 somebody had once chosen a comfortable width for an audit row. The two questions
 are now separate.
 
 Canonical arguments are gated by a large fixed storage bound (256,000
 characters) with **no environment override**, because the only interesting
 direction to move it is up, and up is the denial-of-service direction. Arguments
-above it are still refused rather than truncated — a truncated payload must
-never be executed, approved or replayed — but a normal structured request in
+above it are still refused rather than truncated - a truncated payload must
+never be executed, approved or replayed - but a normal structured request in
 the tens of thousands of characters now executes, is stored in full, is hashed
 in full, and is replayed in full, whatever a preview elsewhere shows.
 
@@ -119,7 +119,7 @@ in full, and is replayed in full, whatever a preview elsewhere shows.
   can cancel its own work; a tool that ignores it keeps running and may still
   produce its side effect long after Jarvis gave up. So a timeout is recorded as
   `timed_out`, distinct from an ordinary `failed`, and carries
-  `effectUnknown: true` — the same marker `interrupted` gets. Both mean "Jarvis
+  `effectUnknown: true` - the same marker `interrupted` gets. Both mean "Jarvis
   cannot say whether this happened", and the UI offers them as *Re-issue anyway*
   rather than *Re-issue*, because a re-issue may duplicate a real-world action.
 - A deterministic rejection is `failed` with `effectUnknown: false`: the tool
@@ -200,5 +200,5 @@ registry.register({
 });
 ```
 
-That is the whole integration. Get `risk` right and the rest — confirmation,
-standing permissions, audit, recovery, UI — already applies.
+That is the whole integration. Get `risk` right and the rest - confirmation,
+standing permissions, audit, recovery, UI - already applies.

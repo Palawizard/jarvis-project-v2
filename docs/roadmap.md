@@ -34,11 +34,11 @@
 - Human HTTP authority is authenticated even on loopback. OS-level isolation of agent children is still not implemented, so sensitive agent tools remain disabled. See `docs/tool-permissions.md`.
 - A tool timeout aborts `ctx.signal` and records `timed_out` with `effectUnknown`, but cannot force uncooperative code to stop; a tool that ignores the signal may still complete its side effect.
 
-## Planned — next five milestones
+## Planned - next five milestones
 
 Phase 1b hardened self-development, and the permission-gated tool-execution and recovery layer is now in place. On top of it, voice/screen/desktop and official Gmail/Calendar modules can be developed through Jarvis with the same evidence and approval boundaries, each registering as a risk-classified tool.
 
-**Blocking milestone — verified OS-level agent isolation.** No `sensitive` tool (Gmail, Calendar, screen capture, desktop input) may be enabled for the `agent` actor until agent child processes run under a verified restricted user or container with filesystem, credential, process, and control-plane network separation. Human HTTP authority now requires a browser-origin capability, so loopback alone cannot impersonate the user; that does not prove containment of arbitrary same-user malware or make sensitive delegated autonomy safe. Until this milestone ships:
+**Blocking milestone - verified OS-level agent isolation.** No `sensitive` tool (Gmail, Calendar, screen capture, desktop input) may be enabled for the `agent` actor until agent child processes run under a verified restricted user or container with filesystem, credential, process, and control-plane network separation. Human HTTP authority now requires a browser-origin capability, so loopback alone cannot impersonate the user; that does not prove containment of arbitrary same-user malware or make sensitive delegated autonomy safe. Until this milestone ships:
 
 - agents are hard-denied `sensitive` and `destructive` by policy, and
 - standing permissions cannot be granted to the `agent` actor at all, so delegated autonomy stays off by construction.

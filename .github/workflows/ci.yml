@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # onnxruntime-node downloads CUDA binaries on Linux x64 during postinstall.
+  # The release asset it asks for answers 404, and CI never uses the GPU.
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+
 jobs:
   deterministic:
     runs-on: ubuntu-latest
@@ -22,10 +27,11 @@ jobs:
       - run: pnpm format:check
       - run: pnpm lint
       - run: pnpm typecheck
+      # The visual QA unit tests photograph real pages with Chromium.
+      - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test
       - run: pnpm test:integration
       - run: pnpm build
-      - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:e2e
 
       # Subscription-backed live agents are intentionally opt-in and never run in CI.

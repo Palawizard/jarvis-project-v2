@@ -72,6 +72,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
+      # The supervised launcher tests start the orchestrator from dist and refuse a
+      # detached HEAD, which is what a pull_request checkout gives.
+      - run: git switch --create ci-integration
+      - run: pnpm build
       - run: pnpm test:integration
 
   e2e:

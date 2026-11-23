@@ -9,7 +9,9 @@ import { defineConfig } from '@playwright/test';
 export default defineConfig({
   testDir: './tests/e2e',
   fullyParallel: true,
-  workers: process.env.CI ? 2 : 4,
+  // A public runner has 4 vCPU; each test boots its own orchestrator, so every
+  // worker can be used.
+  workers: process.env.CI ? '100%' : 4,
   timeout: 60_000,
   expect: { timeout: 10_000 },
   outputDir: '.jarvis/e2e-results',

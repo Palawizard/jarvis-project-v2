@@ -49,6 +49,25 @@ function stubClient(): CalendarClient {
   };
 }
 
+/**
+ * A sync drops every event that ended before `now - windowPastDays`, and the
+ * fixtures below are pinned to September and October 2026. The window reaches
+ * back to them, so these tests do not start failing as the real date moves on.
+ */
+function fixtureConfig() {
+  const config = loadConfig({ dbPath: ':memory:' });
+  const sinceFixtures = Math.ceil(
+    (Date.now() - Date.parse('2026-09-01T00:00:00.000Z')) / 86_400_000,
+  );
+  return loadConfig({
+    dbPath: ':memory:',
+    calendar: {
+      ...config.calendar,
+      windowPastDays: Math.max(config.calendar.windowPastDays, sinceFixtures + 1),
+    },
+  });
+}
+
 const draft: CalendarEventDraft = {
   title: 'Planning',
   startsAt: '2026-09-10T08:00:00.000Z',
@@ -195,7 +214,7 @@ describe('calendar mirror', () => {
     const service = new CalendarService({
       db,
       bus: new EventBus(db),
-      config: loadConfig({ dbPath: ':memory:' }),
+      config: fixtureConfig(),
       createClient: () => client,
     });
 
@@ -228,7 +247,7 @@ describe('calendar mirror', () => {
     const service = new CalendarService({
       db,
       bus: new EventBus(db),
-      config: loadConfig({ dbPath: ':memory:' }),
+      config: fixtureConfig(),
       createClient: () => stubClient(),
     });
     const tools = registerBuiltinTools({ calendar: service } as never, {
@@ -280,7 +299,7 @@ describe('calendar mirror', () => {
     const service = new CalendarService({
       db,
       bus: new EventBus(db),
-      config: loadConfig({ dbPath: ':memory:' }),
+      config: fixtureConfig(),
       createClient: () => client,
     });
     const tools = registerBuiltinTools({ calendar: service } as never, {
@@ -796,7 +815,7 @@ describe('calendar mirror', () => {
     const service = new CalendarService({
       db,
       bus: new EventBus(db),
-      config: loadConfig({ dbPath: ':memory:' }),
+      config: fixtureConfig(),
       createClient: () => ({
         ...stubClient(),
         async events() {
@@ -1221,7 +1240,7 @@ describe('calendar mirror', () => {
       const service = new CalendarService({
         db,
         bus: new EventBus(db),
-        config: loadConfig({ dbPath: ':memory:' }),
+        config: fixtureConfig(),
       });
       await service.connect({
         provider: 'icloud',
@@ -1333,7 +1352,7 @@ describe('calendar mirror', () => {
     const service = new CalendarService({
       db,
       bus: new EventBus(db),
-      config: loadConfig({ dbPath: ':memory:' }),
+      config: fixtureConfig(),
       createClient: () => ({
         ...stubClient(),
         async calendars() {
